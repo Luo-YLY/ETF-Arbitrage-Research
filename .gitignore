@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+.conda/
+dist/
+build/
+*.egg-info/
+*.log
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+outputs/
+tmp/

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etf-arbitrage"
+version = "1.0.0"
+description = "Shenzhen ETF single-market arbitrage research prototype"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24,<3",
+  "pandas>=1.5,<3",
+  "scipy>=1.14,<2",
+  "plotly>=5.15,<7",
+  "streamlit>=1.30,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7,<9", "pytest-cov>=4,<7"]
+redis = ["redis>=5,<7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
