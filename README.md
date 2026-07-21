@@ -76,11 +76,12 @@ python -m streamlit run streamlit_app.py
 ```powershell
 python -m pip install -e ".[redis]"
 $env:SZ_REDIS_HOST="内网地址"
-python scripts/probe_sz_quotation.py --code 159915
+python scripts/probe_sz_quotation.py --code 159915.SZ
 ```
 
 当前适配器一次读取一个 Redis 全市场快照。持续轮询、断线重连和交易日服务将在确认真实
-行情结构后实现。
+行情结构后实现。`SZRedisDataFeed` 默认把项目内部六位证券代码映射为 Redis 的 `.SZ`
+后缀格式，也可以通过 `redis_code_suffix` 参数覆盖。
 
 ## 研究边界
 

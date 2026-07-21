@@ -43,9 +43,9 @@ def records():
         "amount": 20_000_000,
     }
     return {
-        "159915": {"code": "159915", "closepx": 1.205, **common},
-        "000001": {"code": "000001", "closepx": 1.0, **common},
-        "300750": {"code": "300750", "closepx": 1.4, **common},
+        "159915.SZ": {"code": "159915.SZ", "closepx": 1.205, **common},
+        "000001.SZ": {"code": "000001.SZ", "closepx": 1.0, **common},
+        "300750.SZ": {"code": "300750.SZ", "closepx": 1.4, **common},
     }
 
 
@@ -59,12 +59,12 @@ def client():
 def test_reads_single_security_and_market_snapshot() -> None:
     quotation_client = client()
 
-    record = quotation_client.get_security_record("159915", "20260720")
+    record = quotation_client.get_security_record("159915.SZ", "20260720")
     frame = quotation_client.get_quotation_snapshot("20260720")
 
     assert record is not None
     assert record["closepx"] == pytest.approx(1.205)
-    assert list(frame.index) == ["159915", "000001", "300750"]
+    assert list(frame.index) == ["159915.SZ", "000001.SZ", "300750.SZ"]
 
 
 def test_maps_redis_snapshot_to_common_data_feed() -> None:
@@ -92,7 +92,7 @@ def test_maps_redis_snapshot_to_common_data_feed() -> None:
 
 def test_rejects_snapshot_without_executable_etf_quote_fields() -> None:
     broken_records = records()
-    del broken_records["159915"]["bidpx1"]
+    del broken_records["159915.SZ"]["bidpx1"]
     quotation_client = SZRedisQuotationClient(
         SZRedisSettings(host="example.invalid"),
         redis_client=FakeRedis(broken_records),

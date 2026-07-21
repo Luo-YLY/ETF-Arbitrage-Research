@@ -177,6 +177,7 @@ class SZRedisDataFeed(DataFeed):
         weights: Sequence[ComponentWeight],
         field_map: SZRedisFieldMap = SZRedisFieldMap(),
         trade_date: Optional[Any] = None,
+        redis_code_suffix: str = ".SZ",
     ) -> None:
         if not weights:
             raise ValueError("At least one component weight is required")
@@ -185,6 +186,7 @@ class SZRedisDataFeed(DataFeed):
         self._weights = list(weights)
         self.field_map = field_map
         self.trade_date = trade_date
+        self.redis_code_suffix = redis_code_suffix
 
     def get_etf_info(self, etf_code: str) -> ETFInfo:
         if etf_code != self._info.etf_code:
@@ -205,10 +207,13 @@ class SZRedisDataFeed(DataFeed):
         frame = self.client.get_quotation_snapshot(self.trade_date)
         if frame.empty:
             return
-        if etf_code not in frame.index:
-            raise QuotationSchemaError("ETF {} is absent from Redis snapshot".format(etf_code))
+        redis_etf_code = self._redis_code(etf_code)
+        if redis_etf_code not in frame.index:
+            raise QuotationSchemaError(
+                "ETF {} is absent from Redis snapshot".format(redis_etf_code)
+            )
 
-        etf_row = frame.loc[etf_code]
+        etf_row = frame.loc[redis_etf_code]
         timestamp = self._timestamp(etf_row)
         if start is not None and timestamp < start:
             return
@@ -217,9 +222,10 @@ class SZRedisDataFeed(DataFeed):
 
         stock_quotes = {}
         for component in self._weights:
-            if component.stock_code not in frame.index:
+            redis_stock_code = self._redis_code(component.stock_code)
+            if redis_stock_code not in frame.index:
                 continue
-            row = frame.loc[component.stock_code]
+            row = frame.loc[redis_stock_code]
             stock_quotes[component.stock_code] = StockQuote(
                 timestamp=self._timestamp(row, timestamp),
                 stock_code=component.stock_code,
@@ -243,6 +249,12 @@ class SZRedisDataFeed(DataFeed):
             ),
             stock_quotes=stock_quotes,
         )
+
+    def _redis_code(self, canonical_code: str) -> str:
+        suffix = self.redis_code_suffix.strip()
+        if not suffix or canonical_code.upper().endswith(suffix.upper()):
+            return canonical_code
+        return canonical_code + suffix
 
     def _timestamp(
         self,

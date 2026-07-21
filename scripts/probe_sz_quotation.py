@@ -14,7 +14,7 @@ from etf_arbitrage.data import SZRedisQuotationClient, SZRedisSettings
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read one quotation record from Redis")
-    parser.add_argument("--code", default="159915", help="security code stored in Redis")
+    parser.add_argument("--code", default="159915.SZ", help="security code stored in Redis")
     parser.add_argument("--date", help="Redis hash key in YYYYMMDD format")
     return parser.parse_args()
 
