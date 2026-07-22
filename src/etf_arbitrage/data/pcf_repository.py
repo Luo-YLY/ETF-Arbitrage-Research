@@ -8,7 +8,8 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Union
+from typing import Dict, List, Mapping, Optional, Union
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
@@ -85,12 +86,63 @@ class PCFRepository:
         timeout: float = 20.0,
     ) -> Path:
         url = self.render_url(url_template, etf_code, trading_day)
-        request = Request(url, headers={"User-Agent": "ETF-Arbitrage-Research/1.0"})
-        with urlopen(request, timeout=timeout) as response:
-            content = response.read()
-        if not content:
-            raise PCFValidationError("PCF下载结果为空")
-        return self.save(content, etf_code, trading_day)
+        errors = []
+        for candidate in self.download_candidates(url, etf_code, trading_day):
+            request = Request(
+                candidate,
+                headers={
+                    "User-Agent": "ETF-Arbitrage-Research/1.0",
+                    "Referer": "https://www.szse.cn/",
+                },
+            )
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    content = response.read()
+                if not content:
+                    raise PCFValidationError("下载结果为空")
+                return self.save(content, etf_code, trading_day)
+            except Exception as exc:
+                errors.append("{} -> {}".format(candidate, exc))
+        raise PCFValidationError(
+            "未能从下载地址获取有效PCF：{}".format(" | ".join(errors))
+        )
+
+    @staticmethod
+    def download_candidates(
+        url: str,
+        etf_code: str,
+        trading_day: Union[date, str],
+    ) -> List[str]:
+        """Resolve an SZSE download landing page into direct report-document URLs."""
+        parsed = urlparse(url)
+        if not (
+            parsed.hostname
+            and parsed.hostname.lower().endswith("szse.cn")
+            and parsed.path.endswith("/eft_download_new.html")
+        ):
+            return [url]
+
+        query = parse_qs(parsed.query)
+        source_path = query.get("path", [""])[0]
+        filenames = query.get("filename", [""])[0].split(";")
+        if not source_path.startswith("/files/text/"):
+            raise PCFValidationError("深交所下载页面缺少有效的PCF文件路径")
+
+        day = PCFRepository._day_text(trading_day)
+        expected_name = "pcf_{}_{}".format(etf_code, day)
+        ordered_names = [expected_name] + [name for name in filenames if name]
+        unique_names = list(dict.fromkeys(ordered_names))
+        base = "https://reportdocs.static.szse.cn{}".format(source_path.rstrip("/"))
+        candidates = []
+        for name in unique_names:
+            suffix = Path(name).suffix.lower()
+            if suffix in {".xml", ".txt"}:
+                candidates.append("{}/{}".format(base, name))
+            else:
+                candidates.extend(
+                    ["{}/{}.xml".format(base, name), "{}/{}.txt".format(base, name)]
+                )
+        return candidates
 
     def validate(
         self,
@@ -130,6 +182,11 @@ class PCFRepository:
     @staticmethod
     def _extract_xml(content: bytes, etf_code: str) -> bytes:
         if content[:2] != b"PK":
+            prefix = content.lstrip()[:100].lower()
+            if prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html"):
+                raise PCFValidationError(
+                    "下载地址返回的是网页，不是PCF文件；请使用深交所PCF下载页或XML直链"
+                )
             return content
         try:
             with ZipFile(BytesIO(content)) as archive:

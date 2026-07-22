@@ -138,11 +138,12 @@ $env:SZ_REDIS_HOST="内网地址"
 python -m streamlit run streamlit_app.py
 ```
 
-盘前在可访问外网的账户中选择交易日和ETF。PCF可以通过“直接下载地址”下载，也可以上传
-已经下载的XML或ZIP；系统会校验证券代码、交易日、申赎单位和成分数量后才落盘。基金公司
-下载直链可保存在本机的 `config/pcf_sources.local.json`，该文件不会提交到Git；直链支持
-`{etf_code}`、`{trade_date}` 和 `{trade_date_dash}` 占位符。由于不同基金公司的官网地址不同，
-项目不预置未经验证的URL。
+盘前在可访问外网的账户中选择交易日和ETF。项目已为四只深市ETF预置深交所PCF直链模板，
+通常直接点击“下载并校验PCF”即可。看板也兼容深交所 `eft_download_new.html` 下载页面链接，
+会自动解析并尝试对应的XML/TXT文件；仍可上传已经下载的XML或ZIP作为兜底。系统会校验
+证券代码、交易日、申赎单位和成分数量后才落盘。自定义下载地址可保存在本机的
+`config/pcf_sources.local.json`，该文件不会提交到Git；地址支持 `{etf_code}`、
+`{trade_date}` 和 `{trade_date_dash}` 占位符。
 
 切换回内网账户后，确认四只ETF的当日PCF均显示“已校验”，再点击“启动当日采集”。后台
 进程只在 09:30-11:30 和 13:00-15:00 轮询Redis，午间等待，15:00后自动退出。原始快照写入

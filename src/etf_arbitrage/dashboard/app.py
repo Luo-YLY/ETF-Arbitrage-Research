@@ -280,9 +280,9 @@ def render() -> None:
             if url_key not in st.session_state:
                 st.session_state[url_key] = sources.get(target_code, "")
             url_template = st.text_input(
-                "PCF直接下载地址",
+                "PCF来源地址（已自动配置，一般无需修改）",
                 key=url_key,
-                placeholder="可使用 {etf_code} 和 {trade_date} 作为日期/代码占位符",
+                placeholder="支持深交所下载页面、XML直链及日期/代码占位符",
             )
             download_col, save_col = st.columns([1, 1])
             if download_col.button("下载并校验PCF", use_container_width=True):
