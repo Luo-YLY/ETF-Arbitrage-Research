@@ -39,6 +39,12 @@ ETF_LABELS = {
     "{} {}".format(profile.etf_code, profile.name): code
     for code, profile in SZSE_ETFS.items()
 }
+CHART_INTERVALS = {
+    "1分钟": "1min",
+    "30秒": "30s",
+    "5分钟": "5min",
+    "原始快照": None,
+}
 
 
 def _source_templates() -> Dict[str, str]:
@@ -96,30 +102,85 @@ def _find_pcf(
         return None, str(exc)
 
 
-def _premium_figure(frame: pd.DataFrame, entry_threshold: float) -> go.Figure:
+def _resample_last(
+    frame: pd.DataFrame,
+    rule: Optional[str],
+    required_column: str,
+) -> pd.DataFrame:
+    ordered = frame.copy()
+    ordered["timestamp"] = pd.to_datetime(ordered["timestamp"])
+    ordered.sort_values("timestamp", inplace=True)
+    if rule is None or ordered.empty:
+        return ordered
+    return (
+        ordered.set_index("timestamp")
+        .resample(rule)
+        .last()
+        .dropna(subset=[required_column])
+        .reset_index()
+    )
+
+
+def _premium_figure(
+    frame: pd.DataFrame,
+    entry_threshold: float,
+    chart_rule: Optional[str],
+) -> go.Figure:
+    display = _resample_last(frame, chart_rule, "premium")
     figure = go.Figure()
+    if chart_rule is not None and not frame.empty:
+        source = frame.copy()
+        source["timestamp"] = pd.to_datetime(source["timestamp"])
+        band = (
+            source.set_index("timestamp")["premium"]
+            .resample(chart_rule)
+            .agg(["min", "max"])
+            .dropna()
+            .reset_index()
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=band["timestamp"],
+                y=band["max"] * 100,
+                name="区间上沿",
+                line={"width": 0},
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=band["timestamp"],
+                y=band["min"] * 100,
+                name="区间内范围",
+                line={"width": 0},
+                fill="tonexty",
+                fillcolor="rgba(21, 97, 109, 0.16)",
+                hovertemplate="区间下沿 %{y:.3f}%<extra></extra>",
+            )
+        )
     figure.add_trace(
         go.Scatter(
-            x=frame["timestamp"],
-            y=frame["premium"] * 100,
-            name="最新价折溢价",
+            x=display["timestamp"],
+            y=display["premium"] * 100,
+            name="区间末折溢价" if chart_rule else "最新价折溢价",
             line={"color": "#15616D", "width": 2},
         )
     )
-    if "premium_at_bid" in frame and frame["premium_at_bid"].notna().any():
+    if "premium_at_bid" in display and display["premium_at_bid"].notna().any():
         figure.add_trace(
             go.Scatter(
-                x=frame["timestamp"],
-                y=frame["premium_at_bid"] * 100,
+                x=display["timestamp"],
+                y=display["premium_at_bid"] * 100,
                 name="买一溢价边界",
                 line={"color": "#C44536", "width": 1},
             )
         )
-    if "discount_at_ask" in frame and frame["discount_at_ask"].notna().any():
+    if "discount_at_ask" in display and display["discount_at_ask"].notna().any():
         figure.add_trace(
             go.Scatter(
-                x=frame["timestamp"],
-                y=-frame["discount_at_ask"] * 100,
+                x=display["timestamp"],
+                y=-display["discount_at_ask"] * 100,
                 name="卖一折价边界",
                 line={"color": "#3A6EA5", "width": 1},
             )
@@ -137,20 +198,21 @@ def _premium_figure(frame: pd.DataFrame, entry_threshold: float) -> go.Figure:
     return figure
 
 
-def _price_figure(frame: pd.DataFrame) -> go.Figure:
+def _price_figure(frame: pd.DataFrame, chart_rule: Optional[str]) -> go.Figure:
+    display = _resample_last(frame, chart_rule, "iopv")
     figure = go.Figure()
     figure.add_trace(
         go.Scatter(
-            x=frame["timestamp"],
-            y=frame["etf_price"],
+            x=display["timestamp"],
+            y=display["etf_price"],
             name="ETF最新价",
             line={"color": "#1B998B", "width": 2},
         )
     )
     figure.add_trace(
         go.Scatter(
-            x=frame["timestamp"],
-            y=frame["iopv"],
+            x=display["timestamp"],
+            y=display["iopv"],
             name="IOPV",
             line={"color": "#2D3047", "width": 2},
         )
@@ -230,11 +292,15 @@ def render() -> None:
         entry_pct = st.number_input("开仓阈值（%）", 0.01, 5.0, 0.20, 0.01)
         exit_pct = st.number_input("平仓阈值（%）", 0.0, 2.0, 0.05, 0.01)
         max_holding = st.number_input("最长持有期（快照数）", 1, 10000, 600, 10)
-        cost_bps = st.number_input("双边成本（bp）", 0.0, 100.0, 3.0, 0.5)
+        cost_bps = st.number_input("单边换仓成本（bp）", 0.0, 100.0, 3.0, 0.5)
         mode_label = st.selectbox(
             "回测价格模式", ["指示性（最新价）", "可执行（买一卖一）"]
         )
         mode = "indicative" if mode_label.startswith("指示性") else "executable"
+        st.divider()
+        st.subheader("图表显示")
+        chart_interval_label = st.selectbox("图表频率", list(CHART_INTERVALS))
+        chart_rule = CHART_INTERVALS[chart_interval_label]
 
     entry_threshold = float(entry_pct) / 100.0
     exit_threshold = float(exit_pct) / 100.0
@@ -381,9 +447,12 @@ def render() -> None:
                 metrics[4].metric("记录数", str(len(frame)))
                 metrics[5].metric("估值质量", str(latest.get("valuation_quality", "")))
                 st.plotly_chart(
-                    _premium_figure(frame, entry_threshold), use_container_width=True
+                    _premium_figure(frame, entry_threshold, chart_rule),
+                    use_container_width=True,
                 )
-                st.plotly_chart(_price_figure(frame), use_container_width=True)
+                st.plotly_chart(
+                    _price_figure(frame, chart_rule), use_container_width=True
+                )
                 display_columns = [
                     column
                     for column in [
@@ -450,21 +519,39 @@ def render() -> None:
                 metrics[3].metric("胜率", "{:.1%}".format(result.win_rate))
                 metrics[4].metric("平均持有", "{:.1f}个快照".format(result.average_holding_periods))
                 st.plotly_chart(
-                    _premium_figure(observations, entry_threshold),
+                    _premium_figure(observations, entry_threshold, chart_rule),
                     use_container_width=True,
+                )
+                equity_display = _resample_last(
+                    result.timeline, chart_rule, "equity"
                 )
                 equity = go.Figure(
                     go.Scatter(
-                        x=result.timeline["timestamp"],
-                        y=result.timeline["equity"],
-                        name="模拟净值",
+                        x=equity_display["timestamp"],
+                        y=equity_display["equity"],
+                        name="Premium策略指数",
                         line={"color": "#15616D", "width": 2},
                     )
                 )
+                trade_points = result.timeline[
+                    result.timeline["action"].str.startswith(("open_", "close_"))
+                ]
+                if not trade_points.empty:
+                    equity.add_trace(
+                        go.Scatter(
+                            x=trade_points["timestamp"],
+                            y=trade_points["equity"],
+                            name="开平仓",
+                            mode="markers",
+                            marker={"color": "#C44536", "size": 7},
+                            text=trade_points["action"],
+                            hovertemplate="%{text}<br>%{x}<br>%{y:.6f}<extra></extra>",
+                        )
+                    )
                 equity.update_layout(
                     height=330,
                     margin={"l": 8, "r": 8, "t": 25, "b": 8},
-                    yaxis_title="净值",
+                    yaxis_title="累计价差收益指数",
                     xaxis_title=None,
                 )
                 st.plotly_chart(equity, use_container_width=True)

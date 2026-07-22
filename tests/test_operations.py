@@ -5,6 +5,7 @@ import shutil
 from uuid import uuid4
 from zipfile import ZipFile
 
+import pandas as pd
 import pytest
 
 from etf_arbitrage.data import PCFRepository, PCFValidationError
@@ -13,6 +14,7 @@ from etf_arbitrage.operations import (
     MarketMonitorJob,
     SZSEMarketSchedule,
 )
+from etf_arbitrage.dashboard.app import _resample_last
 
 
 PCF_SAMPLE = Path("data/pcf/20260722/pcf_159915_20260722.xml")
@@ -34,6 +36,23 @@ def test_market_schedule_covers_sessions_and_lunch_break() -> None:
     assert schedule.is_open(datetime(2026, 7, 22, 13, 0))
     assert schedule.is_open(datetime(2026, 7, 22, 15, 0))
     assert schedule.is_after_close(datetime(2026, 7, 22, 15, 0, 1))
+
+
+def test_dashboard_chart_resampling_keeps_last_value_in_each_bucket() -> None:
+    frame = pd.DataFrame(
+        {
+            "timestamp": [
+                datetime(2026, 7, 22, 9, 30, 3),
+                datetime(2026, 7, 22, 9, 30, 57),
+                datetime(2026, 7, 22, 9, 31, 3),
+            ],
+            "premium": [0.001, 0.002, 0.003],
+        }
+    )
+
+    result = _resample_last(frame, "1min", "premium")
+
+    assert result["premium"].tolist() == [0.002, 0.003]
 
 
 def test_pcf_repository_saves_and_validates_xml_and_zip() -> None:
