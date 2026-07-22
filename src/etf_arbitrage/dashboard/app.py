@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from etf_arbitrage.backtest import PremiumBacktester, ResearchReplay
@@ -198,6 +199,91 @@ def _premium_figure(
     return figure
 
 
+def _backtest_figure(
+    observations: pd.DataFrame,
+    timeline: pd.DataFrame,
+    entry_threshold: float,
+    chart_rule: Optional[str],
+) -> go.Figure:
+    premium = _premium_figure(observations, entry_threshold, chart_rule)
+    equity_display = _resample_last(timeline, chart_rule, "equity")
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        row_heights=[0.55, 0.45],
+        subplot_titles=("折溢价", "累计价差收益指数"),
+    )
+    for trace in premium.data:
+        figure.add_trace(trace, row=1, col=1)
+    for shape in premium.layout.shapes or ():
+        figure.add_shape(shape, row=1, col=1)
+
+    figure.add_trace(
+        go.Scatter(
+            x=equity_display["timestamp"],
+            y=equity_display["equity"],
+            name="Premium策略指数",
+            line={"color": "#15616D", "width": 2},
+        ),
+        row=2,
+        col=1,
+    )
+    trade_points = timeline[
+        timeline["action"].str.startswith(("open_", "close_"))
+    ]
+    if not trade_points.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=trade_points["timestamp"],
+                y=trade_points["equity"],
+                name="开平仓",
+                mode="markers",
+                marker={"color": "#C44536", "size": 7},
+                text=trade_points["action"],
+                hovertemplate="%{text}<br>%{x}<br>%{y:.6f}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+
+    figure.update_yaxes(
+        title_text="折溢价 (%)", tickformat=".3f", row=1, col=1
+    )
+    figure.update_yaxes(
+        title_text="累计价差收益指数", tickformat=".4f", row=2, col=1
+    )
+    figure.update_traces(xaxis="x")
+    figure.update_xaxes(
+        showspikes=True,
+        spikecolor="#6B7280",
+        spikethickness=1,
+        spikedash="dot",
+        spikemode="across",
+        spikesnap="cursor",
+        row=1,
+        col=1,
+    )
+    figure.update_layout(
+        height=700,
+        margin={"l": 76, "r": 20, "t": 65, "b": 52},
+        legend={"orientation": "h", "y": 1.08, "x": 0},
+        hovermode="x unified",
+        hoversubplots="axis",
+        hoverdistance=30,
+        spikedistance=-1,
+        xaxis={
+            "anchor": "free",
+            "position": 0,
+            "showticklabels": True,
+            "title_text": "时间",
+        },
+        xaxis2={"visible": False, "showticklabels": False},
+    )
+    return figure
+
+
 def _price_figure(frame: pd.DataFrame, chart_rule: Optional[str]) -> go.Figure:
     display = _resample_last(frame, chart_rule, "iopv")
     figure = go.Figure()
@@ -299,7 +385,7 @@ def render() -> None:
         mode = "indicative" if mode_label.startswith("指示性") else "executable"
         st.divider()
         st.subheader("图表显示")
-        chart_interval_label = st.selectbox("图表频率", list(CHART_INTERVALS))
+        chart_interval_label = st.radio("图表频率", list(CHART_INTERVALS))
         chart_rule = CHART_INTERVALS[chart_interval_label]
 
     entry_threshold = float(entry_pct) / 100.0
@@ -519,42 +605,14 @@ def render() -> None:
                 metrics[3].metric("胜率", "{:.1%}".format(result.win_rate))
                 metrics[4].metric("平均持有", "{:.1f}个快照".format(result.average_holding_periods))
                 st.plotly_chart(
-                    _premium_figure(observations, entry_threshold, chart_rule),
+                    _backtest_figure(
+                        observations,
+                        result.timeline,
+                        entry_threshold,
+                        chart_rule,
+                    ),
                     use_container_width=True,
                 )
-                equity_display = _resample_last(
-                    result.timeline, chart_rule, "equity"
-                )
-                equity = go.Figure(
-                    go.Scatter(
-                        x=equity_display["timestamp"],
-                        y=equity_display["equity"],
-                        name="Premium策略指数",
-                        line={"color": "#15616D", "width": 2},
-                    )
-                )
-                trade_points = result.timeline[
-                    result.timeline["action"].str.startswith(("open_", "close_"))
-                ]
-                if not trade_points.empty:
-                    equity.add_trace(
-                        go.Scatter(
-                            x=trade_points["timestamp"],
-                            y=trade_points["equity"],
-                            name="开平仓",
-                            mode="markers",
-                            marker={"color": "#C44536", "size": 7},
-                            text=trade_points["action"],
-                            hovertemplate="%{text}<br>%{x}<br>%{y:.6f}<extra></extra>",
-                        )
-                    )
-                equity.update_layout(
-                    height=330,
-                    margin={"l": 8, "r": 8, "t": 25, "b": 8},
-                    yaxis_title="累计价差收益指数",
-                    xaxis_title=None,
-                )
-                st.plotly_chart(equity, use_container_width=True)
                 trades = pd.DataFrame([asdict(trade) for trade in result.trades])
                 if trades.empty:
                     st.info("当前参数下没有完成的交易。")
