@@ -73,7 +73,9 @@ class RiskEngine:
             blockers.append("price_limit")
         if low_liquidity > self.config.max_low_liquidity_ratio:
             blockers.append("component_liquidity")
-        if etf_quote.spread_bps > self.config.max_etf_spread_bps:
+        if not etf_quote.has_executable_quote:
+            blockers.append("missing_bid_ask")
+        elif etf_quote.spread_bps > self.config.max_etf_spread_bps:
             blockers.append("etf_spread")
         if etf_quote.amount < self.config.min_etf_amount:
             blockers.append("etf_turnover")
@@ -83,7 +85,15 @@ class RiskEngine:
             45.0 * min(1.0, (suspension + missing) / max(self.config.max_suspension_ratio, 1e-9))
             + 20.0 * min(1.0, limit_total / max(self.config.max_limit_ratio, 1e-9))
             + 20.0 * min(1.0, low_liquidity / max(self.config.max_low_liquidity_ratio, 1e-9))
-            + 15.0 * min(1.0, etf_quote.spread_bps / max(self.config.max_etf_spread_bps, 1e-9)),
+            + 15.0
+            * (
+                1.0
+                if not etf_quote.has_executable_quote
+                else min(
+                    1.0,
+                    etf_quote.spread_bps / max(self.config.max_etf_spread_bps, 1e-9),
+                )
+            ),
         )
         blocked = bool(blockers)
         level = RiskLevel.HIGH if blocked or score >= 65 else RiskLevel.MEDIUM if score >= 30 else RiskLevel.LOW

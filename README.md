@@ -79,9 +79,44 @@ $env:SZ_REDIS_HOST="内网地址"
 python scripts/probe_sz_quotation.py --code 159915.SZ
 ```
 
-当前适配器一次读取一个 Redis 全市场快照。持续轮询、断线重连和交易日服务将在确认真实
-行情结构后实现。`SZRedisDataFeed` 默认把项目内部六位证券代码映射为 Redis 的 `.SZ`
-后缀格式，也可以通过 `redis_code_suffix` 参数覆盖。
+适配器每轮只批量读取 ETF 和目标成分股，避免重复拉取整个市场。它能从 `cdate` 和 `ctime`
+解析供应商时间，并默认把项目内部六位证券代码映射为 Redis 的 `.SZ` 后缀。Redis 只提供
+最新价时，应使用指示性模式：系统可以记录行情和计算最新价 Premium，但不会生成可执行
+套利信号。
+
+盘中先记录 ETF 快照：
+
+```powershell
+$env:SZ_REDIS_HOST="内网地址"
+python scripts/record_sz_realtime.py --etf-code 159915 --interval 3
+```
+
+默认文件为 `tmp/recordings/YYYYMMDD/159915.jsonl`，相同市场快照会自动去重。加入成分股权重
+文件后，盘中会同时计算 IOPV、Premium、风险和信号：
+
+```powershell
+python scripts/record_sz_realtime.py `
+  --etf-code 159915 `
+  --components-csv tmp/pcf/159915_components.csv `
+  --shares 1000000 `
+  --creation-unit 1000000 `
+  --interval 3
+```
+
+过渡期成分股 CSV 必须包含 `stock_code,weight` 两列。这里的权重模型仍不是正式 PCF 篮子
+估值；得到 PCF 后应替换为成分股数量和预估现金差额模型。
+
+收盘后回放记录并运行指示性回测：
+
+```powershell
+python scripts/replay_recording.py `
+  --input tmp/recordings/20260722/159915.jsonl `
+  --components-csv tmp/pcf/159915_components.csv `
+  --mode indicative
+```
+
+只有采集数据确实包含买一卖一时，才使用 `--mode executable` 和采集端的
+`--require-bid-ask`。回放结果写入 `outputs/replay/`。
 
 ## 研究边界
 

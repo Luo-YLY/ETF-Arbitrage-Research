@@ -19,23 +19,37 @@ class ETFQuote:
     timestamp: datetime
     etf_code: str
     last_price: float
-    bid_price: float
-    ask_price: float
+    bid_price: Optional[float]
+    ask_price: Optional[float]
     volume: float
     amount: float
 
     @property
     def mid_price(self) -> float:
         """优先取买一卖一的中间价，如果买卖一价格无效，则取最新成交价"""
-        if self.bid_price > 0 and self.ask_price > 0:
+        if self.has_executable_quote:
+            assert self.bid_price is not None
+            assert self.ask_price is not None
             return (self.bid_price + self.ask_price) / 2.0
         return self.last_price
 
     @property
+    def has_executable_quote(self) -> bool:
+        """买一卖一同时有效时，行情才可用于可执行价差判断。"""
+        return bool(
+            self.bid_price is not None
+            and self.ask_price is not None
+            and self.bid_price > 0
+            and self.ask_price > 0
+        )
+
+    @property
     def spread_bps(self) -> float:
         """计算ETF买卖价差（转为基点）"""
-        if self.mid_price <= 0:
+        if not self.has_executable_quote or self.mid_price <= 0:
             return float("inf")
+        assert self.bid_price is not None
+        assert self.ask_price is not None
         return (self.ask_price - self.bid_price) / self.mid_price * 10_000.0
 
 

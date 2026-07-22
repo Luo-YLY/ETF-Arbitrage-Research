@@ -67,8 +67,16 @@ class PremiumMonitor:
 
         iopv = valuation.theoretical_price
         premium = (quote.mid_price - iopv) / iopv
-        premium_at_bid = (quote.bid_price - iopv) / iopv
-        discount_at_ask = (iopv - quote.ask_price) / iopv
+        premium_at_bid = (
+            (quote.bid_price - iopv) / iopv
+            if quote.bid_price is not None and quote.bid_price > 0
+            else float("nan")
+        )
+        discount_at_ask = (
+            (iopv - quote.ask_price) / iopv
+            if quote.ask_price is not None and quote.ask_price > 0
+            else float("nan")
+        )
         state.peak_absolute_premium = max(state.peak_absolute_premium, abs(premium))
 
         if state.deviation_started_at is None and abs(premium) >= self.config.deviation_threshold:

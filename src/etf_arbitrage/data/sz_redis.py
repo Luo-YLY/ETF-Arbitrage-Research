@@ -82,6 +82,7 @@ class SZRedisQuotationClient:
                 decode_responses=True,
                 socket_connect_timeout=self.settings.socket_timeout,
                 socket_timeout=self.settings.socket_timeout,
+                protocol=2,
             )
         return self._redis_client
 
@@ -108,6 +109,30 @@ class SZRedisQuotationClient:
         records = [
             self._decode_record(raw_record, self._as_text(code))
             for code, raw_record in zip(codes, raw_records)
+            if raw_record is not None
+        ]
+        if not records:
+            return pd.DataFrame()
+        frame = pd.DataFrame(records)
+        if "code" not in frame.columns:
+            raise QuotationSchemaError("Redis quotation records do not contain 'code'")
+        frame["code"] = frame["code"].astype(str)
+        return frame.set_index("code", drop=True)
+
+    def get_security_records(
+        self,
+        codes: Sequence[str],
+        trade_date: Optional[Any] = None,
+    ) -> pd.DataFrame:
+        """Read only the requested records from the date-keyed Redis hash."""
+        requested = [str(code) for code in dict.fromkeys(codes)]
+        if not requested:
+            return pd.DataFrame()
+        redis_key = self._trade_date_key(trade_date)
+        raw_records = self.connection.hmget(redis_key, requested)
+        records = [
+            self._decode_record(raw_record, code)
+            for code, raw_record in zip(requested, raw_records)
             if raw_record is not None
         ]
         if not records:
@@ -157,11 +182,13 @@ class SZRedisQuotationClient:
 class SZRedisFieldMap:
     """Map vendor field names to the project's canonical quote fields."""
 
-    timestamp: str = "timestamp"
+    timestamp: Optional[str] = "timestamp"
+    trade_date: Optional[str] = "cdate"
+    trade_time: Optional[str] = "ctime"
     last_price: str = "closepx"
-    bid_price: str = "bidpx1"
-    ask_price: str = "askpx1"
-    volume: str = "volume"
+    bid_price: Optional[str] = "bidpx1"
+    ask_price: Optional[str] = "askpx1"
+    volume: Optional[str] = "volume"
     amount: str = "amount"
     is_suspended: Optional[str] = None
     limit_status: Optional[str] = None
@@ -178,15 +205,15 @@ class SZRedisDataFeed(DataFeed):
         field_map: SZRedisFieldMap = SZRedisFieldMap(),
         trade_date: Optional[Any] = None,
         redis_code_suffix: str = ".SZ",
+        require_bid_ask: bool = True,
     ) -> None:
-        if not weights:
-            raise ValueError("At least one component weight is required")
         self.client = client
         self._info = etf_info
         self._weights = list(weights)
         self.field_map = field_map
         self.trade_date = trade_date
         self.redis_code_suffix = redis_code_suffix
+        self.require_bid_ask = require_bid_ask
 
     def get_etf_info(self, etf_code: str) -> ETFInfo:
         if etf_code != self._info.etf_code:
@@ -204,10 +231,13 @@ class SZRedisDataFeed(DataFeed):
         end: Optional[datetime] = None,
     ) -> Iterable[MarketSnapshot]:
         self.get_etf_info(etf_code)
-        frame = self.client.get_quotation_snapshot(self.trade_date)
+        redis_etf_code = self._redis_code(etf_code)
+        requested_codes = [redis_etf_code] + [
+            self._redis_code(component.stock_code) for component in self._weights
+        ]
+        frame = self.client.get_security_records(requested_codes, self.trade_date)
         if frame.empty:
             return
-        redis_etf_code = self._redis_code(etf_code)
         if redis_etf_code not in frame.index:
             raise QuotationSchemaError(
                 "ETF {} is absent from Redis snapshot".format(redis_etf_code)
@@ -236,14 +266,30 @@ class SZRedisDataFeed(DataFeed):
                 limit_status=self._limit_status(row),
             )
 
+        bid_price = self._optional_float(etf_row, self.field_map.bid_price)
+        ask_price = self._optional_float(etf_row, self.field_map.ask_price)
+        if self.require_bid_ask:
+            if bid_price is None:
+                raise QuotationSchemaError(
+                    "Required quotation field is missing: {}".format(
+                        self.field_map.bid_price or "bid_price"
+                    )
+                )
+            if ask_price is None:
+                raise QuotationSchemaError(
+                    "Required quotation field is missing: {}".format(
+                        self.field_map.ask_price or "ask_price"
+                    )
+                )
+
         yield MarketSnapshot(
             timestamp=timestamp,
             etf_quote=ETFQuote(
                 timestamp=timestamp,
                 etf_code=etf_code,
                 last_price=self._required_float(etf_row, self.field_map.last_price),
-                bid_price=self._required_float(etf_row, self.field_map.bid_price),
-                ask_price=self._required_float(etf_row, self.field_map.ask_price),
+                bid_price=bid_price,
+                ask_price=ask_price,
                 volume=self._optional_float(etf_row, self.field_map.volume, 0.0) or 0.0,
                 amount=self._optional_float(etf_row, self.field_map.amount, 0.0) or 0.0,
             ),
@@ -262,9 +308,35 @@ class SZRedisDataFeed(DataFeed):
         fallback: Optional[datetime] = None,
     ) -> datetime:
         field = self.field_map.timestamp
-        if field in row and pd.notna(row[field]):
+        if field and field in row and pd.notna(row[field]):
             return pd.Timestamp(row[field]).to_pydatetime()
+        date_field = self.field_map.trade_date
+        time_field = self.field_map.trade_time
+        if (
+            date_field
+            and time_field
+            and date_field in row
+            and time_field in row
+            and pd.notna(row[date_field])
+            and pd.notna(row[time_field])
+        ):
+            return self._parse_vendor_timestamp(row[date_field], row[time_field])
         return fallback or datetime.now()
+
+    @staticmethod
+    def _parse_vendor_timestamp(trade_date: Any, trade_time: Any) -> datetime:
+        date_text = str(trade_date).split(".", 1)[0]
+        date_digits = "".join(character for character in date_text if character.isdigit())
+        time_text = str(trade_time).split(".", 1)[0]
+        time_digits = "".join(character for character in time_text if character.isdigit())
+        if len(date_digits) != 8 or not time_digits:
+            raise QuotationSchemaError("Invalid cdate/ctime quotation timestamp")
+        time_digits = time_digits.zfill(6)
+        base = datetime.strptime(date_digits + time_digits[:6], "%Y%m%d%H%M%S")
+        fractional = time_digits[6:]
+        if fractional:
+            base = base.replace(microsecond=int((fractional + "000000")[:6]))
+        return base
 
     @staticmethod
     def _required_float(row: pd.Series, field: str) -> float:
@@ -276,10 +348,10 @@ class SZRedisDataFeed(DataFeed):
     @staticmethod
     def _optional_float(
         row: pd.Series,
-        field: str,
+        field: Optional[str],
         default: Optional[float] = None,
     ) -> Optional[float]:
-        if field not in row or pd.isna(row[field]):
+        if not field or field not in row or pd.isna(row[field]):
             return default
         try:
             return float(row[field])

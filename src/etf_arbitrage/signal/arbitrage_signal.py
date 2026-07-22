@@ -44,6 +44,10 @@ class FixedThresholdSignal:
     ) -> SignalDecision:
         if not np.isfinite(observation.premium):
             return SignalDecision(SignalType.NONE, 0.0, 0.0, False, "invalid_iopv")
+        if not np.isfinite(observation.premium_at_bid) and not np.isfinite(
+            observation.discount_at_ask
+        ):
+            return SignalDecision(SignalType.NONE, 0.0, 0.0, False, "missing_bid_ask")
         if observation.premium_at_bid >= self.config.premium_entry:
             signal = SignalType.PREMIUM_ARBITRAGE
             edge = observation.premium_at_bid

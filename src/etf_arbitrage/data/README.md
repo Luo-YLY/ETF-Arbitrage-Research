@@ -22,10 +22,15 @@ python scripts/probe_sz_quotation.py --code 159915.SZ
 ```
 
 恢复内网后应先运行探测脚本，确认 Redis 中真实的买一、卖一、成交量、成交额和时间字段。
-默认字段映射为 `closepx`、`bidpx1`、`askpx1`、`volume`、`amount` 和 `timestamp`；若供应商
-字段不同，应通过 `SZRedisFieldMap` 显式配置，不能用最新价代替缺失的买一或卖一。
+默认字段映射支持 `closepx`、`bidpx1`、`askpx1`、`volume`、`amount`，时间优先读取
+`timestamp`，缺失时组合 `cdate` 与 `ctime`。若没有买一卖一，可将
+`require_bid_ask=False` 用于指示性记录；最新价不会被伪装成买一卖一。
 `SZRedisDataFeed` 默认将项目内部的六位代码加上 `.SZ` 后缀再查询 Redis，输出的
 `MarketSnapshot` 仍使用六位标准代码。
+
+`recording.py` 中的 `JsonlSnapshotStore` 将一个ETF及其成分股的同一时点行情原子化地写入
+一条JSONL记录，自动跳过完全相同的市场快照。原始记录可重新转换为ETF和成分股DataFrame，
+再交给 `DataFrameReplayFeed` 回放。采集文件位于被Git忽略的 `tmp/`，不会上传内网行情。
 
 生产环境应优先使用交易所 PCF/申购赎回清单中的组合证券数量与现金替代标志；当前 v1.0
 按归一化权重进行理论价值研究。

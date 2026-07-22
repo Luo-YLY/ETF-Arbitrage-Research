@@ -10,6 +10,7 @@ from .models import (
     StockQuote,
 )
 from .replay import DataFrameReplayFeed
+from .recording import JsonlSnapshotStore
 from .sz_redis import (
     QuotationSchemaError,
     RedisDependencyError,
@@ -28,6 +29,7 @@ __all__ = [
     "ETFQuote",
     "LimitStatus",
     "LiveDataFeed",
+    "JsonlSnapshotStore",
     "MarketSnapshot",
     "QuotationSchemaError",
     "RedisDependencyError",

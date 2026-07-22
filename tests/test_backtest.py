@@ -32,3 +32,27 @@ def test_premium_convergence_generates_positive_spread_return() -> None:
     assert result.trades[0].net_return == pytest.approx(0.0049)
     assert result.performance.total_return > 0
     assert result.win_rate == 1.0
+
+
+def test_executable_mode_uses_bid_and_ask_edges_for_entry() -> None:
+    start = datetime(2026, 1, 1, 10, 0)
+    frame = pd.DataFrame(
+        {
+            "timestamp": [start, start + timedelta(minutes=1)],
+            "premium": [0.006, 0.0],
+            "premium_at_bid": [0.004, -0.001],
+            "discount_at_ask": [-0.008, -0.001],
+            "risk_blocked": [False, False],
+        }
+    )
+    engine = PremiumBacktester(
+        BacktestConfig(
+            entry_threshold=0.005,
+            exit_threshold=0.001,
+            execution_mode="executable",
+        )
+    )
+
+    result = engine.run(frame)
+
+    assert len(result.trades) == 0

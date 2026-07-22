@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 import pytest
 
@@ -10,6 +11,7 @@ from etf_arbitrage.data import (
     SZRedisQuotationClient,
     SZRedisSettings,
 )
+from etf_arbitrage.backtest import ResearchReplay
 
 
 class FakeRedis:
@@ -107,3 +109,46 @@ def test_rejects_snapshot_without_executable_etf_quote_fields() -> None:
 
     with pytest.raises(QuotationSchemaError, match="bidpx1"):
         list(feed.snapshots("159915"))
+
+
+def test_maps_real_last_price_fields_in_indicative_mode() -> None:
+    raw = {
+        "159915.SZ": {
+            "code": "159915.SZ",
+            "cdate": "20260721",
+            "ctime": "151324",
+            "closepx": 3.709,
+            "amount": 4_276_929_334,
+        },
+        "000001.SZ": {
+            "code": "000001.SZ",
+            "cdate": "20260721",
+            "ctime": "151323",
+            "closepx": 1.0,
+            "amount": 10_000_000,
+        },
+    }
+    quotation_client = SZRedisQuotationClient(
+        SZRedisSettings(host="example.invalid"), redis_client=FakeRedis(raw)
+    )
+    info = ETFInfo("159915", "创业板ETF", "SZSE", "创业板指", 1, 1)
+    weights = [ComponentWeight("159915", "000001", 1.0)]
+    feed = SZRedisDataFeed(
+        quotation_client,
+        info,
+        weights,
+        trade_date="20260720",
+        require_bid_ask=False,
+    )
+
+    snapshot = list(feed.snapshots("159915"))[0]
+    row = ResearchReplay(feed).process_snapshot(snapshot, info, weights)
+
+    assert snapshot.timestamp == datetime(2026, 7, 21, 15, 13, 24)
+    assert snapshot.etf_quote.bid_price is None
+    assert snapshot.etf_quote.mid_price == pytest.approx(3.709)
+    assert not snapshot.etf_quote.has_executable_quote
+    assert row["premium"] == pytest.approx(2.709)
+    assert row["signal_reason"] == "missing_bid_ask"
+    assert "missing_bid_ask" in row["risk_blockers"]
+    assert not row["indicative_risk_blocked"]

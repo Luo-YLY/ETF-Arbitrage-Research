@@ -40,12 +40,23 @@ class PremiumBacktester:
     def __init__(self, config: BacktestConfig = BacktestConfig()) -> None:
         if config.exit_threshold >= config.entry_threshold:
             raise ValueError("exit threshold must be below entry threshold")
+        if config.execution_mode not in {"indicative", "executable"}:
+            raise ValueError("execution_mode must be indicative or executable")
         self.config = config
 
     def run(self, observations: pd.DataFrame) -> BacktestResult:
         missing = self.REQUIRED_COLUMNS - set(observations.columns)
         if missing:
             raise ValueError("Missing backtest columns: {}".format(sorted(missing)))
+        if self.config.execution_mode == "executable":
+            edge_columns = {"premium_at_bid", "discount_at_ask"}
+            missing_edges = edge_columns - set(observations.columns)
+            if missing_edges:
+                raise ValueError(
+                    "Executable backtest requires columns: {}".format(
+                        sorted(missing_edges)
+                    )
+                )
         frame = observations.copy()
         frame["timestamp"] = pd.to_datetime(frame["timestamp"])
         frame.sort_values("timestamp", inplace=True)
@@ -82,10 +93,20 @@ class PremiumBacktester:
                     new_position = 0
                     exit_reason = "invalid_data"
             elif position == 0 and not risk_blocked:
-                if premium >= self.config.entry_threshold:
+                premium_edge = (
+                    float(getattr(row, "premium_at_bid"))
+                    if self.config.execution_mode == "executable"
+                    else premium
+                )
+                discount_edge = (
+                    float(getattr(row, "discount_at_ask"))
+                    if self.config.execution_mode == "executable"
+                    else -premium
+                )
+                if np.isfinite(premium_edge) and premium_edge >= self.config.entry_threshold:
                     new_position = -1
                     action = "open_premium"
-                elif premium <= -self.config.entry_threshold:
+                elif np.isfinite(discount_edge) and discount_edge >= self.config.entry_threshold:
                     new_position = 1
                     action = "open_discount"
             elif position != 0:

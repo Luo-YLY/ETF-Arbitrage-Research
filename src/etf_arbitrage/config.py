@@ -27,3 +27,4 @@ class BacktestConfig:
     max_holding_periods: int = 30
     transaction_cost_bps: float = 3.0
     annualization_periods: int = 240 * 252
+    execution_mode: str = "indicative"
