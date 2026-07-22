@@ -84,38 +84,48 @@ python scripts/probe_sz_quotation.py --code 159915.SZ
 最新价时，应使用指示性模式：系统可以记录行情和计算最新价 Premium，但不会生成可执行
 套利信号。
 
-盘中先记录 ETF 快照：
+仓库包含一份可复现的159915真实PCF样本：
+
+```text
+data/pcf/20260722/pcf_159915_20260722.xml
+```
+
+采集脚本可直接解析深交所PCF，不需要手工制作成分权重CSV。内网设备克隆最新版后先测试3次：
 
 ```powershell
 $env:SZ_REDIS_HOST="内网地址"
-python scripts/record_sz_realtime.py --etf-code 159915 --interval 3
+python scripts/record_sz_realtime.py `
+  --pcf data/pcf/20260722/pcf_159915_20260722.xml `
+  --redis-code-suffix .sz `
+  --interval 3 `
+  --max-polls 3 `
+  --output tmp/recordings/20260722/159915_pcf_test.jsonl
 ```
 
-默认文件为 `tmp/recordings/YYYYMMDD/159915.jsonl`，相同市场快照会自动去重。加入成分股权重
-文件后，盘中会同时计算 IOPV、Premium、风险和信号：
+确认ETF价格、IOPV和时间持续变化后开始正式记录：
 
 ```powershell
 python scripts/record_sz_realtime.py `
-  --etf-code 159915 `
-  --components-csv tmp/pcf/159915_components.csv `
-  --shares 1000000 `
-  --creation-unit 1000000 `
-  --interval 3
+  --pcf data/pcf/20260722/pcf_159915_20260722.xml `
+  --redis-code-suffix .sz `
+  --interval 3 `
+  --output tmp/recordings/20260722/159915_with_pcf.jsonl
 ```
 
-过渡期成分股 CSV 必须包含 `stock_code,weight` 两列。这里的权重模型仍不是正式 PCF 篮子
-估值；得到 PCF 后应替换为成分股数量和预估现金差额模型。
+默认文件为 `tmp/recordings/YYYYMMDD/159915.jsonl`，相同市场快照会自动去重。PCF模式按
+`(Σ成分数量×实时价格 + 预估现金差额) / 申赎单位` 计算IOPV；任一非零数量成分股缺价时，
+该时点IOPV会被标记为无效。原有 `--components-csv` 权重模式仅保留用于旧研究数据兼容。
 
 收盘后回放记录并运行指示性回测：
 
 ```powershell
 python scripts/replay_recording.py `
-  --input tmp/recordings/20260722/159915.jsonl `
-  --components-csv tmp/pcf/159915_components.csv `
+  --input tmp/recordings/20260722/159915_with_pcf.jsonl `
+  --pcf data/pcf/20260722/pcf_159915_20260722.xml `
   --mode indicative
 ```
 
-只有采集数据确实包含买一卖一时，才使用 `--mode executable` 和采集端的
+脚本会校验PCF的ETF代码、交易日、记录数量和重复证券。只有采集数据确实包含买一卖一时，才使用 `--mode executable` 和采集端的
 `--require-bid-ask`。回放结果写入 `outputs/replay/`。
 
 ## 研究边界

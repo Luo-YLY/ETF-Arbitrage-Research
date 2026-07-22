@@ -21,14 +21,18 @@ from etf_arbitrage.data import (
     SZRedisDataFeed,
     SZRedisQuotationClient,
     SZRedisSettings,
+    SZSEPCFParser,
 )
+from etf_arbitrage.valuation import PCFIOPVCalculator
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record live Shenzhen ETF snapshots")
-    parser.add_argument("--etf-code", default="159915")
+    parser.add_argument("--etf-code")
     parser.add_argument("--trade-date", help="Redis date key in YYYYMMDD format")
-    parser.add_argument("--components-csv", type=Path)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--pcf", type=Path, help="SZSE PCF XML file")
+    source.add_argument("--components-csv", type=Path)
     parser.add_argument("--name", default="创业板ETF")
     parser.add_argument("--tracking-index", default="创业板指")
     parser.add_argument("--shares", type=float, default=1.0)
@@ -59,13 +63,20 @@ def main() -> int:
     args = parse_args()
     if args.interval <= 0:
         raise ValueError("interval must be positive")
-    trade_date = args.trade_date or date.today().strftime("%Y%m%d")
+    pcf = SZSEPCFParser().parse(args.pcf) if args.pcf else None
+    etf_code = args.etf_code or (pcf.etf_code if pcf else "159915")
+    if pcf is not None and etf_code != pcf.etf_code:
+        raise ValueError("--etf-code does not match PCF SecurityID")
+    pcf_trade_date = pcf.trading_day.strftime("%Y%m%d") if pcf else None
+    if args.trade_date and pcf_trade_date and args.trade_date != pcf_trade_date:
+        raise ValueError("--trade-date does not match PCF TradingDay")
+    trade_date = args.trade_date or pcf_trade_date or date.today().strftime("%Y%m%d")
     output = args.output or (
-        ROOT / "tmp" / "recordings" / trade_date / "{}.jsonl".format(args.etf_code)
+        ROOT / "tmp" / "recordings" / trade_date / "{}.jsonl".format(etf_code)
     )
-    weights = load_weights(args.components_csv, args.etf_code)
-    info = ETFInfo(
-        etf_code=args.etf_code,
+    weights = pcf.component_weights() if pcf else load_weights(args.components_csv, etf_code)
+    info = pcf.to_etf_info() if pcf else ETFInfo(
+        etf_code=etf_code,
         name=args.name,
         exchange="SZSE",
         tracking_index=args.tracking_index,
@@ -84,9 +95,19 @@ def main() -> int:
         require_bid_ask=args.require_bid_ask,
     )
     store = JsonlSnapshotStore(output)
-    research = ResearchReplay(feed)
+    calculator = PCFIOPVCalculator(pcf) if pcf else None
+    research = ResearchReplay(feed, calculator=calculator)
 
-    print("Recording {} to {}".format(args.etf_code, output))
+    print("Recording {} to {}".format(etf_code, output))
+    if pcf:
+        print(
+            "PCF {}: {} components, creation unit {}, estimated cash {:.2f}".format(
+                pcf.trading_day,
+                len(pcf.components),
+                pcf.creation_redemption_unit,
+                pcf.estimate_cash_component,
+            )
+        )
     if not weights:
         print("ETF-only mode: snapshots are stored, but IOPV is not calculated.")
     elif not args.require_bid_ask:
@@ -96,7 +117,7 @@ def main() -> int:
     try:
         while args.max_polls is None or polls < args.max_polls:
             started = time.monotonic()
-            snapshots = list(feed.snapshots(args.etf_code))
+            snapshots = list(feed.snapshots(etf_code))
             polls += 1
             if not snapshots:
                 print("poll={} no Redis record".format(polls))

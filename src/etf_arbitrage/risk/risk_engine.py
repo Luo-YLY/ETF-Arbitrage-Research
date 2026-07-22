@@ -52,7 +52,14 @@ class RiskEngine:
         low_liquidity = 0.0
         for stock_code, weight in normalized.items():
             quote = stock_quotes.get(stock_code)
-            if quote is None or quote.last_price is None:
+            usable_price = bool(
+                quote is not None
+                and (
+                    (quote.last_price is not None and quote.last_price > 0)
+                    or (quote.previous_close is not None and quote.previous_close > 0)
+                )
+            )
+            if not usable_price:
                 missing += weight
                 low_liquidity += weight
                 continue

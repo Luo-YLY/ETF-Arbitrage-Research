@@ -64,6 +64,7 @@ class StockQuote:
     turnover_rate: Optional[float] = None
     is_suspended: bool = False
     limit_status: LimitStatus = LimitStatus.NORMAL
+    previous_close: Optional[float] = None
 
 
 @dataclass(frozen=True)

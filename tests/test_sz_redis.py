@@ -125,6 +125,7 @@ def test_maps_real_last_price_fields_in_indicative_mode() -> None:
             "cdate": "20260721",
             "ctime": "151323",
             "closepx": 1.0,
+            "preClosepx": 0.99,
             "amount": 10_000_000,
         },
     }
@@ -147,6 +148,7 @@ def test_maps_real_last_price_fields_in_indicative_mode() -> None:
     assert snapshot.timestamp == datetime(2026, 7, 21, 15, 13, 24)
     assert snapshot.etf_quote.bid_price is None
     assert snapshot.etf_quote.mid_price == pytest.approx(3.709)
+    assert snapshot.stock_quotes["000001"].previous_close == pytest.approx(0.99)
     assert not snapshot.etf_quote.has_executable_quote
     assert row["premium"] == pytest.approx(2.709)
     assert row["signal_reason"] == "missing_bid_ask"

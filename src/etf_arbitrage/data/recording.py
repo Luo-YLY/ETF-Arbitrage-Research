@@ -88,6 +88,7 @@ class JsonlSnapshotStore:
                         "timestamp": snapshot.timestamp,
                         "stock_code": stock.stock_code,
                         "last_price": stock.last_price,
+                        "previous_close": stock.previous_close,
                         "volume": stock.volume,
                         "amount": stock.amount,
                         "turnover_rate": stock.turnover_rate,
@@ -131,6 +132,7 @@ class JsonlSnapshotStore:
                     "stock_code": stock.stock_code,
                     "timestamp": stock.timestamp.isoformat(),
                     "last_price": stock.last_price,
+                    "previous_close": stock.previous_close,
                     "volume": stock.volume,
                     "amount": stock.amount,
                     "turnover_rate": stock.turnover_rate,
@@ -159,6 +161,9 @@ class JsonlSnapshotStore:
                 turnover_rate=item.get("turnover_rate"),
                 is_suspended=bool(item.get("is_suspended", False)),
                 limit_status=LimitStatus(item.get("limit_status", LimitStatus.NORMAL.value)),
+                previous_close=JsonlSnapshotStore._optional_float(
+                    item.get("previous_close")
+                ),
             )
             for item in payload.get("stock_quotes", [])
         }

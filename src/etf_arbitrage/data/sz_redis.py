@@ -131,7 +131,7 @@ class SZRedisQuotationClient:
         redis_key = self._trade_date_key(trade_date)
         raw_records = self.connection.hmget(redis_key, requested)
         records = [
-            self._decode_record(raw_record, code)
+            dict(self._decode_record(raw_record, code), code=code)
             for code, raw_record in zip(requested, raw_records)
             if raw_record is not None
         ]
@@ -186,6 +186,7 @@ class SZRedisFieldMap:
     trade_date: Optional[str] = "cdate"
     trade_time: Optional[str] = "ctime"
     last_price: str = "closepx"
+    previous_close: Optional[str] = "preClosepx"
     bid_price: Optional[str] = "bidpx1"
     ask_price: Optional[str] = "askpx1"
     volume: Optional[str] = "volume"
@@ -264,6 +265,9 @@ class SZRedisDataFeed(DataFeed):
                 amount=self._optional_float(row, self.field_map.amount, 0.0) or 0.0,
                 is_suspended=self._optional_bool(row, self.field_map.is_suspended),
                 limit_status=self._limit_status(row),
+                previous_close=self._optional_float(
+                    row, self.field_map.previous_close
+                ),
             )
 
         bid_price = self._optional_float(etf_row, self.field_map.bid_price)

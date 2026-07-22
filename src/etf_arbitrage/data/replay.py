@@ -103,6 +103,11 @@ class DataFrameReplayFeed(DataFeed):
                     turnover_rate=getattr(stock, "turnover_rate", None),
                     is_suspended=bool(getattr(stock, "is_suspended", False)),
                     limit_status=LimitStatus(raw_limit),
+                    previous_close=(
+                        None
+                        if pd.isna(getattr(stock, "previous_close", None))
+                        else float(stock.previous_close)
+                    ),
                 )
             yield MarketSnapshot(
                 timestamp=timestamp.to_pydatetime(),

@@ -43,7 +43,13 @@ class ResearchReplay:
     ) -> dict:
         valuation = self.calculator.calculate(info, weights, snapshot.stock_quotes)
         observation = self.monitor.observe(snapshot.etf_quote, valuation)
-        risk = self.risk_engine.evaluate(snapshot.etf_quote, weights, snapshot.stock_quotes)
+        risk_weights = weights
+        resolver = getattr(self.calculator, "risk_weights", None)
+        if callable(resolver):
+            risk_weights = resolver(valuation, weights)
+        risk = self.risk_engine.evaluate(
+            snapshot.etf_quote, risk_weights, snapshot.stock_quotes
+        )
         signal = self.signal_engine.evaluate(observation, risk)
         indicative_blockers = tuple(
             blocker for blocker in risk.blockers if blocker != "missing_bid_ask"

@@ -32,5 +32,9 @@ python scripts/probe_sz_quotation.py --code 159915.SZ
 一条JSONL记录，自动跳过完全相同的市场快照。原始记录可重新转换为ETF和成分股DataFrame，
 再交给 `DataFrameReplayFeed` 回放。采集文件位于被Git忽略的 `tmp/`，不会上传内网行情。
 
+`pcf.py` 使用Python标准库解析深交所PCF XML，并校验命名空间、ETF代码、交易日、申赎单位、
+记录数量、重复证券、现金替代标志和数值类型。`PCFDocument.component_weights()`产生行情采集
+代码列表；这些值是篮子数量，不应解释为指数权重。
+
 生产环境应优先使用交易所 PCF/申购赎回清单中的组合证券数量与现金替代标志；当前 v1.0
 按归一化权重进行理论价值研究。
