@@ -1,4 +1,10 @@
 # Dashboard
 
-Streamlit 看板包含偏离监控、风险诊断、价差回测和原始研究数据四个视图。当前入口使用
-`SyntheticDataFeed`；接入真实或历史接口后，只需替换构建 `ResearchReplay` 时传入的数据源。
+Streamlit看板现在是每日研究控制台，分为三个视图：
+
+- 盘前与采集：选择ETF，下载或上传并校验PCF，启动/停止独立后台采集器；
+- 实时观察：读取采集器写出的价格、IOPV、Premium、估值质量和风险状态；
+- 收盘回测：控制均值回复开平仓阈值、最长持有期、成本和价格模式，回放当日原始快照。
+
+Dashboard只负责发出控制指令和展示状态，不承担全日常驻采集。关闭网页或Streamlit会话后，
+已启动的 `scripts/run_market_monitor.py` 仍继续运行至收盘或收到停止请求。

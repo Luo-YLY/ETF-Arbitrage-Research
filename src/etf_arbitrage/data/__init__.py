@@ -16,6 +16,13 @@ from .pcf import (
     SZSEPCFParser,
     SubstituteFlag,
 )
+from .pcf_repository import (
+    PCFRepository,
+    PCFValidationError,
+    SZSE_ETFS,
+    SZSEETFProfile,
+    load_pcf_source_templates,
+)
 from .replay import DataFrameReplayFeed
 from .recording import JsonlSnapshotStore
 from .sz_redis import (
@@ -41,6 +48,8 @@ __all__ = [
     "PCFComponent",
     "PCFDocument",
     "PCFParseError",
+    "PCFRepository",
+    "PCFValidationError",
     "QuotationSchemaError",
     "RedisDependencyError",
     "SZRedisDataFeed",
@@ -48,7 +57,10 @@ __all__ = [
     "SZRedisQuotationClient",
     "SZRedisSettings",
     "SZSEPCFParser",
+    "SZSEETFProfile",
+    "SZSE_ETFS",
     "StockQuote",
     "SyntheticDataFeed",
     "SubstituteFlag",
+    "load_pcf_source_templates",
 ]

@@ -2,7 +2,7 @@
 
 ETF Arbitrage v1.0 是一个面向研究的 Python 原型，用统一数据接口完成 ETF 理论价值计算、
 折溢价监控、机会识别、风险阻断、历史回放和价差头寸回测。第一阶段覆盖深交所 ETF，默认
-展示 159919、159915 和 159922，后续可沿同一接口扩展沪市、沪深港和 QDII ETF。
+优先监控 159915、159901、159949 和 159903，后续可沿同一接口扩展沪市、沪深港和 QDII ETF。
 
 ## 核心口径
 
@@ -31,7 +31,8 @@ ETF_Arbitrage_Project/
 │   ├── signal/        # 固定阈值和 Z-score 信号
 │   ├── risk/          # 停牌、涨跌停和流动性风险
 │   ├── backtest/      # 统一回放与价差头寸模拟
-│   ├── dashboard/     # Streamlit 研究看板
+│   ├── dashboard/     # Streamlit 每日研究控制台
+│   ├── operations/    # 交易时段与后台采集任务控制
 │   └── utils/         # 绩效统计
 ├── config/            # 示例研究参数
 ├── scripts/           # 命令行演示
@@ -127,6 +128,29 @@ python scripts/replay_recording.py `
 
 脚本会校验PCF的ETF代码、交易日、记录数量和重复证券。只有采集数据确实包含买一卖一时，才使用 `--mode executable` 和采集端的
 `--require-bid-ask`。回放结果写入 `outputs/replay/`。
+
+## 每日看板流程
+
+看板支持 159915、159901、159949、159903 的半自动工作流。启动方式：
+
+```powershell
+$env:SZ_REDIS_HOST="内网地址"
+python -m streamlit run streamlit_app.py
+```
+
+盘前在可访问外网的账户中选择交易日和ETF。PCF可以通过“直接下载地址”下载，也可以上传
+已经下载的XML或ZIP；系统会校验证券代码、交易日、申赎单位和成分数量后才落盘。基金公司
+下载直链可保存在本机的 `config/pcf_sources.local.json`，该文件不会提交到Git；直链支持
+`{etf_code}`、`{trade_date}` 和 `{trade_date_dash}` 占位符。由于不同基金公司的官网地址不同，
+项目不预置未经验证的URL。
+
+切换回内网账户后，确认四只ETF的当日PCF均显示“已校验”，再点击“启动当日采集”。后台
+进程只在 09:30-11:30 和 13:00-15:00 轮询Redis，午间等待，15:00后自动退出。原始快照写入
+`tmp/recordings/YYYYMMDD/`，实时价格、IOPV和Premium写入 `tmp/observations/YYYYMMDD/`。
+
+收盘后进入“收盘回测”，选择ETF并设置开仓阈值、平仓阈值、最长持有快照数和成本。当前
+Redis没有买一卖一时应使用“指示性（最新价）”，其收益仅表示Premium收敛研究结果，并非
+可直接成交的真实套利收益。
 
 ## 研究边界
 
