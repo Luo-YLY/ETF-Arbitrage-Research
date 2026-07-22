@@ -131,6 +131,7 @@ def test_monitor_job_validation_and_command() -> None:
     job.validate()
     command = controller.build_command(Path("job.json"))
 
+    assert job.redis_code_suffix == ".SZ"
     assert command[0]
     assert command[1].endswith("run_market_monitor.py")
     assert command[-2:] == ["--job", "job.json"]

@@ -52,7 +52,7 @@ class MarketMonitorJob:
     etf_codes: tuple[str, ...]
     pcf_paths: Mapping[str, str]
     interval: float = 3.0
-    redis_code_suffix: str = ".sz"
+    redis_code_suffix: str = ".SZ"
 
     def validate(self) -> None:
         datetime.strptime(self.trade_date, "%Y%m%d")

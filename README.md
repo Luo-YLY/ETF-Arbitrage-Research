@@ -97,7 +97,7 @@ data/pcf/20260722/pcf_159915_20260722.xml
 $env:SZ_REDIS_HOST="内网地址"
 python scripts/record_sz_realtime.py `
   --pcf data/pcf/20260722/pcf_159915_20260722.xml `
-  --redis-code-suffix .sz `
+  --redis-code-suffix .SZ `
   --interval 3 `
   --max-polls 3 `
   --output tmp/recordings/20260722/159915_pcf_test.jsonl
@@ -108,7 +108,7 @@ python scripts/record_sz_realtime.py `
 ```powershell
 python scripts/record_sz_realtime.py `
   --pcf data/pcf/20260722/pcf_159915_20260722.xml `
-  --redis-code-suffix .sz `
+  --redis-code-suffix .SZ `
   --interval 3 `
   --output tmp/recordings/20260722/159915_with_pcf.jsonl
 ```

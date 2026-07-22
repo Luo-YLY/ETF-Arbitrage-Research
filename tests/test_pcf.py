@@ -120,7 +120,7 @@ def test_pcf_to_etf_info_uses_creation_unit_and_estimated_cash() -> None:
 def test_real_pcf_drives_targeted_redis_collection_and_live_iopv() -> None:
     pcf = SZSEPCFParser().parse(PCF_PATH)
     records = {
-        "159915.sz": {
+        "159915.SZ": {
             "code": "159915.SZ",
             "cdate": "20260722",
             "ctime": "100000",
@@ -130,7 +130,7 @@ def test_real_pcf_drives_targeted_redis_collection_and_live_iopv() -> None:
     }
     records.update(
         {
-            "{}.sz".format(item.stock_code): {
+            "{}.SZ".format(item.stock_code): {
                 "code": "{}.SZ".format(item.stock_code),
                 "cdate": "20260722",
                 "ctime": "100000",
@@ -161,7 +161,7 @@ def test_real_pcf_drives_targeted_redis_collection_and_live_iopv() -> None:
         pcf.to_etf_info(),
         pcf.component_weights(),
         trade_date="20260722",
-        redis_code_suffix=".sz",
+        redis_code_suffix=".SZ",
         require_bid_ask=False,
     )
 

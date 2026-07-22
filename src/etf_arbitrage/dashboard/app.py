@@ -328,7 +328,7 @@ def render() -> None:
                         etf_codes=tuple(selected_codes),
                         pcf_paths={code: str(pcf_paths[code]) for code in selected_codes},
                         interval=float(interval),
-                        redis_code_suffix=".sz",
+                        redis_code_suffix=".SZ",
                     )
                 )
                 st.success("后台采集已启动，进程号 {}。".format(pid))

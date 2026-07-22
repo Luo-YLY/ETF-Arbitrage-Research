@@ -63,7 +63,7 @@ def load_job(path: Path) -> MarketMonitorJob:
         etf_codes=tuple(payload["etf_codes"]),
         pcf_paths={str(code): str(value) for code, value in payload["pcf_paths"].items()},
         interval=float(payload.get("interval", 3.0)),
-        redis_code_suffix=str(payload.get("redis_code_suffix", ".sz")),
+        redis_code_suffix=str(payload.get("redis_code_suffix", ".SZ")),
     )
     job.validate()
     return job
