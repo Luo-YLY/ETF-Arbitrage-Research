@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from etf_arbitrage.data import (
     PCFRepository,
@@ -49,6 +50,13 @@ from etf_arbitrage.reporting import RunRecorder
 ROOT = Path(__file__).resolve().parents[3]
 PCF_ROOT = ROOT / "data" / "pcf"
 RUN_ROOT = ROOT / "data" / "runs"
+SMOOTH_CHART_COMPONENT_ROOT = (
+    Path(__file__).resolve().parent / "components" / "smooth_runtime_charts"
+)
+smooth_runtime_charts = components.declare_component(
+    "smooth_runtime_charts",
+    path=SMOOTH_CHART_COMPONENT_ROOT,
+)
 
 SIMULATION_SCENARIO_LABELS = {
     SimulationScenario.NORMAL: "正常行情",
@@ -137,6 +145,76 @@ def _relative_price_bps(prices: list[Optional[float]], reference: float) -> list
         else float("nan")
         for price in prices
     ]
+
+
+def _smooth_chart_payload(
+    comparison_labels: list[str],
+    comparison_prices: list[Optional[float]],
+    reference: float,
+    timeline_rows: pd.DataFrame,
+) -> dict:
+    comparison_bps = _relative_price_bps(comparison_prices, reference)
+    finite_bps = [abs(value) for value in comparison_bps if value == value]
+    axis_extent = max(1.0, max(finite_bps, default=0.0) * 1.25)
+
+    timeline = timeline_rows.copy()
+    timeline["timestamp"] = pd.to_datetime(timeline["timestamp"])
+    series_specs = (
+        ("etf_last", "ETF最新价", "#202A2E", "", 2.2),
+        ("etf_bid", "ETF买一价", "#2F6B4F", "2 4", 1.4),
+        ("etf_ask", "ETF卖一价", "#C44536", "2 4", 1.4),
+        ("official_iopv", "官方IOPV", "#3A6EA5", "6 4", 1.8),
+        ("internal_iopv", "内部IOPV", "#7A5C9E", "", 1.8),
+    )
+    timeline_series = []
+    for column, name, color, dash, width in series_specs:
+        values = pd.to_numeric(timeline[column], errors="coerce")
+        timeline_series.append(
+            {
+                "name": name,
+                "color": color,
+                "dash": dash,
+                "width": width,
+                "values": [
+                    None if pd.isna(value) else float(value)
+                    for value in values
+                ],
+            }
+        )
+
+    candle_rows = []
+    candles = _daily_candlestick_frame(timeline)
+    for row in candles.itertuples(index=False):
+        candle_rows.append(
+            {
+                "day": pd.Timestamp(row.timestamp).strftime("%Y-%m-%d"),
+                "open": float(row.open),
+                "high": float(row.high),
+                "low": float(row.low),
+                "close": float(row.close),
+            }
+        )
+
+    return {
+        "bar": {
+            "labels": comparison_labels,
+            "values": comparison_bps,
+            "prices": [
+                None if value is None else float(value)
+                for value in comparison_prices
+            ],
+            "colors": ["#3A6EA5", "#4C956C", "#15616D", "#C44536", "#8B5E34"],
+            "axis_extent": axis_extent,
+        },
+        "timeline": {
+            "timestamps": [
+                value.isoformat()
+                for value in timeline["timestamp"]
+            ],
+            "series": timeline_series,
+        },
+        "candles": {"rows": candle_rows},
+    }
 
 
 def _playback_refresh_plan(
@@ -486,113 +564,20 @@ def _render_runtime_content(
                 etf.best_ask,
                 evaluation.upper_bound,
             ]
-            comparison_bps = _relative_price_bps(
-                comparison_prices,
-                evaluation.internal_iopv,
-            )
-            finite_bps = [abs(value) for value in comparison_bps if value == value]
-            axis_extent = max(1.0, max(finite_bps, default=0.0) * 1.25)
-            figure = go.Figure()
-            figure.add_bar(
-                x=comparison_labels,
-                y=comparison_bps,
-                customdata=comparison_prices,
-                text=["{:+.2f} bp".format(value) for value in comparison_bps],
-                textposition="outside",
-                marker_color=["#3A6EA5", "#4C956C", "#15616D", "#C44536", "#8B5E34"],
-                hovertemplate="%{x}<br>偏离：%{y:+.2f} bp<br>价格：%{customdata:.4f}<extra></extra>",
-            )
-            figure.add_hline(y=0, line_color="#202A2E", line_width=1.2)
-            figure.update_layout(
-                height=350,
-                margin={"l": 20, "r": 20, "t": 45, "b": 20},
-                title="相对内部IOPV偏离（0轴 = 内部IOPV）",
-                yaxis={
-                    "title": "偏离（bp）",
-                    "range": [-axis_extent, axis_extent],
-                    "zeroline": False,
-                },
-                uirevision="exec-price-deviation",
-            )
-            st.plotly_chart(
-                figure,
-                use_container_width=True,
-                key="exec_price_deviation_chart",
-                config={"displayModeBar": False},
-            )
             timeline_rows = pd.DataFrame(st.session_state.exec_history["snapshots"])
             if not timeline_rows.empty:
-                timeline_rows["timestamp"] = pd.to_datetime(timeline_rows["timestamp"])
-                history_figure = go.Figure()
-                for column, label, color, dash, width in (
-                    ("etf_last", "ETF最新价", "#202A2E", "solid", 2.2),
-                    ("etf_bid", "ETF买一价", "#2F6B4F", "dot", 1.4),
-                    ("etf_ask", "ETF卖一价", "#C44536", "dot", 1.4),
-                    ("official_iopv", "官方IOPV", "#3A6EA5", "dash", 1.8),
-                    ("internal_iopv", "内部IOPV", "#7A5C9E", "solid", 1.8),
-                ):
-                    history_figure.add_trace(
-                        go.Scatter(
-                            x=timeline_rows["timestamp"],
-                            y=timeline_rows[column],
-                            mode="lines",
-                            name=label,
-                            line={"color": color, "width": width, "dash": dash},
-                        )
-                    )
-                history_figure.update_layout(
-                    height=390,
-                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
-                    hovermode="x unified",
-                    title="ETF价格与IOPV分时走势",
-                    xaxis={
-                        "title": "模拟时间",
-                        "showspikes": True,
-                        "spikemode": "across",
-                        "spikesnap": "cursor",
-                    },
-                    yaxis={"title": "价格", "showspikes": True},
-                    legend={"orientation": "h", "y": 1.08},
-                    uirevision="exec-intraday",
+                payload = _smooth_chart_payload(
+                    comparison_labels,
+                    comparison_prices,
+                    evaluation.internal_iopv,
+                    timeline_rows,
                 )
-                st.plotly_chart(
-                    history_figure,
-                    use_container_width=True,
-                    key="exec_intraday_chart",
-                    config={"displayModeBar": False},
-                )
-                candles = _daily_candlestick_frame(timeline_rows)
-                candle_figure = go.Figure(
-                    go.Candlestick(
-                        x=candles["timestamp"],
-                        open=candles["open"],
-                        high=candles["high"],
-                        low=candles["low"],
-                        close=candles["close"],
-                        name="ETF日K",
-                        increasing_line_color="#C44536",
-                        decreasing_line_color="#2F6B4F",
-                    )
-                )
-                candle_figure.update_layout(
-                    height=350,
-                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
-                    title="ETF日K线（多日记录预留）",
-                    xaxis={
-                        "title": "交易日",
-                        "rangeslider": {"visible": False},
-                        "showspikes": True,
-                        "spikemode": "across",
-                        "spikesnap": "cursor",
-                    },
-                    yaxis={"title": "ETF价格", "showspikes": True},
-                    uirevision="exec-daily-candlestick",
-                )
-                st.plotly_chart(
-                    candle_figure,
-                    use_container_width=True,
-                    key="exec_daily_candlestick_chart",
-                    config={"displayModeBar": False},
+                smooth_runtime_charts(
+                    bar=payload["bar"],
+                    timeline=payload["timeline"],
+                    candles=payload["candles"],
+                    key="exec_smooth_runtime_charts",
+                    default=None,
                 )
 
     with tabs[1]:

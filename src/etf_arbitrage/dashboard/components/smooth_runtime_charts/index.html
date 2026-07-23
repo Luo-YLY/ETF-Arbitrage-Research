@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      color: #202a2e;
+      background: transparent;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    .chart {
+      position: relative;
+      width: 100%;
+      margin: 0 0 18px;
+    }
+
+    .chart:last-child {
+      margin-bottom: 0;
+    }
+
+    .title {
+      height: 30px;
+      padding: 2px 0 0 12px;
+      font-size: 16px;
+      font-weight: 600;
+      line-height: 28px;
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      overflow: visible;
+      background: transparent;
+    }
+
+    .axis-label {
+      fill: #596368;
+      font-size: 12px;
+    }
+
+    .value-label {
+      fill: #202a2e;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .grid {
+      stroke: #e2e6e8;
+      stroke-width: 1;
+      shape-rendering: crispEdges;
+    }
+
+    .zero-line {
+      stroke: #202a2e;
+      stroke-width: 1.25;
+      shape-rendering: crispEdges;
+    }
+
+    .legend {
+      font-size: 12px;
+      fill: #374147;
+    }
+
+    .crosshair {
+      stroke: #6d777c;
+      stroke-width: 1;
+      stroke-dasharray: 4 3;
+      pointer-events: none;
+    }
+
+    .tooltip {
+      position: absolute;
+      z-index: 3;
+      display: none;
+      min-width: 180px;
+      padding: 8px 10px;
+      border: 1px solid #cfd5d8;
+      border-radius: 4px;
+      color: #202a2e;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 3px 10px rgba(32, 42, 46, 0.12);
+      font-size: 12px;
+      line-height: 1.55;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <section id="bar-chart" class="chart">
+    <div class="title">相对内部IOPV偏离（0轴 = 内部IOPV）</div>
+    <svg aria-label="相对内部IOPV偏离"></svg>
+  </section>
+
+  <section id="line-chart" class="chart">
+    <div class="title">ETF价格与IOPV分时走势</div>
+    <svg aria-label="ETF价格与IOPV分时走势"></svg>
+    <div class="tooltip"></div>
+  </section>
+
+  <section id="candle-chart" class="chart">
+    <div class="title">ETF日K线（多日记录预留）</div>
+    <svg aria-label="ETF日K线"></svg>
+  </section>
+
+  <script>
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    let latestArgs = null;
+    let resizeTimer = null;
+
+    function post(type, payload = {}) {
+      window.parent.postMessage(
+        { isStreamlitMessage: true, type, ...payload },
+        "*"
+      );
+    }
+
+    function svgNode(name, attrs = {}, text = null) {
+      const node = document.createElementNS(SVG_NS, name);
+      for (const [key, value] of Object.entries(attrs)) {
+        node.setAttribute(key, String(value));
+      }
+      if (text !== null) {
+        node.textContent = text;
+      }
+      return node;
+    }
+
+    function finite(values) {
+      return values
+        .filter(
+          (value) =>
+            value !== null &&
+            value !== undefined &&
+            Number.isFinite(Number(value))
+        )
+        .map(Number);
+    }
+
+    function extent(values, minimumPad = 0.0001) {
+      const numbers = finite(values);
+      if (!numbers.length) {
+        return [0, 1];
+      }
+      let low = Math.min(...numbers);
+      let high = Math.max(...numbers);
+      const pad = Math.max(minimumPad, (high - low) * 0.08);
+      if (low === high) {
+        low -= pad;
+        high += pad;
+      } else {
+        low -= pad;
+        high += pad;
+      }
+      return [low, high];
+    }
+
+    function scaleLinear(domainMin, domainMax, rangeMin, rangeMax) {
+      const span = domainMax - domainMin || 1;
+      return (value) =>
+        rangeMin + ((Number(value) - domainMin) / span) * (rangeMax - rangeMin);
+    }
+
+    function replaceSvg(svg, width, height, fragment) {
+      svg.setAttribute("height", String(height));
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      svg.replaceChildren(fragment);
+    }
+
+    function drawYAxis(fragment, x, top, bottom, low, high, yScale, formatter) {
+      for (let index = 0; index <= 4; index += 1) {
+        const value = low + ((high - low) * index) / 4;
+        const y = yScale(value);
+        fragment.appendChild(
+          svgNode("line", {
+            x1: x,
+            x2: "100%",
+            y1: y,
+            y2: y,
+            class: "grid",
+          })
+        );
+        fragment.appendChild(
+          svgNode(
+            "text",
+            {
+              x: x - 8,
+              y: y + 4,
+              "text-anchor": "end",
+              class: "axis-label",
+            },
+            formatter(value)
+          )
+        );
+      }
+    }
+
+    function renderBars(data) {
+      const section = document.getElementById("bar-chart");
+      const svg = section.querySelector("svg");
+      const width = Math.max(560, svg.clientWidth || section.clientWidth || 900);
+      const height = 300;
+      const margin = { left: 64, right: 20, top: 22, bottom: 42 };
+      const plotWidth = width - margin.left - margin.right;
+      const plotBottom = height - margin.bottom;
+      const values = (data && data.values) || [];
+      const labels = (data && data.labels) || [];
+      const prices = (data && data.prices) || [];
+      const colors = (data && data.colors) || [];
+      const maximum = Math.max(1, ...finite(values).map(Math.abs));
+      const axisExtent = Number(data && data.axis_extent) || maximum * 1.25;
+      const yScale = scaleLinear(
+        -axisExtent,
+        axisExtent,
+        plotBottom,
+        margin.top
+      );
+      const zeroY = yScale(0);
+      const fragment = document.createDocumentFragment();
+
+      for (let index = 0; index <= 4; index += 1) {
+        const value = -axisExtent + (2 * axisExtent * index) / 4;
+        const y = yScale(value);
+        fragment.appendChild(
+          svgNode("line", {
+            x1: margin.left,
+            x2: width - margin.right,
+            y1: y,
+            y2: y,
+            class: Math.abs(value) < 1e-9 ? "zero-line" : "grid",
+          })
+        );
+        fragment.appendChild(
+          svgNode(
+            "text",
+            {
+              x: margin.left - 8,
+              y: y + 4,
+              "text-anchor": "end",
+              class: "axis-label",
+            },
+            `${value.toFixed(1)} bp`
+          )
+        );
+      }
+
+      const slot = plotWidth / Math.max(1, labels.length);
+      const barWidth = Math.min(76, slot * 0.55);
+      labels.forEach((label, index) => {
+        const value = Number(values[index]) || 0;
+        const x = margin.left + slot * index + (slot - barWidth) / 2;
+        const valueY = yScale(value);
+        const rectY = Math.min(zeroY, valueY);
+        const rectHeight = Math.max(2, Math.abs(zeroY - valueY));
+        const rect = svgNode("rect", {
+          x,
+          y: value === 0 ? zeroY - 2 : rectY,
+          width: barWidth,
+          height: value === 0 ? 4 : rectHeight,
+          fill: colors[index] || "#3a6ea5",
+          rx: 1,
+        });
+        rect.appendChild(
+          svgNode(
+            "title",
+            {},
+            `${label}\n偏离：${value >= 0 ? "+" : ""}${value.toFixed(2)} bp\n价格：${Number(prices[index]).toFixed(4)}`
+          )
+        );
+        fragment.appendChild(rect);
+        fragment.appendChild(
+          svgNode(
+            "text",
+            {
+              x: x + barWidth / 2,
+              y:
+                value >= 0
+                  ? Math.max(margin.top + 12, valueY - 8)
+                  : Math.min(plotBottom - 4, valueY + 17),
+              "text-anchor": "middle",
+              class: "value-label",
+            },
+            `${value >= 0 ? "+" : ""}${value.toFixed(2)} bp`
+          )
+        );
+        fragment.appendChild(
+          svgNode(
+            "text",
+            {
+              x: x + barWidth / 2,
+              y: height - 14,
+              "text-anchor": "middle",
+              class: "axis-label",
+            },
+            label
+          )
+        );
+      });
+
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      replaceSvg(svg, width, height, fragment);
+    }
+
+    function timeLabel(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return String(value || "");
+      }
+      return date.toLocaleTimeString("zh-CN", {
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+    }
+
+    function renderTimeline(data) {
+      const section = document.getElementById("line-chart");
+      const svg = section.querySelector("svg");
+      const tooltip = section.querySelector(".tooltip");
+      const width = Math.max(560, svg.clientWidth || section.clientWidth || 900);
+      const height = 350;
+      const margin = { left: 64, right: 24, top: 44, bottom: 42 };
+      const plotWidth = width - margin.left - margin.right;
+      const plotBottom = height - margin.bottom;
+      const timestamps = (data && data.timestamps) || [];
+      const series = (data && data.series) || [];
+      const allValues = series.flatMap((item) => item.values || []);
+      const [low, high] = extent(allValues, 0.00005);
+      const yScale = scaleLinear(low, high, plotBottom, margin.top);
+      const xScale = (index) =>
+        margin.left +
+        (timestamps.length <= 1
+          ? plotWidth / 2
+          : (plotWidth * index) / (timestamps.length - 1));
+      const fragment = document.createDocumentFragment();
+
+      drawYAxis(
+        fragment,
+        margin.left,
+        margin.top,
+        plotBottom,
+        low,
+        high,
+        yScale,
+        (value) => value.toFixed(4)
+      );
+
+      const legendWidth = Math.max(110, Math.floor(plotWidth / Math.max(1, series.length)));
+      series.forEach((item, seriesIndex) => {
+        const legendX = margin.left + seriesIndex * legendWidth;
+        fragment.appendChild(
+          svgNode("line", {
+            x1: legendX,
+            x2: legendX + 22,
+            y1: 17,
+            y2: 17,
+            stroke: item.color,
+            "stroke-width": item.width || 2,
+            "stroke-dasharray": item.dash || "",
+          })
+        );
+        fragment.appendChild(
+          svgNode(
+            "text",
+            { x: legendX + 28, y: 21, class: "legend" },
+            item.name
+          )
+        );
+
+        let path = "";
+        let active = false;
+        (item.values || []).forEach((value, index) => {
+          if (
+            value === null ||
+            value === undefined ||
+            !Number.isFinite(Number(value))
+          ) {
+            active = false;
+            return;
+          }
+          path += `${active ? "L" : "M"}${xScale(index).toFixed(2)},${yScale(value).toFixed(2)} `;
+          active = true;
+        });
+        fragment.appendChild(
+          svgNode("path", {
+            d: path.trim(),
+            fill: "none",
+            stroke: item.color,
+            "stroke-width": item.width || 2,
+            "stroke-dasharray": item.dash || "",
+            "vector-effect": "non-scaling-stroke",
+          })
+        );
+      });
+
+      const labelIndexes = new Set([
+        0,
+        Math.floor((timestamps.length - 1) / 4),
+        Math.floor((timestamps.length - 1) / 2),
+        Math.floor(((timestamps.length - 1) * 3) / 4),
+        Math.max(0, timestamps.length - 1),
+      ]);
+      labelIndexes.forEach((index) => {
+        if (!timestamps.length) {
+          return;
+        }
+        fragment.appendChild(
+          svgNode(
+            "text",
+            {
+              x: xScale(index),
+              y: height - 14,
+              "text-anchor": "middle",
+              class: "axis-label",
+            },
+            timeLabel(timestamps[index])
+          )
+        );
+      });
+
+      const crosshair = svgNode("line", {
+        x1: margin.left,
+        x2: margin.left,
+        y1: margin.top,
+        y2: plotBottom,
+        class: "crosshair",
+        visibility: "hidden",
+      });
+      fragment.appendChild(crosshair);
+      const overlay = svgNode("rect", {
+        x: margin.left,
+        y: margin.top,
+        width: plotWidth,
+        height: plotBottom - margin.top,
+        fill: "transparent",
+        cursor: "crosshair",
+      });
+      overlay.addEventListener("pointermove", (event) => {
+        if (!timestamps.length) {
+          return;
+        }
+        const bounds = svg.getBoundingClientRect();
+        const localX = ((event.clientX - bounds.left) / bounds.width) * width;
+        const ratio = Math.max(
+          0,
+          Math.min(1, (localX - margin.left) / plotWidth)
+        );
+        const index = Math.round(ratio * Math.max(0, timestamps.length - 1));
+        const x = xScale(index);
+        crosshair.setAttribute("x1", x);
+        crosshair.setAttribute("x2", x);
+        crosshair.setAttribute("visibility", "visible");
+        tooltip.innerHTML = [
+          `<strong>${timeLabel(timestamps[index])}</strong>`,
+          ...series.map((item) => {
+            const raw = item.values[index];
+            const value = Number(raw);
+            const shown =
+              raw !== null && raw !== undefined && Number.isFinite(value)
+                ? value.toFixed(4)
+                : "--";
+            return `<div><span style="color:${item.color}">●</span> ${item.name}：${shown}</div>`;
+          }),
+        ].join("");
+        tooltip.style.display = "block";
+        tooltip.style.left = `${Math.min(section.clientWidth - 200, Math.max(8, event.clientX - bounds.left + 12))}px`;
+        tooltip.style.top = `${Math.max(35, event.clientY - bounds.top - 18)}px`;
+      });
+      overlay.addEventListener("pointerleave", () => {
+        crosshair.setAttribute("visibility", "hidden");
+        tooltip.style.display = "none";
+      });
+      fragment.appendChild(overlay);
+
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      replaceSvg(svg, width, height, fragment);
+    }
+
+    function renderCandles(data) {
+      const section = document.getElementById("candle-chart");
+      const svg = section.querySelector("svg");
+      const width = Math.max(560, svg.clientWidth || section.clientWidth || 900);
+      const height = 300;
+      const margin = { left: 64, right: 24, top: 18, bottom: 42 };
+      const plotWidth = width - margin.left - margin.right;
+      const plotBottom = height - margin.bottom;
+      const rows = (data && data.rows) || [];
+      const [low, high] = extent(
+        rows.flatMap((row) => [row.low, row.high]),
+        0.0001
+      );
+      const yScale = scaleLinear(low, high, plotBottom, margin.top);
+      const fragment = document.createDocumentFragment();
+
+      drawYAxis(
+        fragment,
+        margin.left,
+        margin.top,
+        plotBottom,
+        low,
+        high,
+        yScale,
+        (value) => value.toFixed(4)
+      );
+
+      const slot = plotWidth / Math.max(1, rows.length);
+      const bodyWidth = Math.min(28, Math.max(8, slot * 0.42));
+      rows.forEach((row, index) => {
+        const x = margin.left + slot * index + slot / 2;
+        const open = Number(row.open);
+        const close = Number(row.close);
+        const color = close >= open ? "#c44536" : "#2f6b4f";
+        const highY = yScale(row.high);
+        const lowY = yScale(row.low);
+        const openY = yScale(open);
+        const closeY = yScale(close);
+        fragment.appendChild(
+          svgNode("line", {
+            x1: x,
+            x2: x,
+            y1: highY,
+            y2: lowY,
+            stroke: color,
+            "stroke-width": 1.4,
+          })
+        );
+        const body = svgNode("rect", {
+          x: x - bodyWidth / 2,
+          y: Math.min(openY, closeY),
+          width: bodyWidth,
+          height: Math.max(2, Math.abs(openY - closeY)),
+          fill: close >= open ? "#ffffff" : color,
+          stroke: color,
+          "stroke-width": 1.5,
+        });
+        body.appendChild(
+          svgNode(
+            "title",
+            {},
+            `${row.day}\n开：${open.toFixed(4)}\n高：${Number(row.high).toFixed(4)}\n低：${Number(row.low).toFixed(4)}\n收：${close.toFixed(4)}`
+          )
+        );
+        fragment.appendChild(body);
+        fragment.appendChild(
+          svgNode(
+            "text",
+            {
+              x,
+              y: height - 14,
+              "text-anchor": "middle",
+              class: "axis-label",
+            },
+            row.day
+          )
+        );
+      });
+
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      replaceSvg(svg, width, height, fragment);
+    }
+
+    function renderAll(args) {
+      latestArgs = args || {};
+      renderBars(latestArgs.bar || {});
+      renderTimeline(latestArgs.timeline || {});
+      renderCandles(latestArgs.candles || {});
+      requestAnimationFrame(() => {
+        post("streamlit:setFrameHeight", {
+          height: document.documentElement.scrollHeight,
+        });
+      });
+    }
+
+    window.addEventListener("message", (event) => {
+      if (!event.data || event.data.type !== "streamlit:render") {
+        return;
+      }
+      renderAll(event.data.args || {});
+    });
+
+    new ResizeObserver(() => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (latestArgs) {
+          renderAll(latestArgs);
+        }
+      }, 80);
+    }).observe(document.body);
+
+    post("streamlit:componentReady", { apiVersion: 1 });
+    post("streamlit:setFrameHeight", { height: 1080 });
+  </script>
+</body>
+</html>
