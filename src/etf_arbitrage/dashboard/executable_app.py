@@ -106,7 +106,7 @@ def _new_history() -> Dict[str, list[dict]]:
     }
 
 
-def _candlestick_frame(rows: pd.DataFrame, ticks_per_candle: int) -> pd.DataFrame:
+def _daily_candlestick_frame(rows: pd.DataFrame) -> pd.DataFrame:
     if rows.empty or "etf_last" not in rows:
         return pd.DataFrame()
     prices = rows.loc[:, ["timestamp", "etf_last"]].copy()
@@ -115,10 +115,9 @@ def _candlestick_frame(rows: pd.DataFrame, ticks_per_candle: int) -> pd.DataFram
     prices.dropna(subset=["etf_last"], inplace=True)
     if prices.empty:
         return pd.DataFrame()
-    prices["candle"] = range(len(prices))
-    prices["candle"] = prices["candle"] // max(1, ticks_per_candle)
+    prices["trading_day"] = prices["timestamp"].dt.date
     return (
-        prices.groupby("candle", sort=True)
+        prices.groupby("trading_day", sort=True)
         .agg(
             timestamp=("timestamp", "first"),
             open=("etf_last", "first"),
@@ -128,6 +127,21 @@ def _candlestick_frame(rows: pd.DataFrame, ticks_per_candle: int) -> pd.DataFram
         )
         .reset_index(drop=True)
     )
+
+
+def _playback_refresh_plan(
+    tick_interval_ms: int,
+    playback_speed: float,
+    minimum_refresh_seconds: float = 0.25,
+) -> tuple[float, int]:
+    if tick_interval_ms <= 0 or playback_speed <= 0:
+        raise ValueError("tick interval and playback speed must be positive")
+    simulated_tick_seconds = tick_interval_ms / 1_000.0 / playback_speed
+    steps_per_refresh = max(
+        1,
+        int((minimum_refresh_seconds / simulated_tick_seconds) + 0.999999),
+    )
+    return simulated_tick_seconds * steps_per_refresh, steps_per_refresh
 
 
 def _book_rows(book) -> pd.DataFrame:
@@ -323,6 +337,19 @@ def _table_download(table: str, rows: list[dict]) -> None:
 
 def render() -> None:
     st.set_page_config(page_title="深市ETF可执行套利模拟", layout="wide")
+    st.markdown(
+        """
+        <style>
+        [data-stale="true"] {
+            opacity: 1 !important;
+        }
+        .stApp, .stApp * {
+            transition-duration: 0s !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("深市ETF可执行申赎套利模拟")
     st.caption("纸面模拟系统 · 无真实下单接口")
 
@@ -744,50 +771,14 @@ def render() -> None:
             st.plotly_chart(figure, use_container_width=True)
             timeline_rows = pd.DataFrame(st.session_state.exec_history["snapshots"])
             if not timeline_rows.empty:
-                candle_ticks = st.selectbox(
-                    "K线周期",
-                    [1, 5, 10, 30, 60],
-                    index=1,
-                    format_func=lambda value: (
-                        "逐Tick" if value == 1 else "{} Tick".format(value)
-                    ),
-                    key="exec_candle_ticks",
-                )
-                candles = _candlestick_frame(timeline_rows, candle_ticks)
-                candle_figure = go.Figure(
-                    go.Candlestick(
-                        x=candles["timestamp"],
-                        open=candles["open"],
-                        high=candles["high"],
-                        low=candles["low"],
-                        close=candles["close"],
-                        name="ETF",
-                        increasing_line_color="#C44536",
-                        decreasing_line_color="#2F6B4F",
-                    )
-                )
-                candle_figure.update_layout(
-                    height=390,
-                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
-                    hovermode="x unified",
-                    title="ETF模拟行情K线",
-                    xaxis={
-                        "title": "模拟时间",
-                        "rangeslider": {"visible": False},
-                        "showspikes": True,
-                        "spikemode": "across",
-                        "spikesnap": "cursor",
-                    },
-                    yaxis={"title": "ETF价格", "showspikes": True},
-                )
-                st.plotly_chart(candle_figure, use_container_width=True)
                 timeline_rows["timestamp"] = pd.to_datetime(timeline_rows["timestamp"])
                 history_figure = go.Figure()
-                for column, label, color in (
-                    ("etf_bid", "ETF Bid", "#2F6B4F"),
-                    ("etf_ask", "ETF Ask", "#C44536"),
-                    ("official_iopv", "Official IOPV", "#3A6EA5"),
-                    ("internal_iopv", "Internal IOPV", "#7A5C9E"),
+                for column, label, color, dash, width in (
+                    ("etf_last", "ETF最新价", "#202A2E", "solid", 2.2),
+                    ("etf_bid", "ETF买一价", "#2F6B4F", "dot", 1.4),
+                    ("etf_ask", "ETF卖一价", "#C44536", "dot", 1.4),
+                    ("official_iopv", "官方IOPV", "#3A6EA5", "dash", 1.8),
+                    ("internal_iopv", "内部IOPV", "#7A5C9E", "solid", 1.8),
                 ):
                     history_figure.add_trace(
                         go.Scatter(
@@ -795,14 +786,14 @@ def render() -> None:
                             y=timeline_rows[column],
                             mode="lines",
                             name=label,
-                            line={"color": color, "width": 1.5},
+                            line={"color": color, "width": width, "dash": dash},
                         )
                     )
                 history_figure.update_layout(
-                    height=360,
+                    height=390,
                     margin={"l": 20, "r": 20, "t": 35, "b": 20},
                     hovermode="x unified",
-                    title="模拟行情时间轴",
+                    title="ETF价格与IOPV分时走势",
                     xaxis={
                         "title": "模拟时间",
                         "showspikes": True,
@@ -813,6 +804,33 @@ def render() -> None:
                     legend={"orientation": "h", "y": 1.08},
                 )
                 st.plotly_chart(history_figure, use_container_width=True)
+                candles = _daily_candlestick_frame(timeline_rows)
+                candle_figure = go.Figure(
+                    go.Candlestick(
+                        x=candles["timestamp"],
+                        open=candles["open"],
+                        high=candles["high"],
+                        low=candles["low"],
+                        close=candles["close"],
+                        name="ETF日K",
+                        increasing_line_color="#C44536",
+                        decreasing_line_color="#2F6B4F",
+                    )
+                )
+                candle_figure.update_layout(
+                    height=350,
+                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
+                    title="ETF日K线（多日记录预留）",
+                    xaxis={
+                        "title": "交易日",
+                        "rangeslider": {"visible": False},
+                        "showspikes": True,
+                        "spikemode": "across",
+                        "spikesnap": "cursor",
+                    },
+                    yaxis={"title": "ETF价格", "showspikes": True},
+                )
+                st.plotly_chart(candle_figure, use_container_width=True)
 
     with tabs[1]:
         header = {
@@ -980,14 +998,19 @@ def render() -> None:
             st.success("运行数据已保存：{}".format(output.relative_to(ROOT)))
 
     if source and source.health().running:
-        interval_ms = (
+        tick_interval_ms = (
             config.simulation.tick_interval_ms
             if source_mode == DataSourceMode.SIMULATED
             else config.file_replay.fixed_step_ms
         )
-        time.sleep(min(5.0, max(0.01, interval_ms / 1_000.0 / playback_speed)))
+        refresh_seconds, steps_per_refresh = _playback_refresh_plan(
+            tick_interval_ms,
+            playback_speed,
+        )
+        time.sleep(min(5.0, refresh_seconds))
         try:
-            _advance(source, engine)
+            for _ in range(steps_per_refresh):
+                _advance(source, engine)
         except StopIteration:
             source.stop()
             st.info("回放已结束。")
