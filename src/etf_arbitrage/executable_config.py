@@ -70,6 +70,7 @@ class SimulationConfig:
     scenario: SimulationScenario = SimulationScenario.NORMAL
     random_seed: int = 42
     tick_interval_ms: int = 1_000
+    total_ticks: int = 300
     simulation_speed: float = 1.0
     base_volatility: float = 0.00015
     etf_spread_bps: float = 2.0

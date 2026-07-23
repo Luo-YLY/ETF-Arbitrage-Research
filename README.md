@@ -169,7 +169,7 @@ ETF与成分股多档Bid/Ask + 官方PCF
 -> 虚拟账户、最终现金差额和PnL
 ```
 
-启动项目后，在Streamlit左侧页面导航中进入 `02 executable arbitrage`：
+启动项目后，在Streamlit左侧页面导航中进入“实盘套利模拟”：
 
 ```powershell
 conda activate etf-arbitrage-py314
@@ -181,6 +181,10 @@ python -m streamlit run streamlit_app.py
 ```powershell
 .\.conda\py314\python.exe -m streamlit run streamlit_app.py
 ```
+
+左侧导航固定显示为“实盘均值回复监控”和“实盘套利模拟”。模拟页面可设置有限Tick时间轴，
+并以0.25x至100x倍速连续回放；总览同步绘制ETF Bid/Ask、官方IOPV和内部IOPV时间序列，
+鼠标悬停时使用统一时间指示线。
 
 默认参数为159915、模拟行情、1 CU、库存锁定模式、禁止主动使用允许现金替代、Redis关闭、
 自动影子交易关闭和只记录机会。只有在页面中主动启用“自动影子交易”并关闭“只记录机会”后，

@@ -2,6 +2,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from etf_arbitrage.data import SZSEPCFParser
 from etf_arbitrage.executable_config import RedisConfig, SimulationConfig, SimulationScenario
@@ -25,6 +26,21 @@ def test_simulated_feed_is_reproducible_and_pcf_consistent():
     assert left.etf_order_book.bids == right.etf_order_book.bids
     assert len(left.component_order_books) > 90
     assert left.etf_order_book.best_bid > left.internal_iopv
+
+
+def test_simulated_timeline_stops_at_configured_length():
+    pcf = SZSEPCFParser().parse(PCF)
+    source = SimulatedMarketDataSource(
+        pcf,
+        SimulationConfig(total_ticks=2),
+    )
+    source.start()
+    source.step()
+    source.step()
+    assert source.current_tick == 2
+    with pytest.raises(StopIteration):
+        source.step()
+    assert not source.health().running
 
 
 def test_file_replay_never_returns_future_snapshot():

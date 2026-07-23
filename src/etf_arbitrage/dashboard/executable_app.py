@@ -334,6 +334,7 @@ def render() -> None:
         simulation_scenario = SimulationScenario.NORMAL
         random_seed = 42
         tick_ms = 1_000
+        total_ticks = 300
         playback_speed = 1.0
         premium_shock = 35.0
         levels = 5
@@ -358,7 +359,15 @@ def render() -> None:
             )
             random_seed = int(st.number_input("随机种子", 0, 1_000_000, 42))
             tick_ms = int(st.number_input("Tick间隔（毫秒）", 10, 60_000, 1_000, 10))
-            playback_speed = float(st.number_input("回放速度（倍）", 0.1, 100.0, 1.0, 0.1))
+            total_ticks = int(st.number_input("模拟时间轴长度（Tick）", 10, 100_000, 300, 10))
+            playback_speed = float(
+                st.select_slider(
+                    "模拟加速",
+                    options=[0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0],
+                    value=1.0,
+                    format_func=lambda value: "{}x".format(value),
+                )
+            )
             premium_shock = float(st.number_input("冲击（bp）", 0.0, 500.0, 35.0, 1.0))
             volatility = float(st.number_input("基础波动率", 0.0, 0.02, 0.00015, 0.00005, format="%.5f"))
             levels = int(st.number_input("盘口档位", 1, 10, 5))
@@ -498,6 +507,7 @@ def render() -> None:
             scenario=simulation_scenario,
             random_seed=random_seed,
             tick_interval_ms=tick_ms,
+            total_ticks=total_ticks,
             simulation_speed=playback_speed,
             base_volatility=volatility,
             etf_spread_bps=etf_spread,
@@ -608,6 +618,23 @@ def render() -> None:
         st.session_state.pop("exec_signature", None)
         st.rerun()
 
+    if source_mode == DataSourceMode.SIMULATED and isinstance(
+        source, SimulatedMarketDataSource
+    ):
+        generated = min(source.current_tick, config.simulation.total_ticks)
+        timeline = st.columns([1, 4, 1])
+        timeline[0].metric("时间轴", "{}/{}".format(generated, config.simulation.total_ticks))
+        timeline[1].progress(generated / config.simulation.total_ticks)
+        timeline[2].metric("模拟速度", "{}x".format(config.simulation.simulation_speed))
+        current_time = source.health().last_snapshot_time
+        simulated_seconds = config.simulation.total_ticks * config.simulation.tick_interval_ms / 1_000.0
+        st.caption(
+            "起点 09:30:00 ｜ 当前 {} ｜ 模拟跨度 {:.1f} 秒".format(
+                current_time.strftime("%H:%M:%S.%f")[:-3] if current_time else "尚未开始",
+                simulated_seconds,
+            )
+        )
+
     snapshot = st.session_state.exec_snapshot
     engine_result = st.session_state.exec_result
     tabs = st.tabs(
@@ -652,6 +679,40 @@ def render() -> None:
             )
             figure.update_layout(height=330, margin={"l": 20, "r": 20, "t": 25, "b": 20}, yaxis_title="价格")
             st.plotly_chart(figure, use_container_width=True)
+            timeline_rows = pd.DataFrame(st.session_state.exec_history["snapshots"])
+            if not timeline_rows.empty:
+                timeline_rows["timestamp"] = pd.to_datetime(timeline_rows["timestamp"])
+                history_figure = go.Figure()
+                for column, label, color in (
+                    ("etf_bid", "ETF Bid", "#2F6B4F"),
+                    ("etf_ask", "ETF Ask", "#C44536"),
+                    ("official_iopv", "Official IOPV", "#3A6EA5"),
+                    ("internal_iopv", "Internal IOPV", "#7A5C9E"),
+                ):
+                    history_figure.add_trace(
+                        go.Scatter(
+                            x=timeline_rows["timestamp"],
+                            y=timeline_rows[column],
+                            mode="lines",
+                            name=label,
+                            line={"color": color, "width": 1.5},
+                        )
+                    )
+                history_figure.update_layout(
+                    height=360,
+                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
+                    hovermode="x unified",
+                    title="模拟行情时间轴",
+                    xaxis={
+                        "title": "模拟时间",
+                        "showspikes": True,
+                        "spikemode": "across",
+                        "spikesnap": "cursor",
+                    },
+                    yaxis={"title": "价格", "showspikes": True},
+                    legend={"orientation": "h", "y": 1.08},
+                )
+                st.plotly_chart(history_figure, use_container_width=True)
 
     with tabs[1]:
         header = {

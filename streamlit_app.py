@@ -1,12 +1,23 @@
-"""Streamlit entry point that works without an editable install."""
+"""Named Streamlit navigation for the two ETF research applications."""
 
 from pathlib import Path
-import sys
+
+import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "src"))
 
-from etf_arbitrage.dashboard.app import render
-
-
-render()
+navigation = st.navigation(
+    [
+        st.Page(
+            ROOT / "pages" / "01_mean_reversion.py",
+            title="实盘均值回复监控",
+            default=True,
+        ),
+        st.Page(
+            ROOT / "pages" / "02_executable_arbitrage.py",
+            title="实盘套利模拟",
+        ),
+    ],
+    position="sidebar",
+)
+navigation.run()

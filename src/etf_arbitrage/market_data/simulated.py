@@ -78,7 +78,15 @@ class SimulatedMarketDataSource(MarketDataSource):
             return self.step()
         return self._latest
 
+    @property
+    def current_tick(self) -> int:
+        """Number of snapshots generated on the finite simulation timeline."""
+        return self._tick
+
     def step(self) -> MarketSnapshot:
+        if self._tick >= self.config.total_ticks:
+            self._running = False
+            raise StopIteration("End of simulated timeline")
         if not self._connected:
             self.connect()
         self._evolve_prices()
