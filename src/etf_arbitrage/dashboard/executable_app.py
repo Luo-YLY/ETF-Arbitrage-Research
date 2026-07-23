@@ -7,7 +7,6 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 import json
 from pathlib import Path
-import time
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -127,6 +126,17 @@ def _daily_candlestick_frame(rows: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index(drop=True)
     )
+
+
+def _relative_price_bps(prices: list[Optional[float]], reference: float) -> list[float]:
+    if reference <= 0 or reference != reference:
+        return [float("nan")] * len(prices)
+    return [
+        (float(price) / reference - 1.0) * 10_000.0
+        if price is not None and float(price) == float(price)
+        else float("nan")
+        for price in prices
+    ]
 
 
 def _playback_refresh_plan(
@@ -333,6 +343,560 @@ def _table_download(table: str, rows: list[dict]) -> None:
         )
     except ImportError:
         right.info("Parquet需要pyarrow。")
+
+
+def _render_runtime_content(
+    config: PaperArbitrageConfig,
+    pcf,
+    pcf_report,
+    pcf_path: Path,
+    etf_code: str,
+    source_mode: DataSourceMode,
+    execution_mode: ExecutionMode,
+    steps_per_refresh: int,
+) -> None:
+    source = st.session_state.exec_source
+    engine = st.session_state.exec_engine
+    runtime_notice = st.session_state.pop("exec_runtime_notice", None)
+    runtime_error = st.session_state.pop("exec_runtime_error", None)
+    if runtime_notice:
+        st.info(runtime_notice)
+    if runtime_error:
+        st.error(runtime_error)
+    manual_advance = False
+    controls = st.columns(5)
+    if controls[0].button("开始", use_container_width=True, disabled=source is None):
+        try:
+            source.start()
+            st.rerun()
+        except Exception as exc:
+            st.error("启动失败：{}".format(exc))
+    if controls[1].button("暂停", use_container_width=True, disabled=source is None):
+        source.stop()
+        st.rerun()
+    if controls[2].button("单步", use_container_width=True, disabled=source is None):
+        try:
+            _advance(source, engine)
+            manual_advance = True
+        except StopIteration:
+            st.info("回放已结束。")
+        except Exception as exc:
+            st.error("单步失败：{}".format(exc))
+    if controls[3].button("恢复", use_container_width=True, disabled=source is None):
+        try:
+            source.start()
+            st.rerun()
+        except Exception as exc:
+            st.error("恢复失败：{}".format(exc))
+    if controls[4].button("重置", use_container_width=True):
+        st.session_state.pop("exec_signature", None)
+        st.rerun()
+
+    if source and source.health().running and not manual_advance:
+        try:
+            for _ in range(steps_per_refresh):
+                _advance(source, engine)
+        except StopIteration:
+            source.stop()
+            st.session_state.exec_runtime_notice = "回放已结束。"
+            st.rerun()
+        except Exception as exc:
+            source.stop()
+            st.session_state.exec_runtime_error = "连续回放已停止：{}".format(exc)
+            st.rerun()
+
+    if source_mode == DataSourceMode.SIMULATED and isinstance(
+        source, SimulatedMarketDataSource
+    ):
+        generated = min(source.current_tick, config.simulation.total_ticks)
+        timeline = st.columns([1, 4, 1])
+        timeline[0].metric("时间轴", "{}/{}".format(generated, config.simulation.total_ticks))
+        timeline[1].progress(generated / config.simulation.total_ticks)
+        timeline[2].metric("模拟速度", "{}x".format(config.simulation.simulation_speed))
+        current_time = source.health().last_snapshot_time
+        simulated_seconds = (
+            config.simulation.total_ticks
+            * config.simulation.tick_interval_ms
+            / 1_000.0
+        )
+        st.caption(
+            "起点 09:30:00 ｜ 当前 {} ｜ 模拟跨度 {:.1f} 秒".format(
+                current_time.strftime("%H:%M:%S.%f")[:-3]
+                if current_time
+                else "尚未开始",
+                simulated_seconds,
+            )
+        )
+
+    snapshot = st.session_state.exec_snapshot
+    engine_result = st.session_state.exec_result
+    tabs = st.tabs(
+        [
+            "实时总览",
+            "PCF",
+            "盘口与篮子",
+            "套利机会",
+            "订单与申赎",
+            "损益",
+            "数据质量与日志",
+            "历史数据与导出",
+        ]
+    )
+
+    with tabs[0]:
+        health = source.health() if source else None
+        if snapshot is None or engine_result is None:
+            st.info("点击开始或单步生成第一份快照。")
+        else:
+            evaluation = engine_result.decision_evaluation
+            etf = snapshot.etf_order_book
+            first = st.columns(6)
+            system_status = (
+                SYSTEM_STATUS_LABELS.get(health.status, health.status)
+                if health
+                else "未加载"
+            )
+            first[0].metric("系统状态", system_status)
+            first[1].metric(
+                "新交易许可",
+                "允许" if evaluation.quality.new_trades_enabled else "禁止",
+            )
+            first[2].metric(
+                "风控熔断",
+                "已触发" if evaluation.quality.kill_switch else "未触发",
+            )
+            first[3].metric("ETF Last", "{:.4f}".format(etf.last_price or float("nan")))
+            first[4].metric("ETF Bid", "{:.4f}".format(etf.best_bid or float("nan")))
+            first[5].metric("ETF Ask", "{:.4f}".format(etf.best_ask or float("nan")))
+            second = st.columns(6)
+            second[0].metric(
+                "Official IOPV",
+                "{:.4f}".format(evaluation.official_iopv or float("nan")),
+            )
+            second[1].metric("Internal IOPV", "{:.4f}".format(evaluation.internal_iopv))
+            second[2].metric("Lower Bound", "{:.4f}".format(evaluation.lower_bound))
+            second[3].metric("Upper Bound", "{:.4f}".format(evaluation.upper_bound))
+            second[4].metric("申购净利润", "{:,.2f}".format(evaluation.creation.net_profit))
+            second[5].metric("赎回净利润", "{:,.2f}".format(evaluation.redemption.net_profit))
+            comparison_labels = ["下界", "ETF买一", "内部IOPV", "ETF卖一", "上界"]
+            comparison_prices = [
+                evaluation.lower_bound,
+                etf.best_bid,
+                evaluation.internal_iopv,
+                etf.best_ask,
+                evaluation.upper_bound,
+            ]
+            comparison_bps = _relative_price_bps(
+                comparison_prices,
+                evaluation.internal_iopv,
+            )
+            finite_bps = [abs(value) for value in comparison_bps if value == value]
+            axis_extent = max(1.0, max(finite_bps, default=0.0) * 1.25)
+            figure = go.Figure()
+            figure.add_bar(
+                x=comparison_labels,
+                y=comparison_bps,
+                customdata=comparison_prices,
+                text=["{:+.2f} bp".format(value) for value in comparison_bps],
+                textposition="outside",
+                marker_color=["#3A6EA5", "#4C956C", "#15616D", "#C44536", "#8B5E34"],
+                hovertemplate="%{x}<br>偏离：%{y:+.2f} bp<br>价格：%{customdata:.4f}<extra></extra>",
+            )
+            figure.add_hline(y=0, line_color="#202A2E", line_width=1.2)
+            figure.update_layout(
+                height=350,
+                margin={"l": 20, "r": 20, "t": 45, "b": 20},
+                title="相对内部IOPV偏离（0轴 = 内部IOPV）",
+                yaxis={
+                    "title": "偏离（bp）",
+                    "range": [-axis_extent, axis_extent],
+                    "zeroline": False,
+                },
+                uirevision="exec-price-deviation",
+            )
+            st.plotly_chart(
+                figure,
+                use_container_width=True,
+                key="exec_price_deviation_chart",
+                config={"displayModeBar": False},
+            )
+            timeline_rows = pd.DataFrame(st.session_state.exec_history["snapshots"])
+            if not timeline_rows.empty:
+                timeline_rows["timestamp"] = pd.to_datetime(timeline_rows["timestamp"])
+                history_figure = go.Figure()
+                for column, label, color, dash, width in (
+                    ("etf_last", "ETF最新价", "#202A2E", "solid", 2.2),
+                    ("etf_bid", "ETF买一价", "#2F6B4F", "dot", 1.4),
+                    ("etf_ask", "ETF卖一价", "#C44536", "dot", 1.4),
+                    ("official_iopv", "官方IOPV", "#3A6EA5", "dash", 1.8),
+                    ("internal_iopv", "内部IOPV", "#7A5C9E", "solid", 1.8),
+                ):
+                    history_figure.add_trace(
+                        go.Scatter(
+                            x=timeline_rows["timestamp"],
+                            y=timeline_rows[column],
+                            mode="lines",
+                            name=label,
+                            line={"color": color, "width": width, "dash": dash},
+                        )
+                    )
+                history_figure.update_layout(
+                    height=390,
+                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
+                    hovermode="x unified",
+                    title="ETF价格与IOPV分时走势",
+                    xaxis={
+                        "title": "模拟时间",
+                        "showspikes": True,
+                        "spikemode": "across",
+                        "spikesnap": "cursor",
+                    },
+                    yaxis={"title": "价格", "showspikes": True},
+                    legend={"orientation": "h", "y": 1.08},
+                    uirevision="exec-intraday",
+                )
+                st.plotly_chart(
+                    history_figure,
+                    use_container_width=True,
+                    key="exec_intraday_chart",
+                    config={"displayModeBar": False},
+                )
+                candles = _daily_candlestick_frame(timeline_rows)
+                candle_figure = go.Figure(
+                    go.Candlestick(
+                        x=candles["timestamp"],
+                        open=candles["open"],
+                        high=candles["high"],
+                        low=candles["low"],
+                        close=candles["close"],
+                        name="ETF日K",
+                        increasing_line_color="#C44536",
+                        decreasing_line_color="#2F6B4F",
+                    )
+                )
+                candle_figure.update_layout(
+                    height=350,
+                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
+                    title="ETF日K线（多日记录预留）",
+                    xaxis={
+                        "title": "交易日",
+                        "rangeslider": {"visible": False},
+                        "showspikes": True,
+                        "spikemode": "across",
+                        "spikesnap": "cursor",
+                    },
+                    yaxis={"title": "ETF价格", "showspikes": True},
+                    uirevision="exec-daily-candlestick",
+                )
+                st.plotly_chart(
+                    candle_figure,
+                    use_container_width=True,
+                    key="exec_daily_candlestick_chart",
+                    config={"displayModeBar": False},
+                )
+
+    with tabs[1]:
+        header = {
+            "ETF代码": pcf.etf_code,
+            "名称": pcf.symbol,
+            "交易日": pcf.trading_day,
+            "最小申赎单位": pcf.creation_redemption_unit,
+            "成分股数量": len(pcf.components),
+            "预估现金差额": pcf.estimate_cash_component,
+            "最大现金替代比例": pcf.max_cash_ratio,
+            "允许申购": pcf.creation_allowed,
+            "允许赎回": pcf.redemption_allowed,
+            "申购限额": pcf.creation_limit,
+            "赎回限额": pcf.redemption_limit,
+            "文件SHA256": pcf_report.file_hash,
+            "校验状态": "通过" if pcf_report.valid else "失败",
+        }
+        st.dataframe(pd.DataFrame([header]), use_container_width=True, hide_index=True)
+        subs = st.columns(3)
+        subs[0].metric("禁止现金替代", pcf_report.prohibited_count)
+        subs[1].metric("允许现金替代", pcf_report.optional_count)
+        subs[2].metric("必须现金替代", pcf_report.mandatory_count)
+        components = pd.DataFrame(
+            [
+                {
+                    "证券代码": item.stock_code,
+                    "名称": item.symbol,
+                    "数量": item.component_share,
+                    "替代标志": item.substitute_flag.name,
+                    "申购替代金额": item.creation_cash_substitute,
+                    "赎回替代金额": item.redemption_cash_substitute,
+                    "申购溢价率": item.premium_ratio,
+                    "赎回折价率": item.discount_ratio,
+                }
+                for item in pcf.components
+            ]
+        )
+        st.dataframe(
+            components,
+            use_container_width=True,
+            hide_index=True,
+            height=430,
+        )
+
+    with tabs[2]:
+        if snapshot is None or engine_result is None:
+            st.info("暂无盘口。")
+        else:
+            evaluation = engine_result.decision_evaluation
+            left, right = st.columns([1, 2])
+            with left:
+                st.subheader("ETF盘口")
+                st.dataframe(
+                    _book_rows(snapshot.etf_order_book),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            with right:
+                st.subheader("成分股盘口")
+                st.dataframe(
+                    _component_book_rows(snapshot),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=360,
+                )
+            basket = pd.DataFrame(
+                [
+                    {
+                        "方向": "申购",
+                        "实物篮子": evaluation.creation.basket.physical_value,
+                        "现金替代": evaluation.creation.basket.substitution_cash,
+                        "预估现金差额": evaluation.creation.basket.estimate_cash_component,
+                        "篮子合计": evaluation.creation.basket.total_value,
+                        "完整成交": evaluation.creation.basket.fully_filled,
+                        "瓶颈证券": evaluation.creation.basket.bottleneck_symbol,
+                    },
+                    {
+                        "方向": "赎回",
+                        "实物篮子": evaluation.redemption.basket.physical_value,
+                        "现金替代": evaluation.redemption.basket.substitution_cash,
+                        "预估现金差额": evaluation.redemption.basket.estimate_cash_component,
+                        "篮子合计": evaluation.redemption.basket.total_value,
+                        "完整成交": evaluation.redemption.basket.fully_filled,
+                        "瓶颈证券": evaluation.redemption.basket.bottleneck_symbol,
+                    },
+                ]
+            )
+            st.dataframe(basket, use_container_width=True, hide_index=True)
+
+    with tabs[3]:
+        rows = st.session_state.exec_history["opportunities"]
+        if rows:
+            st.dataframe(
+                pd.DataFrame(rows).tail(200),
+                use_container_width=True,
+                hide_index=True,
+                height=360,
+            )
+            evaluation = engine_result.decision_evaluation
+            capacity = pd.DataFrame(
+                [
+                    asdict(evaluation.creation_capacity),
+                    asdict(evaluation.redemption_capacity),
+                ]
+            )
+            st.dataframe(capacity, use_container_width=True, hide_index=True)
+            snapshots = len(st.session_state.exec_history["snapshots"])
+            opportunities = pd.DataFrame(rows)
+            n0 = snapshots
+            n1 = int((opportunities.groupby("timestamp")["net_profit"].max() > 0).sum())
+            depth_ok = (
+                opportunities["basket_fully_filled"]
+                & opportunities["etf_fully_filled"]
+            )
+            n2 = int(opportunities.loc[depth_ok, "timestamp"].nunique())
+            n3 = int(
+                opportunities[opportunities["executable"]]["timestamp"].nunique()
+            )
+            n4 = len(
+                [
+                    row
+                    for row in st.session_state.exec_history["trades"]
+                    if row["fill_time"]
+                ]
+            )
+            n5 = len(
+                [
+                    row
+                    for row in st.session_state.exec_history["trades"]
+                    if row["final_pnl"] > 0
+                ]
+            )
+            funnel = pd.DataFrame(
+                {
+                    "阶段": [
+                        "N0快照",
+                        "N1成本前正边际",
+                        "N2深度完整",
+                        "N3成本后可执行",
+                        "N4延迟后成交",
+                        "N5最终盈利",
+                    ],
+                    "数量": [n0, n1, n2, n3, n4, n5],
+                }
+            )
+            st.dataframe(funnel, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无机会记录。")
+
+    with tabs[4]:
+        history = st.session_state.exec_history
+        st.subheader("模拟订单")
+        st.dataframe(
+            pd.DataFrame(history["orders"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.subheader("模拟成交")
+        st.dataframe(
+            pd.DataFrame(history["fills"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.subheader("一级市场申赎")
+        st.dataframe(
+            pd.DataFrame(history["primary_market_requests"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabs[5]:
+        history = st.session_state.exec_history
+        pnl = pd.DataFrame(history["pnl"])
+        account_metrics = st.columns(4)
+        account_metrics[0].metric("虚拟现金", "{:,.2f}".format(engine.account.cash))
+        account_metrics[1].metric(
+            "累计已实现PnL",
+            "{:,.2f}".format(engine.account.realized_pnl),
+        )
+        account_metrics[2].metric("当日已执行CU", engine.account.daily_cu)
+        account_metrics[3].metric("执行模式", execution_mode.value)
+        if not pnl.empty:
+            pnl["累计PnL"] = pnl["final_pnl"].cumsum()
+            figure = go.Figure(
+                go.Scatter(
+                    x=pd.to_datetime(pnl["timestamp"]),
+                    y=pnl["累计PnL"],
+                    mode="lines+markers",
+                    name="累计PnL",
+                )
+            )
+            figure.update_layout(
+                height=350,
+                margin={"l": 20, "r": 20, "t": 25, "b": 20},
+                hovermode="x unified",
+                uirevision="exec-pnl",
+            )
+            st.plotly_chart(
+                figure,
+                use_container_width=True,
+                key="exec_pnl_chart",
+                config={"displayModeBar": False},
+            )
+            st.dataframe(pnl, use_container_width=True, hide_index=True)
+
+    with tabs[6]:
+        quality_rows = st.session_state.exec_history["data_quality_events"]
+        if quality_rows:
+            st.dataframe(
+                pd.DataFrame(quality_rows).tail(200),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("暂无数据质量记录。")
+        if source:
+            st.json(asdict(source.health()))
+
+    with tabs[7]:
+        summary = st.session_state.get("exec_file_summary")
+        if summary:
+            st.dataframe(
+                pd.DataFrame([asdict(summary)]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        config_json = json.dumps(config.to_dict(), ensure_ascii=False, indent=2)
+        st.download_button(
+            "导出当前配置JSON",
+            config_json.encode("utf-8"),
+            file_name="executable_arbitrage_config.json",
+            mime="application/json",
+        )
+        table = st.selectbox(
+            "导出数据表",
+            list(st.session_state.exec_history),
+            key="exec_export_table",
+        )
+        _table_download(table, st.session_state.exec_history[table])
+        if st.button(
+            "保存完整运行数据",
+            use_container_width=True,
+            key="exec_save_complete_run",
+        ):
+            recorder = RunRecorder(RUN_ROOT, config.to_dict())
+            for name, rows in st.session_state.exec_history.items():
+                for row in rows:
+                    recorder.record(name, row)
+            output = recorder.save(
+                {
+                    "etf_code": etf_code,
+                    "pcf_path": str(pcf_path),
+                    "final_cash": engine.account.cash,
+                    "realized_pnl": engine.account.realized_pnl,
+                }
+            )
+            st.success("运行数据已保存：{}".format(output.relative_to(ROOT)))
+
+
+def _render_runtime_panel(
+    config: PaperArbitrageConfig,
+    pcf,
+    pcf_report,
+    pcf_path: Path,
+    etf_code: str,
+    source_mode: DataSourceMode,
+    execution_mode: ExecutionMode,
+) -> None:
+    tick_interval_ms = (
+        config.simulation.tick_interval_ms
+        if source_mode == DataSourceMode.SIMULATED
+        else config.file_replay.fixed_step_ms
+    )
+    playback_speed = (
+        config.simulation.simulation_speed
+        if source_mode == DataSourceMode.SIMULATED
+        else config.file_replay.playback_speed
+    )
+    refresh_seconds, steps_per_refresh = _playback_refresh_plan(
+        tick_interval_ms,
+        playback_speed,
+    )
+    source = st.session_state.get("exec_source")
+    run_every = (
+        refresh_seconds
+        if source is not None and source.health().running
+        else None
+    )
+
+    @st.fragment(run_every=run_every)
+    def runtime_fragment() -> None:
+        _render_runtime_content(
+            config,
+            pcf,
+            pcf_report,
+            pcf_path,
+            etf_code,
+            source_mode,
+            execution_mode,
+            steps_per_refresh,
+        )
+
+    runtime_fragment()
 
 
 def render() -> None:
@@ -665,357 +1229,13 @@ def render() -> None:
         st.session_state.exec_result = None
         st.session_state.exec_history = _new_history()
 
-    source = st.session_state.exec_source
-    engine = st.session_state.exec_engine
-    controls = st.columns(5)
-    if controls[0].button("开始", use_container_width=True, disabled=source is None):
-        try:
-            source.start()
-            _advance(source, engine)
-            st.rerun()
-        except Exception as exc:
-            st.error("启动失败：{}".format(exc))
-    if controls[1].button("暂停", use_container_width=True, disabled=source is None):
-        source.stop()
-        st.rerun()
-    if controls[2].button("单步", use_container_width=True, disabled=source is None):
-        try:
-            _advance(source, engine)
-            st.rerun()
-        except StopIteration:
-            st.info("回放已结束。")
-        except Exception as exc:
-            st.error("单步失败：{}".format(exc))
-    if controls[3].button("恢复", use_container_width=True, disabled=source is None):
-        try:
-            source.start()
-            _advance(source, engine)
-            st.rerun()
-        except Exception as exc:
-            st.error("恢复失败：{}".format(exc))
-    if controls[4].button("重置", use_container_width=True):
-        st.session_state.pop("exec_signature", None)
-        st.rerun()
-
-    if source_mode == DataSourceMode.SIMULATED and isinstance(
-        source, SimulatedMarketDataSource
-    ):
-        generated = min(source.current_tick, config.simulation.total_ticks)
-        timeline = st.columns([1, 4, 1])
-        timeline[0].metric("时间轴", "{}/{}".format(generated, config.simulation.total_ticks))
-        timeline[1].progress(generated / config.simulation.total_ticks)
-        timeline[2].metric("模拟速度", "{}x".format(config.simulation.simulation_speed))
-        current_time = source.health().last_snapshot_time
-        simulated_seconds = config.simulation.total_ticks * config.simulation.tick_interval_ms / 1_000.0
-        st.caption(
-            "起点 09:30:00 ｜ 当前 {} ｜ 模拟跨度 {:.1f} 秒".format(
-                current_time.strftime("%H:%M:%S.%f")[:-3] if current_time else "尚未开始",
-                simulated_seconds,
-            )
-        )
-
-    snapshot = st.session_state.exec_snapshot
-    engine_result = st.session_state.exec_result
-    tabs = st.tabs(
-        [
-            "实时总览",
-            "PCF",
-            "盘口与篮子",
-            "套利机会",
-            "订单与申赎",
-            "损益",
-            "数据质量与日志",
-            "历史数据与导出",
-        ]
+    _render_runtime_panel(
+        config,
+        pcf,
+        pcf_report,
+        Path(pcf_path),
+        etf_code,
+        source_mode,
+        execution_mode,
     )
-
-    with tabs[0]:
-        health = source.health() if source else None
-        if snapshot is None or engine_result is None:
-            st.info("点击开始或单步生成第一份快照。")
-        else:
-            evaluation = engine_result.decision_evaluation
-            etf = snapshot.etf_order_book
-            first = st.columns(6)
-            system_status = (
-                SYSTEM_STATUS_LABELS.get(health.status, health.status)
-                if health
-                else "未加载"
-            )
-            first[0].metric("系统状态", system_status)
-            first[1].metric(
-                "新交易许可",
-                "允许" if evaluation.quality.new_trades_enabled else "禁止",
-            )
-            first[2].metric(
-                "风控熔断",
-                "已触发" if evaluation.quality.kill_switch else "未触发",
-            )
-            first[3].metric("ETF Last", "{:.4f}".format(etf.last_price or float("nan")))
-            first[4].metric("ETF Bid", "{:.4f}".format(etf.best_bid or float("nan")))
-            first[5].metric("ETF Ask", "{:.4f}".format(etf.best_ask or float("nan")))
-            second = st.columns(6)
-            second[0].metric("Official IOPV", "{:.4f}".format(evaluation.official_iopv or float("nan")))
-            second[1].metric("Internal IOPV", "{:.4f}".format(evaluation.internal_iopv))
-            second[2].metric("Lower Bound", "{:.4f}".format(evaluation.lower_bound))
-            second[3].metric("Upper Bound", "{:.4f}".format(evaluation.upper_bound))
-            second[4].metric("申购净利润", "{:,.2f}".format(evaluation.creation.net_profit))
-            second[5].metric("赎回净利润", "{:,.2f}".format(evaluation.redemption.net_profit))
-            figure = go.Figure()
-            figure.add_bar(
-                x=["Lower", "ETF Bid", "Internal IOPV", "ETF Ask", "Upper"],
-                y=[evaluation.lower_bound, etf.best_bid, evaluation.internal_iopv, etf.best_ask, evaluation.upper_bound],
-                marker_color=["#3A6EA5", "#4C956C", "#15616D", "#C44536", "#8B5E34"],
-            )
-            figure.update_layout(height=330, margin={"l": 20, "r": 20, "t": 25, "b": 20}, yaxis_title="价格")
-            st.plotly_chart(figure, use_container_width=True)
-            timeline_rows = pd.DataFrame(st.session_state.exec_history["snapshots"])
-            if not timeline_rows.empty:
-                timeline_rows["timestamp"] = pd.to_datetime(timeline_rows["timestamp"])
-                history_figure = go.Figure()
-                for column, label, color, dash, width in (
-                    ("etf_last", "ETF最新价", "#202A2E", "solid", 2.2),
-                    ("etf_bid", "ETF买一价", "#2F6B4F", "dot", 1.4),
-                    ("etf_ask", "ETF卖一价", "#C44536", "dot", 1.4),
-                    ("official_iopv", "官方IOPV", "#3A6EA5", "dash", 1.8),
-                    ("internal_iopv", "内部IOPV", "#7A5C9E", "solid", 1.8),
-                ):
-                    history_figure.add_trace(
-                        go.Scatter(
-                            x=timeline_rows["timestamp"],
-                            y=timeline_rows[column],
-                            mode="lines",
-                            name=label,
-                            line={"color": color, "width": width, "dash": dash},
-                        )
-                    )
-                history_figure.update_layout(
-                    height=390,
-                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
-                    hovermode="x unified",
-                    title="ETF价格与IOPV分时走势",
-                    xaxis={
-                        "title": "模拟时间",
-                        "showspikes": True,
-                        "spikemode": "across",
-                        "spikesnap": "cursor",
-                    },
-                    yaxis={"title": "价格", "showspikes": True},
-                    legend={"orientation": "h", "y": 1.08},
-                )
-                st.plotly_chart(history_figure, use_container_width=True)
-                candles = _daily_candlestick_frame(timeline_rows)
-                candle_figure = go.Figure(
-                    go.Candlestick(
-                        x=candles["timestamp"],
-                        open=candles["open"],
-                        high=candles["high"],
-                        low=candles["low"],
-                        close=candles["close"],
-                        name="ETF日K",
-                        increasing_line_color="#C44536",
-                        decreasing_line_color="#2F6B4F",
-                    )
-                )
-                candle_figure.update_layout(
-                    height=350,
-                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
-                    title="ETF日K线（多日记录预留）",
-                    xaxis={
-                        "title": "交易日",
-                        "rangeslider": {"visible": False},
-                        "showspikes": True,
-                        "spikemode": "across",
-                        "spikesnap": "cursor",
-                    },
-                    yaxis={"title": "ETF价格", "showspikes": True},
-                )
-                st.plotly_chart(candle_figure, use_container_width=True)
-
-    with tabs[1]:
-        header = {
-            "ETF代码": pcf.etf_code,
-            "名称": pcf.symbol,
-            "交易日": pcf.trading_day,
-            "最小申赎单位": pcf.creation_redemption_unit,
-            "成分股数量": len(pcf.components),
-            "预估现金差额": pcf.estimate_cash_component,
-            "最大现金替代比例": pcf.max_cash_ratio,
-            "允许申购": pcf.creation_allowed,
-            "允许赎回": pcf.redemption_allowed,
-            "申购限额": pcf.creation_limit,
-            "赎回限额": pcf.redemption_limit,
-            "文件SHA256": pcf_report.file_hash,
-            "校验状态": "通过" if pcf_report.valid else "失败",
-        }
-        st.dataframe(pd.DataFrame([header]), use_container_width=True, hide_index=True)
-        subs = st.columns(3)
-        subs[0].metric("禁止现金替代", pcf_report.prohibited_count)
-        subs[1].metric("允许现金替代", pcf_report.optional_count)
-        subs[2].metric("必须现金替代", pcf_report.mandatory_count)
-        components = pd.DataFrame(
-            [
-                {
-                    "证券代码": item.stock_code,
-                    "名称": item.symbol,
-                    "数量": item.component_share,
-                    "替代标志": item.substitute_flag.name,
-                    "申购替代金额": item.creation_cash_substitute,
-                    "赎回替代金额": item.redemption_cash_substitute,
-                    "申购溢价率": item.premium_ratio,
-                    "赎回折价率": item.discount_ratio,
-                }
-                for item in pcf.components
-            ]
-        )
-        st.dataframe(components, use_container_width=True, hide_index=True, height=430)
-
-    with tabs[2]:
-        if snapshot is None or engine_result is None:
-            st.info("暂无盘口。")
-        else:
-            evaluation = engine_result.decision_evaluation
-            left, right = st.columns([1, 2])
-            with left:
-                st.subheader("ETF盘口")
-                st.dataframe(_book_rows(snapshot.etf_order_book), use_container_width=True, hide_index=True)
-            with right:
-                st.subheader("成分股盘口")
-                st.dataframe(_component_book_rows(snapshot), use_container_width=True, hide_index=True, height=360)
-            basket = pd.DataFrame(
-                [
-                    {
-                        "方向": "申购",
-                        "实物篮子": evaluation.creation.basket.physical_value,
-                        "现金替代": evaluation.creation.basket.substitution_cash,
-                        "预估现金差额": evaluation.creation.basket.estimate_cash_component,
-                        "篮子合计": evaluation.creation.basket.total_value,
-                        "完整成交": evaluation.creation.basket.fully_filled,
-                        "瓶颈证券": evaluation.creation.basket.bottleneck_symbol,
-                    },
-                    {
-                        "方向": "赎回",
-                        "实物篮子": evaluation.redemption.basket.physical_value,
-                        "现金替代": evaluation.redemption.basket.substitution_cash,
-                        "预估现金差额": evaluation.redemption.basket.estimate_cash_component,
-                        "篮子合计": evaluation.redemption.basket.total_value,
-                        "完整成交": evaluation.redemption.basket.fully_filled,
-                        "瓶颈证券": evaluation.redemption.basket.bottleneck_symbol,
-                    },
-                ]
-            )
-            st.dataframe(basket, use_container_width=True, hide_index=True)
-
-    with tabs[3]:
-        rows = st.session_state.exec_history["opportunities"]
-        if rows:
-            st.dataframe(pd.DataFrame(rows).tail(200), use_container_width=True, hide_index=True, height=360)
-            evaluation = engine_result.decision_evaluation
-            capacity = pd.DataFrame(
-                [
-                    asdict(evaluation.creation_capacity),
-                    asdict(evaluation.redemption_capacity),
-                ]
-            )
-            st.dataframe(capacity, use_container_width=True, hide_index=True)
-            snapshots = len(st.session_state.exec_history["snapshots"])
-            opportunities = pd.DataFrame(rows)
-            n0 = snapshots
-            n1 = int((opportunities.groupby("timestamp")["net_profit"].max() > 0).sum())
-            depth_ok = opportunities["basket_fully_filled"] & opportunities["etf_fully_filled"]
-            n2 = int(opportunities.loc[depth_ok, "timestamp"].nunique())
-            n3 = int(opportunities[opportunities["executable"]]["timestamp"].nunique())
-            n4 = len([row for row in st.session_state.exec_history["trades"] if row["fill_time"]])
-            n5 = len([row for row in st.session_state.exec_history["trades"] if row["final_pnl"] > 0])
-            funnel = pd.DataFrame(
-                {"阶段": ["N0快照", "N1成本前正边际", "N2深度完整", "N3成本后可执行", "N4延迟后成交", "N5最终盈利"], "数量": [n0, n1, n2, n3, n4, n5]}
-            )
-            st.dataframe(funnel, use_container_width=True, hide_index=True)
-        else:
-            st.info("暂无机会记录。")
-
-    with tabs[4]:
-        history = st.session_state.exec_history
-        st.subheader("模拟订单")
-        st.dataframe(pd.DataFrame(history["orders"]), use_container_width=True, hide_index=True)
-        st.subheader("模拟成交")
-        st.dataframe(pd.DataFrame(history["fills"]), use_container_width=True, hide_index=True)
-        st.subheader("一级市场申赎")
-        st.dataframe(pd.DataFrame(history["primary_market_requests"]), use_container_width=True, hide_index=True)
-
-    with tabs[5]:
-        history = st.session_state.exec_history
-        pnl = pd.DataFrame(history["pnl"])
-        account_metrics = st.columns(4)
-        account_metrics[0].metric("虚拟现金", "{:,.2f}".format(engine.account.cash))
-        account_metrics[1].metric("累计已实现PnL", "{:,.2f}".format(engine.account.realized_pnl))
-        account_metrics[2].metric("当日已执行CU", engine.account.daily_cu)
-        account_metrics[3].metric("执行模式", execution_mode.value)
-        if not pnl.empty:
-            pnl["累计PnL"] = pnl["final_pnl"].cumsum()
-            figure = go.Figure(
-                go.Scatter(x=pd.to_datetime(pnl["timestamp"]), y=pnl["累计PnL"], mode="lines+markers", name="累计PnL")
-            )
-            figure.update_layout(height=350, margin={"l": 20, "r": 20, "t": 25, "b": 20}, hovermode="x unified")
-            st.plotly_chart(figure, use_container_width=True)
-            st.dataframe(pnl, use_container_width=True, hide_index=True)
-
-    with tabs[6]:
-        quality_rows = st.session_state.exec_history["data_quality_events"]
-        if quality_rows:
-            st.dataframe(pd.DataFrame(quality_rows).tail(200), use_container_width=True, hide_index=True)
-        else:
-            st.info("暂无数据质量记录。")
-        if source:
-            st.json(asdict(source.health()))
-
-    with tabs[7]:
-        summary = st.session_state.get("exec_file_summary")
-        if summary:
-            st.dataframe(pd.DataFrame([asdict(summary)]), use_container_width=True, hide_index=True)
-        config_json = json.dumps(config.to_dict(), ensure_ascii=False, indent=2)
-        st.download_button(
-            "导出当前配置JSON",
-            config_json.encode("utf-8"),
-            file_name="executable_arbitrage_config.json",
-            mime="application/json",
-        )
-        table = st.selectbox("导出数据表", list(st.session_state.exec_history))
-        _table_download(table, st.session_state.exec_history[table])
-        if st.button("保存完整运行数据", use_container_width=True):
-            recorder = RunRecorder(RUN_ROOT, config.to_dict())
-            for name, rows in st.session_state.exec_history.items():
-                for row in rows:
-                    recorder.record(name, row)
-            output = recorder.save(
-                {
-                    "etf_code": etf_code,
-                    "pcf_path": str(pcf_path),
-                    "final_cash": engine.account.cash,
-                    "realized_pnl": engine.account.realized_pnl,
-                }
-            )
-            st.success("运行数据已保存：{}".format(output.relative_to(ROOT)))
-
-    if source and source.health().running:
-        tick_interval_ms = (
-            config.simulation.tick_interval_ms
-            if source_mode == DataSourceMode.SIMULATED
-            else config.file_replay.fixed_step_ms
-        )
-        refresh_seconds, steps_per_refresh = _playback_refresh_plan(
-            tick_interval_ms,
-            playback_speed,
-        )
-        time.sleep(min(5.0, refresh_seconds))
-        try:
-            for _ in range(steps_per_refresh):
-                _advance(source, engine)
-        except StopIteration:
-            source.stop()
-            st.info("回放已结束。")
-        except Exception as exc:
-            source.stop()
-            st.error("连续回放已停止：{}".format(exc))
-        else:
-            st.rerun()
+    return

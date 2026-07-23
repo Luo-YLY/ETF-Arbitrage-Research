@@ -1,8 +1,10 @@
 import pandas as pd
+import pytest
 
 from etf_arbitrage.dashboard.executable_app import (
     _daily_candlestick_frame,
     _playback_refresh_plan,
+    _relative_price_bps,
 )
 
 
@@ -36,3 +38,9 @@ def test_high_speed_playback_batches_ticks_to_reduce_page_refreshes():
     refresh_seconds, steps = _playback_refresh_plan(1_000, 1.0)
     assert refresh_seconds == 1.0
     assert steps == 1
+
+
+def test_price_bar_uses_internal_iopv_as_zero_bps_axis():
+    values = _relative_price_bps([0.998, 0.999, 1.0, 1.001, 1.002], 1.0)
+
+    assert values == pytest.approx([-20.0, -10.0, 0.0, 10.0, 20.0])
