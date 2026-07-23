@@ -41,11 +41,21 @@ class DataFrameReplayFeed(DataFeed):
         self._etf_quotes = etf_quotes.copy()
         self._stock_quotes = stock_quotes.copy()
         self._validate()
+        self._has_snapshot_id = (
+            "snapshot_id" in self._etf_quotes.columns
+            and "snapshot_id" in self._stock_quotes.columns
+        )
 
         self._etf_quotes["timestamp"] = pd.to_datetime(self._etf_quotes["timestamp"])
         self._stock_quotes["timestamp"] = pd.to_datetime(self._stock_quotes["timestamp"])
-        self._etf_quotes.sort_values("timestamp", inplace=True)
-        self._stock_quotes.sort_values(["timestamp", "stock_code"], inplace=True)
+        etf_sort = ["timestamp", "snapshot_id"] if self._has_snapshot_id else ["timestamp"]
+        stock_sort = (
+            ["timestamp", "snapshot_id", "stock_code"]
+            if self._has_snapshot_id
+            else ["timestamp", "stock_code"]
+        )
+        self._etf_quotes.sort_values(etf_sort, inplace=True)
+        self._stock_quotes.sort_values(stock_sort, inplace=True)
 
     def _validate(self) -> None:
         """验证行情数据的完整性"""
@@ -57,6 +67,12 @@ class DataFrameReplayFeed(DataFeed):
             raise ValueError("Missing stock quote columns: {}".format(sorted(missing_stock)))
         if not self._weights:
             raise ValueError("At least one component weight is required")
+        if ("snapshot_id" in self._etf_quotes.columns) != (
+            "snapshot_id" in self._stock_quotes.columns
+        ):
+            raise ValueError(
+                "snapshot_id must be present in both ETF and stock quote frames"
+            )
 
     def get_etf_info(self, etf_code: str) -> ETFInfo:
         """获取ETF静态信息"""
@@ -84,13 +100,25 @@ class DataFrameReplayFeed(DataFeed):
             etf_rows = etf_rows[etf_rows["timestamp"] <= pd.Timestamp(end)]
 
         # 将成分股行情按时间戳分组，便于快速查找对应的股票行情
-        stock_groups: Dict[pd.Timestamp, pd.DataFrame] = {
-            timestamp: frame for timestamp, frame in self._stock_quotes.groupby("timestamp")
-        }
+        if self._has_snapshot_id:
+            stock_groups = {
+                (timestamp, snapshot_id): frame
+                for (timestamp, snapshot_id), frame in self._stock_quotes.groupby(
+                    ["timestamp", "snapshot_id"]
+                )
+            }
+        else:
+            stock_groups = {
+                timestamp: frame
+                for timestamp, frame in self._stock_quotes.groupby("timestamp")
+            }
         # 逐个时点遍历ETF行情数据，生成MarketSnapshot对象
         for row in etf_rows.itertuples(index=False):
             timestamp = pd.Timestamp(row.timestamp)
-            stock_frame = stock_groups.get(timestamp, pd.DataFrame())
+            group_key = (
+                (timestamp, row.snapshot_id) if self._has_snapshot_id else timestamp
+            )
+            stock_frame = stock_groups.get(group_key, pd.DataFrame())
             stock_map: Dict[str, StockQuote] = {}
             for stock in stock_frame.itertuples(index=False):
                 raw_limit = getattr(stock, "limit_status", LimitStatus.NORMAL.value)

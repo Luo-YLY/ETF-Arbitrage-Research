@@ -71,8 +71,10 @@ class JsonlSnapshotStore:
             if fingerprint in seen:
                 continue
             seen.add(fingerprint)
+            snapshot_id = len(etf_rows)
             etf_rows.append(
                 {
+                    "snapshot_id": snapshot_id,
                     "timestamp": snapshot.timestamp,
                     "ETF_code": quote.etf_code,
                     "last_price": quote.last_price,
@@ -85,6 +87,7 @@ class JsonlSnapshotStore:
             for stock in snapshot.stock_quotes.values():
                 stock_rows.append(
                     {
+                        "snapshot_id": snapshot_id,
                         "timestamp": snapshot.timestamp,
                         "stock_code": stock.stock_code,
                         "last_price": stock.last_price,

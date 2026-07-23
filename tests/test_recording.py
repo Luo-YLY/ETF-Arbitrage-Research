@@ -16,12 +16,18 @@ from etf_arbitrage.data import (
 )
 
 
-def snapshot(timestamp: datetime, price: float = 1.2) -> MarketSnapshot:
+def snapshot(
+    timestamp: datetime,
+    price: float = 1.2,
+    stock_price: float = 1.0,
+) -> MarketSnapshot:
     return MarketSnapshot(
         timestamp=timestamp,
         etf_quote=ETFQuote(timestamp, "159915", price, None, None, 0, 10_000_000),
         stock_quotes={
-            "000001": StockQuote(timestamp, "000001", 1.0, 0, amount=5_000_000)
+            "000001": StockQuote(
+                timestamp, "000001", stock_price, 0, amount=5_000_000
+            )
         },
     )
 
@@ -43,6 +49,33 @@ def test_jsonl_store_deduplicates_and_loads_replay_frames() -> None:
         assert len(stock_frame) == 2
         assert etf_frame.iloc[0]["bid_price"] is None
         assert etf_frame.iloc[-1]["last_price"] == pytest.approx(1.201)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_replay_keeps_distinct_snapshots_with_the_same_timestamp() -> None:
+    path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    timestamp = datetime(2026, 7, 22, 9, 30)
+    try:
+        store = JsonlSnapshotStore(path)
+        assert store.append(snapshot(timestamp, stock_price=1.0))
+        assert store.append(snapshot(timestamp, stock_price=1.1))
+
+        etf_frame, stock_frame = store.to_frames("159915")
+        info = ETFInfo("159915", "ETF", "SZSE", "INDEX", 1, 1)
+        weights = [ComponentWeight("159915", "000001", 1.0)]
+        replayed = list(
+            DataFrameReplayFeed(
+                info, weights, etf_frame, stock_frame
+            ).snapshots("159915")
+        )
+
+        assert etf_frame["snapshot_id"].tolist() == [0, 1]
+        assert stock_frame["snapshot_id"].tolist() == [0, 1]
+        assert [item.stock_quotes["000001"].last_price for item in replayed] == [
+            1.0,
+            1.1,
+        ]
     finally:
         path.unlink(missing_ok=True)
 
