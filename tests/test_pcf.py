@@ -1,6 +1,9 @@
 import json
 from datetime import date, datetime
 from pathlib import Path
+import shutil
+import xml.etree.ElementTree as ET
+from uuid import uuid4
 
 import pytest
 
@@ -33,6 +36,50 @@ def test_parses_real_szse_pcf_sample() -> None:
         item.substitute_flag == SubstituteFlag.MANDATORY for item in pcf.components
     ) == 2
     assert len([item for item in pcf.components if item.component_share > 0]) == 98
+
+
+def test_parser_accepts_compact_substitute_fields() -> None:
+    namespace = "http://ts.szse.cn/Fund"
+    tree = ET.parse(PCF_PATH)
+    components = tree.getroot().findall(
+        ".//{{{}}}Component".format(namespace)
+    )
+    allowed = next(
+        item
+        for item in components
+        if item.find("{{{}}}SubstituteFlag".format(namespace)).text == "1"
+    )
+    mandatory = next(
+        item
+        for item in components
+        if item.find("{{{}}}SubstituteFlag".format(namespace)).text == "2"
+    )
+    for tag in ("CreationCashSubstitute", "RedemptionCashSubstitute"):
+        allowed.remove(allowed.find("{{{}}}{}".format(namespace, tag)))
+    for tag in ("ComponentShare", "PremiumRatio"):
+        mandatory.remove(mandatory.find("{{{}}}{}".format(namespace, tag)))
+
+    temporary = Path("tmp") / "tests" / uuid4().hex
+    temporary.mkdir(parents=True)
+    try:
+        compact_path = temporary / "compact_pcf.xml"
+        tree.write(compact_path, encoding="utf-8", xml_declaration=True)
+        pcf = SZSEPCFParser().parse(compact_path)
+        allowed_component = next(
+            item for item in pcf.components if item.stock_code == "300001"
+        )
+        mandatory_component = next(
+            item
+            for item in pcf.components
+            if item.substitute_flag == SubstituteFlag.MANDATORY
+        )
+
+        assert allowed_component.creation_cash_substitute == 0.0
+        assert allowed_component.redemption_cash_substitute == 0.0
+        assert mandatory_component.component_share == 0.0
+        assert mandatory_component.premium_ratio == 0.0
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
 
 
 def test_pcf_iopv_uses_component_quantities_and_estimated_cash() -> None:

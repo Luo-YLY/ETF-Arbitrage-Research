@@ -1,6 +1,6 @@
 {
-  "159915": "https://reportdocs.static.szse.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml",
-  "159901": "https://reportdocs.static.szse.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml",
-  "159949": "https://reportdocs.static.szse.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml",
-  "159903": "https://reportdocs.static.szse.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml"
+  "159915": "https://reportdocs.static.sse.org.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml",
+  "159901": "https://reportdocs.static.sse.org.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml",
+  "159949": "https://reportdocs.static.sse.org.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml",
+  "159903": "https://reportdocs.static.sse.org.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml"
 }

@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Union
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
@@ -30,6 +30,11 @@ SZSE_ETFS: Mapping[str, SZSEETFProfile] = {
     "159949": SZSEETFProfile("159949", "创业板50ETF华安", "华安基金", "399673 创业板50"),
     "159903": SZSEETFProfile("159903", "深成ETF南方", "南方基金", "399001 深证成指"),
 }
+
+SZSE_REPORT_DOCUMENT_HOSTS = (
+    "reportdocs.static.szse.cn",
+    "reportdocs.static.sse.org.cn",
+)
 
 
 class PCFValidationError(ValueError):
@@ -120,7 +125,7 @@ class PCFRepository:
             and parsed.hostname.lower().endswith("szse.cn")
             and parsed.path.endswith("/eft_download_new.html")
         ):
-            return [url]
+            return PCFRepository._report_document_candidates(url)
 
         query = parse_qs(parsed.query)
         source_path = query.get("path", [""])[0]
@@ -132,17 +137,34 @@ class PCFRepository:
         expected_name = "pcf_{}_{}".format(etf_code, day)
         ordered_names = [expected_name] + [name for name in filenames if name]
         unique_names = list(dict.fromkeys(ordered_names))
-        base = "https://reportdocs.static.szse.cn{}".format(source_path.rstrip("/"))
+        bases = [
+            "https://{}{}".format(host, source_path.rstrip("/"))
+            for host in SZSE_REPORT_DOCUMENT_HOSTS
+        ]
         candidates = []
         for name in unique_names:
             suffix = Path(name).suffix.lower()
             if suffix in {".xml", ".txt"}:
-                candidates.append("{}/{}".format(base, name))
+                candidates.extend("{}/{}".format(base, name) for base in bases)
             else:
-                candidates.extend(
-                    ["{}/{}.xml".format(base, name), "{}/{}.txt".format(base, name)]
-                )
-        return candidates
+                for extension in ("xml", "txt"):
+                    candidates.extend(
+                        "{}/{}.{}".format(base, name, extension) for base in bases
+                    )
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _report_document_candidates(url: str) -> List[str]:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        if hostname not in SZSE_REPORT_DOCUMENT_HOSTS:
+            return [url]
+        ordered_hosts = [hostname] + [
+            host for host in SZSE_REPORT_DOCUMENT_HOSTS if host != hostname
+        ]
+        return [
+            urlunparse(parsed._replace(netloc=host)) for host in ordered_hosts
+        ]
 
     def validate(
         self,

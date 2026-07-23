@@ -94,9 +94,29 @@ def test_szse_download_page_resolves_to_direct_pcf_candidates() -> None:
         "https://reportdocs.static.szse.cn/files/text/ETFDown/"
         "pcf_159915_20260722.xml"
     )
-    assert candidates[1].endswith("pcf_159915_20260722.txt")
-    assert candidates[-2].endswith("159915ETF20260722.xml")
+    assert candidates[1] == (
+        "https://reportdocs.static.sse.org.cn/files/text/ETFDown/"
+        "pcf_159915_20260722.xml"
+    )
+    assert candidates[2].endswith("pcf_159915_20260722.txt")
+    assert candidates[-3].endswith("159915ETF20260722.xml")
     assert candidates[-1].endswith("159915ETF20260722.txt")
+
+
+def test_direct_report_url_includes_official_backup_host() -> None:
+    candidates = PCFRepository.download_candidates(
+        "https://reportdocs.static.szse.cn/files/text/ETFDown/"
+        "pcf_159915_20260723.xml",
+        "159915",
+        "20260723",
+    )
+
+    assert candidates == [
+        "https://reportdocs.static.szse.cn/files/text/ETFDown/"
+        "pcf_159915_20260723.xml",
+        "https://reportdocs.static.sse.org.cn/files/text/ETFDown/"
+        "pcf_159915_20260723.xml",
+    ]
 
 
 def test_repository_downloads_from_szse_landing_page(monkeypatch) -> None:
@@ -127,6 +147,43 @@ def test_repository_downloads_from_szse_landing_page(monkeypatch) -> None:
         assert requested_urls == [
             "https://reportdocs.static.szse.cn/files/text/ETFDown/"
             "pcf_159915_20260722.xml"
+        ]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_repository_falls_back_to_official_report_host(monkeypatch) -> None:
+    root = Path("tmp") / "tests" / uuid4().hex
+    requested_urls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return PCF_SAMPLE.read_bytes()
+
+    def fake_urlopen(request, timeout):
+        requested_urls.append(request.full_url)
+        if request.full_url.startswith("https://reportdocs.static.szse.cn"):
+            raise OSError("primary report host unavailable")
+        return FakeResponse()
+
+    monkeypatch.setattr("etf_arbitrage.data.pcf_repository.urlopen", fake_urlopen)
+    try:
+        path = PCFRepository(root).download(
+            SZSE_DOWNLOAD_PAGE, "159915", "20260722"
+        )
+
+        assert path.exists()
+        assert requested_urls == [
+            "https://reportdocs.static.szse.cn/files/text/ETFDown/"
+            "pcf_159915_20260722.xml",
+            "https://reportdocs.static.sse.org.cn/files/text/ETFDown/"
+            "pcf_159915_20260722.xml",
         ]
     finally:
         shutil.rmtree(root, ignore_errors=True)

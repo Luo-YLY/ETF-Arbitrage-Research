@@ -145,7 +145,8 @@ class SZSEPCFParser:
         )
 
     def _parse_component(self, element: ET.Element, q) -> PCFComponent:
-        shares = self._number(element, q("ComponentShare"))
+        # SZSE compact PCFs omit fields that are not applicable to a substitute flag.
+        shares = self._optional_number(element, q("ComponentShare"))
         if shares < 0:
             raise PCFParseError("ComponentShare cannot be negative")
         raw_flag = self._integer(element, q("SubstituteFlag"))
@@ -159,11 +160,11 @@ class SZSEPCFParser:
             symbol=self._text(element, q("UnderlyingSymbol")),
             component_share=shares,
             substitute_flag=flag,
-            premium_ratio=self._number(element, q("PremiumRatio")),
-            creation_cash_substitute=self._number(
+            premium_ratio=self._optional_number(element, q("PremiumRatio")),
+            creation_cash_substitute=self._optional_number(
                 element, q("CreationCashSubstitute")
             ),
-            redemption_cash_substitute=self._number(
+            redemption_cash_substitute=self._optional_number(
                 element, q("RedemptionCashSubstitute")
             ),
         )
@@ -190,6 +191,17 @@ class SZSEPCFParser:
     @classmethod
     def _number(cls, parent: ET.Element, tag: str) -> float:
         return float(cls._decimal(parent, tag))
+
+    @staticmethod
+    def _optional_number(parent: ET.Element, tag: str, default: float = 0.0) -> float:
+        element = parent.find(tag)
+        if element is None or element.text is None or not element.text.strip():
+            return default
+        text = element.text.strip()
+        try:
+            return float(Decimal(text))
+        except InvalidOperation as exc:
+            raise PCFParseError("Invalid numeric PCF value: {}".format(text)) from exc
 
     @classmethod
     def _integer(cls, parent: ET.Element, tag: str) -> int:

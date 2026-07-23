@@ -143,7 +143,8 @@ python -m streamlit run streamlit_app.py
 会自动解析并尝试对应的XML/TXT文件；仍可上传已经下载的XML或ZIP作为兜底。系统会校验
 证券代码、交易日、申赎单位和成分数量后才落盘。自定义下载地址可保存在本机的
 `config/pcf_sources.local.json`，该文件不会提交到Git；地址支持 `{etf_code}`、
-`{trade_date}` 和 `{trade_date_dash}` 占位符。
+`{trade_date}` 和 `{trade_date_dash}` 占位符。下载器会在深交所公开配置的主用
+`reportdocs.static.szse.cn` 与备用 `reportdocs.static.sse.org.cn` 文件域名之间自动切换。
 
 切换回内网账户后，确认四只ETF的当日PCF均显示“已校验”，再点击“启动当日采集”。后台
 进程只在 09:30-11:30 和 13:00-15:00 轮询Redis，午间等待，15:00后自动退出。原始快照写入
