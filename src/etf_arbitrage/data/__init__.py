@@ -23,6 +23,7 @@ from .pcf_repository import (
     SZSEETFProfile,
     load_pcf_source_templates,
 )
+from .pcf_validation import PCFValidationReport, validate_executable_pcf
 from .replay import DataFrameReplayFeed
 from .recording import JsonlSnapshotStore
 from .sz_redis import (
@@ -63,4 +64,6 @@ __all__ = [
     "SyntheticDataFeed",
     "SubstituteFlag",
     "load_pcf_source_templates",
+    "PCFValidationReport",
+    "validate_executable_pcf",
 ]

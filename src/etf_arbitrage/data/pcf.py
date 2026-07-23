@@ -36,6 +36,7 @@ class PCFComponent:
     premium_ratio: float
     creation_cash_substitute: float
     redemption_cash_substitute: float
+    discount_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,10 @@ class PCFDocument:
     nav_per_creation_unit: float
     nav: float
     components: tuple[PCFComponent, ...]
+    creation_limit: float = 0.0
+    redemption_limit: float = 0.0
+    net_creation_limit: float = 0.0
+    net_redemption_limit: float = 0.0
 
     def component_weights(self) -> List[ComponentWeight]:
         """Return quantity weights used to request all PCF component quotes."""
@@ -142,6 +147,10 @@ class SZSEPCFParser:
             nav_per_creation_unit=self._number(root, q("NAVperCU")),
             nav=self._number(root, q("NAV")),
             components=components,
+            creation_limit=self._optional_number(root, q("CreationLimit")),
+            redemption_limit=self._optional_number(root, q("RedemptionLimit")),
+            net_creation_limit=self._optional_number(root, q("NetCreationLimit")),
+            net_redemption_limit=self._optional_number(root, q("NetRedemptionLimit")),
         )
 
     def _parse_component(self, element: ET.Element, q) -> PCFComponent:
@@ -167,6 +176,7 @@ class SZSEPCFParser:
             redemption_cash_substitute=self._optional_number(
                 element, q("RedemptionCashSubstitute")
             ),
+            discount_ratio=self._optional_number(element, q("DiscountRatio")),
         )
 
     @staticmethod
