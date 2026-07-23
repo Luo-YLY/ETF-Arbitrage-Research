@@ -222,3 +222,34 @@ def test_monitor_job_requires_every_selected_pcf() -> None:
 
     with pytest.raises(ValueError, match="159901"):
         job.validate()
+
+
+def test_monitor_worker_forces_utf8_output(monkeypatch) -> None:
+    root = Path("tmp") / "tests" / uuid4().hex
+    captured = {}
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr("etf_arbitrage.operations.market_day.subprocess.Popen", fake_popen)
+    try:
+        controller = MarketMonitorController(root)
+        job = MarketMonitorJob(
+            trade_date="20260723",
+            etf_codes=("159915",),
+            pcf_paths={"159915": "sample.xml"},
+        )
+
+        controller.start(job)
+
+        environment = captured["kwargs"]["env"]
+        assert environment["PYTHONUNBUFFERED"] == "1"
+        assert environment["PYTHONIOENCODING"] == "utf-8"
+        assert environment["PYTHONUTF8"] == "1"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

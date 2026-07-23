@@ -175,7 +175,7 @@ type tmp\runtime\market_monitor_YYYYMMDD.json
 
 查看最后20行日志：
 
-powershell -NoProfile -Command "Get-Content -Tail 20 'tmp\runtime\market_monitor_YYYYMMDD.log'"
+powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 20 'tmp\runtime\market_monitor_YYYYMMDD.log'"
 
 检查原始行情文件：
 
@@ -261,6 +261,17 @@ python -m streamlit run streamlit_app.py
 7. Git提示 Connection was reset
 
 说明当前网络无法访问GitHub。代码更新必须在可访问外网的账户中完成。
+
+8. 采集日志中文乱码
+
+最新版会强制后台采集进程使用UTF-8。查看日志时不要直接使用 type，使用：
+
+powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 20 'tmp\runtime\market_monitor_YYYYMMDD.log'"
+
+旧版本已经写入的乱码不会自动修复。停止当日采集并关闭看板后，可以把旧日志改名留档，
+再用最新版重新启动采集：
+
+ren tmp\runtime\market_monitor_YYYYMMDD.log market_monitor_YYYYMMDD_legacy_encoding.log
 
 
 每日最简检查清单

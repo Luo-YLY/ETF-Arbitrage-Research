@@ -109,7 +109,12 @@ class MarketMonitorController:
             "cwd": str(self.project_root),
             "stdout": log_handle,
             "stderr": subprocess.STDOUT,
-            "env": dict(os.environ, PYTHONUNBUFFERED="1"),
+            "env": dict(
+                os.environ,
+                PYTHONUNBUFFERED="1",
+                PYTHONIOENCODING="utf-8",
+                PYTHONUTF8="1",
+            ),
         }
         if os.name == "nt":
             kwargs["creationflags"] = (
