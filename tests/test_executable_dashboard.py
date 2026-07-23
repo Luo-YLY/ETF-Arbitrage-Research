@@ -7,6 +7,26 @@ from etf_arbitrage.dashboard.executable_app import (
     _relative_price_bps,
     _smooth_chart_payload,
 )
+from etf_arbitrage.dashboard.page_state import (
+    ACTIVE_PAGE_KEY,
+    EXECUTABLE_ARBITRAGE_PAGE,
+    MEAN_REVERSION_PAGE,
+    activate_dashboard_page,
+    dashboard_page_is_active,
+)
+
+
+class FakeSource:
+    def __init__(self) -> None:
+        self.running = True
+        self.stop_calls = 0
+
+    def health(self):
+        return type("Health", (), {"running": self.running})()
+
+    def stop(self) -> None:
+        self.running = False
+        self.stop_calls += 1
 
 
 def test_tick_history_is_aggregated_into_daily_ohlc_candles():
@@ -83,3 +103,27 @@ def test_smooth_chart_payload_contains_bar_timeline_and_daily_candle():
             "close": 1.01,
         }
     ]
+
+
+def test_switching_to_mean_reversion_stops_hidden_executable_runtime():
+    source = FakeSource()
+    state = {
+        ACTIVE_PAGE_KEY: EXECUTABLE_ARBITRAGE_PAGE,
+        "exec_source": source,
+    }
+
+    activate_dashboard_page(state, MEAN_REVERSION_PAGE)
+
+    assert state[ACTIVE_PAGE_KEY] == MEAN_REVERSION_PAGE
+    assert source.stop_calls == 1
+    assert not dashboard_page_is_active(state, EXECUTABLE_ARBITRAGE_PAGE)
+
+
+def test_activating_executable_page_keeps_runtime_available():
+    source = FakeSource()
+    state = {"exec_source": source}
+
+    activate_dashboard_page(state, EXECUTABLE_ARBITRAGE_PAGE)
+
+    assert source.stop_calls == 0
+    assert dashboard_page_is_active(state, EXECUTABLE_ARBITRAGE_PAGE)

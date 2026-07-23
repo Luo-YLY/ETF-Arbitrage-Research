@@ -45,6 +45,11 @@ from etf_arbitrage.market_data import (
     SimulatedMarketDataSource,
 )
 from etf_arbitrage.reporting import RunRecorder
+from etf_arbitrage.dashboard.page_state import (
+    EXECUTABLE_ARBITRAGE_PAGE,
+    activate_dashboard_page,
+    dashboard_page_is_active,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -870,6 +875,10 @@ def _render_runtime_panel(
 
     @st.fragment(run_every=run_every)
     def runtime_fragment() -> None:
+        if not dashboard_page_is_active(
+            st.session_state, EXECUTABLE_ARBITRAGE_PAGE
+        ):
+            return
         _render_runtime_content(
             config,
             pcf,
@@ -886,18 +895,9 @@ def _render_runtime_panel(
 
 def render() -> None:
     st.set_page_config(page_title="深市ETF可执行套利模拟", layout="wide")
-    st.markdown(
-        """
-        <style>
-        [data-stale="true"] {
-            opacity: 1 !important;
-        }
-        .stApp, .stApp * {
-            transition-duration: 0s !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
+    activate_dashboard_page(
+        st.session_state,
+        EXECUTABLE_ARBITRAGE_PAGE,
     )
     st.title("深市ETF可执行申赎套利模拟")
     st.caption("纸面模拟系统 · 无真实下单接口")

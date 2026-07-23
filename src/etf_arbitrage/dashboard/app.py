@@ -31,6 +31,10 @@ from etf_arbitrage.operations import (
     read_job_state,
 )
 from etf_arbitrage.valuation import PCFIOPVCalculator
+from etf_arbitrage.dashboard.page_state import (
+    MEAN_REVERSION_PAGE,
+    activate_dashboard_page,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -355,6 +359,7 @@ def _run_replay(
 
 def render() -> None:
     st.set_page_config(page_title="深市ETF套利研究控制台", layout="wide")
+    activate_dashboard_page(st.session_state, MEAN_REVERSION_PAGE)
     st.title("深市ETF套利研究控制台")
     st.caption("盘前PCF准备 · 交易时段行情采集 · 收盘后均值回复回测")
 
