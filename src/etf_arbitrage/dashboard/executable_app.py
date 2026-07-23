@@ -51,6 +51,32 @@ ROOT = Path(__file__).resolve().parents[3]
 PCF_ROOT = ROOT / "data" / "pcf"
 RUN_ROOT = ROOT / "data" / "runs"
 
+SIMULATION_SCENARIO_LABELS = {
+    SimulationScenario.NORMAL: "正常行情",
+    SimulationScenario.PREMIUM_SHOCK: "ETF溢价冲击",
+    SimulationScenario.DISCOUNT_SHOCK: "ETF折价冲击",
+    SimulationScenario.MEAN_REVERSION: "折溢价均值回复",
+    SimulationScenario.ETF_DEPTH_SHORTAGE: "ETF盘口深度不足",
+    SimulationScenario.COMPONENT_DEPTH_SHORTAGE: "成分股盘口深度不足",
+    SimulationScenario.STALE_QUOTE: "成分股报价陈旧",
+    SimulationScenario.MISSING_QUOTE: "成分股行情缺失",
+    SimulationScenario.SUSPENSION: "成分股停牌",
+    SimulationScenario.LIMIT_UP_NO_ASK: "涨停且无卖盘",
+    SimulationScenario.LIMIT_DOWN_NO_BID: "跌停且无买盘",
+    SimulationScenario.DECODE_ERROR: "行情解码错误",
+    SimulationScenario.SEQUENCE_GAP: "行情序号断档",
+    SimulationScenario.CROSSED_BOOK: "异常交叉盘口",
+    SimulationScenario.PCF_INVALID: "PCF交易日无效",
+}
+
+SYSTEM_STATUS_LABELS = {
+    "RUNNING": "运行中",
+    "READY": "就绪",
+    "DISCONNECTED": "未连接",
+    "DISABLED": "已禁用",
+    "ERROR": "异常",
+}
+
 
 def _latest_local_day(etf_code: str) -> date:
     paths = sorted(PCF_ROOT.glob("*/pcf_{}_*.xml".format(etf_code)), reverse=True)
@@ -78,6 +104,30 @@ def _new_history() -> Dict[str, list[dict]]:
         "pnl": [],
         "data_quality_events": [],
     }
+
+
+def _candlestick_frame(rows: pd.DataFrame, ticks_per_candle: int) -> pd.DataFrame:
+    if rows.empty or "etf_last" not in rows:
+        return pd.DataFrame()
+    prices = rows.loc[:, ["timestamp", "etf_last"]].copy()
+    prices["timestamp"] = pd.to_datetime(prices["timestamp"])
+    prices["etf_last"] = pd.to_numeric(prices["etf_last"], errors="coerce")
+    prices.dropna(subset=["etf_last"], inplace=True)
+    if prices.empty:
+        return pd.DataFrame()
+    prices["candle"] = range(len(prices))
+    prices["candle"] = prices["candle"] // max(1, ticks_per_candle)
+    return (
+        prices.groupby("candle", sort=True)
+        .agg(
+            timestamp=("timestamp", "first"),
+            open=("etf_last", "first"),
+            high=("etf_last", "max"),
+            low=("etf_last", "min"),
+            close=("etf_last", "last"),
+        )
+        .reset_index(drop=True)
+    )
 
 
 def _book_rows(book) -> pd.DataFrame:
@@ -354,8 +404,10 @@ def render() -> None:
         sequence_gap_probability = 0.0
         quote_latency = 50
         if source_mode == DataSourceMode.SIMULATED:
-            simulation_scenario = SimulationScenario(
-                st.selectbox("模拟场景", [item.value for item in SimulationScenario])
+            simulation_scenario = st.selectbox(
+                "模拟场景",
+                list(SimulationScenario),
+                format_func=lambda scenario: SIMULATION_SCENARIO_LABELS[scenario],
             )
             random_seed = int(st.number_input("随机种子", 0, 1_000_000, 42))
             tick_ms = int(st.number_input("Tick间隔（毫秒）", 10, 60_000, 1_000, 10))
@@ -476,7 +528,7 @@ def render() -> None:
             max_limit_up = float(st.slider("最大涨停无卖盘权重", 0.0, 1.0, 0.10, 0.01))
             max_limit_down = float(st.slider("最大跌停无买盘权重", 0.0, 1.0, 0.10, 0.01))
             max_iopv_error = float(st.number_input("最大IOPV误差（bp）", 0.0, 10_000.0, 30.0))
-            kill_switch_enabled = st.checkbox("启用Kill Switch", value=True)
+            kill_switch_enabled = st.checkbox("启用风控熔断", value=True)
 
     if pcf_path is None:
         st.error("缺少已校验的当日PCF。")
@@ -658,9 +710,20 @@ def render() -> None:
             evaluation = engine_result.decision_evaluation
             etf = snapshot.etf_order_book
             first = st.columns(6)
-            first[0].metric("系统状态", health.status if health else "未加载")
-            first[1].metric("Trading Enabled", "是" if evaluation.quality.new_trades_enabled else "否")
-            first[2].metric("Kill Switch", "ON" if evaluation.quality.kill_switch else "OFF")
+            system_status = (
+                SYSTEM_STATUS_LABELS.get(health.status, health.status)
+                if health
+                else "未加载"
+            )
+            first[0].metric("系统状态", system_status)
+            first[1].metric(
+                "新交易许可",
+                "允许" if evaluation.quality.new_trades_enabled else "禁止",
+            )
+            first[2].metric(
+                "风控熔断",
+                "已触发" if evaluation.quality.kill_switch else "未触发",
+            )
             first[3].metric("ETF Last", "{:.4f}".format(etf.last_price or float("nan")))
             first[4].metric("ETF Bid", "{:.4f}".format(etf.best_bid or float("nan")))
             first[5].metric("ETF Ask", "{:.4f}".format(etf.best_ask or float("nan")))
@@ -681,6 +744,43 @@ def render() -> None:
             st.plotly_chart(figure, use_container_width=True)
             timeline_rows = pd.DataFrame(st.session_state.exec_history["snapshots"])
             if not timeline_rows.empty:
+                candle_ticks = st.selectbox(
+                    "K线周期",
+                    [1, 5, 10, 30, 60],
+                    index=1,
+                    format_func=lambda value: (
+                        "逐Tick" if value == 1 else "{} Tick".format(value)
+                    ),
+                    key="exec_candle_ticks",
+                )
+                candles = _candlestick_frame(timeline_rows, candle_ticks)
+                candle_figure = go.Figure(
+                    go.Candlestick(
+                        x=candles["timestamp"],
+                        open=candles["open"],
+                        high=candles["high"],
+                        low=candles["low"],
+                        close=candles["close"],
+                        name="ETF",
+                        increasing_line_color="#C44536",
+                        decreasing_line_color="#2F6B4F",
+                    )
+                )
+                candle_figure.update_layout(
+                    height=390,
+                    margin={"l": 20, "r": 20, "t": 35, "b": 20},
+                    hovermode="x unified",
+                    title="ETF模拟行情K线",
+                    xaxis={
+                        "title": "模拟时间",
+                        "rangeslider": {"visible": False},
+                        "showspikes": True,
+                        "spikemode": "across",
+                        "spikesnap": "cursor",
+                    },
+                    yaxis={"title": "ETF价格", "showspikes": True},
+                )
+                st.plotly_chart(candle_figure, use_container_width=True)
                 timeline_rows["timestamp"] = pd.to_datetime(timeline_rows["timestamp"])
                 history_figure = go.Figure()
                 for column, label, color in (
