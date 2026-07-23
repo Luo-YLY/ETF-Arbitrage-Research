@@ -1,0 +1,283 @@
+深市ETF套利研究系统：内网设备每日启动流程
+========================================
+
+适用环境
+--------
+1. Windows 内网设备。
+2. 使用 Miniforge Prompt，不使用 PowerShell 环境变量语法。
+3. 项目已经完成环境安装，日常启动不需要重复安装依赖。
+4. 当前监控标的：159915、159901、159949、159903。
+5. Redis 行情代码由程序自动转换为大写 .SZ 后缀。
+
+重要说明
+--------
+1. YYYYMMDD 表示当天日期，例如 20260723。
+2. 必须先在可访问外网的账户完成代码更新和PCF下载，再切换内网账户。
+3. 内网采集启动后不要切换账户，否则Redis连接可能中断。
+4. 当前Redis没有买一卖一，回测价格模式使用“指示性（最新价）”。
+5. 指示性回测衡量Premium收敛，不代表可以直接成交的真实套利收益。
+
+
+第一步：外网账户更新项目
+------------------------
+
+打开 Miniforge Prompt，进入项目目录：
+
+cd /d "C:\你的项目目录\ETF_Arbitrage_Project"
+
+根据本机环境选择一种激活方式，不要两条都执行：
+
+conda activate etf-arbitrage-py314
+
+或者项目内环境：
+
+conda activate ".\.conda\py314"
+
+在能够访问GitHub的外网账户更新代码：
+
+git -c http.version=HTTP/1.1 pull origin main
+git log -1 --oneline
+
+如果出现 Connection was reset，说明当前网络无法连接GitHub。确认正在使用外网账户后重试，
+不要在无法访问外网的内网账户中反复执行。
+
+
+第二步：外网账户下载当日PCF
+----------------------------
+
+启动看板：
+
+python -m streamlit run streamlit_app.py
+
+浏览器打开：
+
+http://127.0.0.1:8501
+
+在看板中进行以下操作：
+
+1. 交易日选择当天日期。
+2. 监控ETF选择：159915、159901、159949、159903。
+3. 在“盘前与采集”页面依次选择四只ETF。
+4. 对每只ETF点击“下载并校验PCF”。
+5. 确认四只ETF的PCF状态均为“已校验”。
+
+PCF文件应保存到：
+
+data\pcf\YYYYMMDD\pcf_159915_YYYYMMDD.xml
+data\pcf\YYYYMMDD\pcf_159901_YYYYMMDD.xml
+data\pcf\YYYYMMDD\pcf_159949_YYYYMMDD.xml
+data\pcf\YYYYMMDD\pcf_159903_YYYYMMDD.xml
+
+项目会在深交所公开配置的主用和备用文件域名之间自动切换。目前可用模板为：
+
+https://reportdocs.static.sse.org.cn/files/text/ETFDown/pcf_{etf_code}_{trade_date}.xml
+
+PCF全部准备完成后，在运行看板的终端按 Ctrl+C，关闭外网账户下的看板，然后切换内网账户。
+
+
+第三步：内网账户确认Python环境
+------------------------------
+
+切换到内网账户，重新打开 Miniforge Prompt：
+
+cd /d "C:\你的项目目录\ETF_Arbitrage_Project"
+
+根据本机环境选择一种激活方式：
+
+conda activate etf-arbitrage-py314
+
+或者：
+
+conda activate ".\.conda\py314"
+
+确认解释器和依赖：
+
+python --version
+python -c "import sys; print(sys.executable)"
+python -c "import redis, pandas, streamlit; print('环境正常')"
+
+如果这里报模块缺失，应先回到可访问外网的账户处理依赖，不要临近开盘时在内网账户重新建环境。
+
+
+第四步：设置并测试Redis
+-----------------------
+
+在 Miniforge Prompt 中设置Redis。将 YOUR_REDIS_HOST 替换成实际内网地址：
+
+set SZ_REDIS_HOST=YOUR_REDIS_HOST
+set SZ_REDIS_PORT=6379
+set SZ_REDIS_DB=0
+set SZ_REDIS_PASSWORD=
+
+确认变量：
+
+set SZ_REDIS
+
+测试当天159915行情。将 YYYYMMDD 替换成当天日期：
+
+python scripts\probe_sz_quotation.py --code 159915.SZ --date YYYYMMDD
+
+正常结果应显示Redis记录中的可用字段和JSON内容。
+
+注意：
+1. 盘前今日Redis哈希尚未生成时，可能显示 No quotation record found。
+2. 开盘后应看到 closepx、ctime、amount 等字段。
+3. Redis代码必须是 159915.SZ 形式，但看板内只选择六位ETF代码。
+
+
+第五步：启动内网看板和行情采集
+--------------------------------
+
+必须在已经执行 set SZ_REDIS_HOST 的同一个 Miniforge Prompt 中启动：
+
+python -m streamlit run streamlit_app.py
+
+浏览器打开：
+
+http://127.0.0.1:8501
+
+看板参数：
+
+1. 交易日：当天日期。
+2. 监控ETF：159915、159901、159949、159903。
+3. 采集间隔：3秒。
+4. 回测价格模式：指示性（最新价）。
+5. 图表频率：建议1分钟，原始数据仍按3秒保存。
+6. 确认四只ETF的PCF均为“已校验”。
+7. 确认Redis配置显示“已配置”。
+
+点击“启动当日采集”。
+
+可以在9:30之前启动。后台任务会等待开盘，不需要等到9:30再点击。
+
+
+第六步：交易时段安排
+--------------------
+
+系统自动按以下时间运行：
+
+09:30-11:30    上午采集
+11:30-13:00    午间等待
+13:00-15:00    下午采集
+15:00以后      自动结束
+
+午间不要点击“停止采集”，也不需要下午重新启动。
+
+
+第七步：检查采集状态
+--------------------
+
+如需命令行检查，可另开一个 Miniforge Prompt，激活相同环境并进入项目目录。
+
+查看任务状态：
+
+type tmp\runtime\market_monitor_YYYYMMDD.json
+
+查看最后20行日志：
+
+powershell -NoProfile -Command "Get-Content -Tail 20 'tmp\runtime\market_monitor_YYYYMMDD.log'"
+
+检查原始行情文件：
+
+dir tmp\recordings\YYYYMMDD
+
+检查派生观察文件：
+
+dir tmp\observations\YYYYMMDD
+
+每只ETF正常应产生：
+
+tmp\recordings\YYYYMMDD\159915.jsonl
+tmp\observations\YYYYMMDD\159915.jsonl
+
+其他三只ETF使用各自代码命名。
+
+状态解释：
+
+waiting             盘前或午间等待
+running             采集任务正在运行
+stored              已写入新的行情快照
+unchanged           Redis快照未变化，程序已自动跳过重复记录
+no_redis_record     Redis中暂未找到该证券记录
+error               发生错误，需要查看日志
+completed           收盘后任务正常结束
+
+
+第八步：收盘后回测
+------------------
+
+15:00以后刷新任务状态，确认显示 completed，然后进入“收盘回测”。
+
+依次对四只ETF操作：
+
+1. 选择回测ETF。
+2. 使用“指示性（最新价）”模式。
+3. 设置开仓阈值、平仓阈值、最长持有快照数和单边成本。
+4. 点击“运行收盘回测”。
+5. 查看折溢价和累计价差收益指数的上下对齐图。
+6. 根据需要下载观察结果CSV。
+
+每日需要保留的数据：
+
+data\pcf\YYYYMMDD\
+tmp\recordings\YYYYMMDD\
+tmp\observations\YYYYMMDD\
+tmp\runtime\market_monitor_YYYYMMDD.log
+
+
+常见问题
+--------
+
+1. PCF下载404或无法访问
+
+先更新到最新版。项目会在以下两个官方文件域名之间自动切换：
+
+reportdocs.static.szse.cn
+reportdocs.static.sse.org.cn
+
+2. 看板显示Redis未配置
+
+说明启动看板的终端中没有设置 SZ_REDIS_HOST。按 Ctrl+C 关闭看板，在同一终端重新执行：
+
+set SZ_REDIS_HOST=YOUR_REDIS_HOST
+python -m streamlit run streamlit_app.py
+
+3. 开盘前没有行情记录
+
+通常是今日Redis日期键尚未生成。开盘后再次检查，不要因此修改PCF或删除文件。
+
+4. 日志连续显示 unchanged
+
+表示Redis行情快照没有变化，程序正在正常去重。如果开盘后长时间不变，再检查Redis数据源。
+
+5. 最新成交价为0
+
+不要把0当作有效市场价格。等待开盘后的有效成交，或检查行情字段是否发生变化。
+
+6. Git提示 not a git repository
+
+说明当前目录不是Git克隆目录。先执行 cd /d 进入真正的 ETF_Arbitrage_Project 目录。
+
+7. Git提示 Connection was reset
+
+说明当前网络无法访问GitHub。代码更新必须在可访问外网的账户中完成。
+
+
+每日最简检查清单
+----------------
+
+[ ] 外网账户更新Git代码
+[ ] 选择当天交易日
+[ ] 下载并校验四份PCF
+[ ] 关闭外网看板并切换内网账户
+[ ] 激活Miniforge环境
+[ ] 设置SZ_REDIS_HOST
+[ ] 测试159915.SZ行情
+[ ] 启动内网看板
+[ ] 选择四只ETF和3秒采集间隔
+[ ] 点击启动当日采集
+[ ] 开盘后确认recordings和observations持续增长
+[ ] 午间保持任务等待，不停止
+[ ] 收盘后确认completed
+[ ] 对四只ETF运行指示性回测
+[ ] 保留当日PCF、原始行情、观察结果和日志
