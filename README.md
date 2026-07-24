@@ -32,12 +32,14 @@ ETF_Arbitrage_Project/
 │   ├── risk/          # 停牌、涨跌停和流动性风险
 │   ├── backtest/      # 统一回放与价差头寸模拟
 │   ├── dashboard/     # Streamlit 每日研究控制台
+│   ├── dashboard_panel/ # Panel + Bokeh 增量回放实验台
 │   ├── operations/    # 交易时段与后台采集任务控制
 │   └── utils/         # 绩效统计
 ├── config/            # 示例研究参数
 ├── scripts/           # 命令行演示
 ├── tests/             # 基础与集成测试
-└── streamlit_app.py   # 看板入口
+├── streamlit_app.py   # Streamlit 看板入口
+└── panel_app.py       # Panel 实验台入口
 ```
 
 采用 `src/etf_arbitrage/signal` 命名空间而非项目根目录的 `signal` 包，是为了避免覆盖 Python
@@ -53,10 +55,16 @@ conda env create -f environment.yml
 conda activate etf-arbitrage-py314
 python scripts/run_demo.py
 python -m streamlit run streamlit_app.py
+python -m panel serve panel_app.py --address 127.0.0.1 --port 8505
 ```
 
 当前工作区也可将环境直接创建在 `.conda/py314`，通过
-`.\.conda\py314\python.exe` 使用，无需修改全局环境。两个运行入口会自动加载本地 `src` 目录。
+`.\.conda\py314\python.exe` 使用，无需修改全局环境。各运行入口会自动加载本地 `src` 目录。
+
+Panel 实验台打开地址为 `http://127.0.0.1:8505/panel_app`。它优先读取
+`tmp/observations/YYYYMMDD/ETF.jsonl`，缺少实时观察结果时再读取
+`outputs/data_check/YYYYMMDD/ETF/observations.csv`。开始、暂停、单步、重置和倍速回放均在
+同一组 Bokeh 图表模型上增量更新，用于比较长期监控场景下的刷新观感。
 
 ## 数据接入
 
