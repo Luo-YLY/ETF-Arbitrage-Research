@@ -59,7 +59,7 @@ class PremiumBacktester:
                 )
         frame = observations.copy()
         frame["timestamp"] = pd.to_datetime(frame["timestamp"])
-        frame.sort_values("timestamp", inplace=True)
+        frame.sort_values("timestamp", kind="stable", inplace=True)
         frame.reset_index(drop=True, inplace=True)
         if "risk_blocked" not in frame:
             frame["risk_blocked"] = False

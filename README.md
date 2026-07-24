@@ -64,7 +64,9 @@ python -m panel serve panel_app.py --address 127.0.0.1 --port 8505
 Panel 实验台打开地址为 `http://127.0.0.1:8505/panel_app`。它优先读取
 `tmp/observations/YYYYMMDD/ETF.jsonl`，缺少实时观察结果时再读取
 `outputs/data_check/YYYYMMDD/ETF/observations.csv`。开始、暂停、单步、重置和倍速回放均在
-同一组 Bokeh 图表模型上增量更新，用于比较长期监控场景下的刷新观感。
+同一组 Bokeh 图表模型上增量更新。实验台直接复用 `PremiumBacktester`，支持控制开仓阈值、
+平仓阈值、最长持有期、单边成本和指示性/可执行价格模式，并同步展示仓位、开平仓动作、
+累计价差收益指数、胜率和最大回撤。
 
 ## 数据接入
 

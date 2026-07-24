@@ -56,3 +56,25 @@ def test_executable_mode_uses_bid_and_ask_edges_for_entry() -> None:
     result = engine.run(frame)
 
     assert len(result.trades) == 0
+
+
+def test_duplicate_timestamps_keep_source_order() -> None:
+    timestamp = datetime(2026, 1, 1, 10, 0)
+    frame = pd.DataFrame(
+        {
+            "timestamp": [timestamp, timestamp, timestamp],
+            "premium": [0.006, 0.004, 0.0005],
+            "source_order": ["first", "second", "third"],
+            "risk_blocked": [False, False, False],
+        }
+    )
+
+    result = PremiumBacktester(
+        BacktestConfig(entry_threshold=0.005, exit_threshold=0.001)
+    ).run(frame)
+
+    assert result.timeline["source_order"].tolist() == [
+        "first",
+        "second",
+        "third",
+    ]

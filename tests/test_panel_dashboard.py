@@ -98,13 +98,22 @@ def test_panel_replay_streams_rows_without_replacing_chart_models():
         source_identity = id(dashboard.source)
         template = dashboard.template()
 
+        assert dashboard.frame["action"].tolist() == [
+            "open_premium",
+            "hold",
+            "close_end_of_replay",
+        ]
+        assert dashboard.source.data["position"] == [-1, -1]
         dashboard._stream_rows(1)
 
-        assert template.title == "深市ETF套利监控实验台"
+        assert template.title == "深市ETF均值回复监控实验台"
         assert id(dashboard.source) == source_identity
         assert dashboard.cursor == 3
         assert len(dashboard.source.data["timestamp"]) == 3
+        assert dashboard.source.data["position"] == [-1, -1, 0]
+        assert dashboard.source.data["close_equity"][-1] > 0
         assert dashboard.progress.value == 100
+        assert "已平仓" in dashboard.strategy_metrics.object
 
         dashboard._reset_clicked(None)
         assert dashboard.cursor == 2

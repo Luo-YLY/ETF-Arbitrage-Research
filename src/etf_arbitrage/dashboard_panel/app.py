@@ -11,6 +11,9 @@ import panel as pn
 from bokeh.models import ColumnDataSource, CrosshairTool, HoverTool, Span
 from bokeh.plotting import figure
 
+from etf_arbitrage.backtest import BacktestResult, PremiumBacktester
+from etf_arbitrage.config import BacktestConfig
+
 from .data import (
     ObservationDataset,
     datasets_by_day,
@@ -36,6 +39,12 @@ EMPTY_SOURCE = {
     "ask_price": [],
     "iopv": [],
     "premium_pct": [],
+    "position": [],
+    "action": [],
+    "equity": [],
+    "strategy_return": [],
+    "open_equity": [],
+    "close_equity": [],
 }
 
 RAW_CSS = """
@@ -95,7 +104,10 @@ class PanelReplayDashboard:
         if not self.datasets:
             raise RuntimeError("No observation datasets were found")
         self.by_day = datasets_by_day(self.datasets)
+        self.observations = pd.DataFrame()
         self.frame = pd.DataFrame()
+        self.backtest_result: Optional[BacktestResult] = None
+        self.strategy_error = ""
         self.cursor = 0
         self.callback: Optional[Any] = None
         self._changing_dataset = False
@@ -129,6 +141,35 @@ class PanelReplayDashboard:
             start=0.01,
             end=5.0,
         )
+        self.exit_threshold = pn.widgets.FloatInput(
+            label="平仓阈值（%）",
+            value=0.05,
+            step=0.01,
+            start=0.0,
+            end=2.0,
+        )
+        self.max_holding = pn.widgets.IntInput(
+            label="最长持有期（快照数）",
+            value=600,
+            step=10,
+            start=1,
+            end=10000,
+        )
+        self.transaction_cost = pn.widgets.FloatInput(
+            label="单边换仓成本（bp）",
+            value=3.0,
+            step=0.5,
+            start=0.0,
+            end=100.0,
+        )
+        self.execution_mode = pn.widgets.Select(
+            label="回测价格模式",
+            options={
+                "指示性（最新价）": "indicative",
+                "可执行（买一卖一）": "executable",
+            },
+            value="indicative",
+        )
         self.window_size = pn.widgets.IntInput(
             label="图表保留点数",
             value=5000,
@@ -160,7 +201,9 @@ class PanelReplayDashboard:
         self.source = ColumnDataSource(data={key: [] for key in EMPTY_SOURCE})
         self.price_figure = self._build_price_figure()
         self.premium_figure = self._build_premium_figure()
+        self.strategy_figure = self._build_strategy_figure()
         self.premium_figure.x_range = self.price_figure.x_range
+        self.strategy_figure.x_range = self.price_figure.x_range
         self.upper_span = Span(
             location=self.entry_threshold.value,
             dimension="width",
@@ -175,6 +218,20 @@ class PanelReplayDashboard:
             line_dash="dashed",
             line_width=1.2,
         )
+        self.exit_upper_span = Span(
+            location=self.exit_threshold.value,
+            dimension="width",
+            line_color="#7A5C9E",
+            line_dash="dotdash",
+            line_width=1,
+        )
+        self.exit_lower_span = Span(
+            location=-self.exit_threshold.value,
+            dimension="width",
+            line_color="#7A5C9E",
+            line_dash="dotdash",
+            line_width=1,
+        )
         self.zero_span = Span(
             location=0,
             dimension="width",
@@ -183,6 +240,8 @@ class PanelReplayDashboard:
         )
         self.premium_figure.add_layout(self.upper_span)
         self.premium_figure.add_layout(self.lower_span)
+        self.premium_figure.add_layout(self.exit_upper_span)
+        self.premium_figure.add_layout(self.exit_lower_span)
         self.premium_figure.add_layout(self.zero_span)
 
         self.metrics = pn.pane.HTML(
@@ -191,6 +250,11 @@ class PanelReplayDashboard:
             stylesheets=[RAW_CSS],
         )
         self.status = pn.pane.HTML(
+            "",
+            sizing_mode="stretch_width",
+            stylesheets=[RAW_CSS],
+        )
+        self.strategy_metrics = pn.pane.HTML(
             "",
             sizing_mode="stretch_width",
             stylesheets=[RAW_CSS],
@@ -220,7 +284,14 @@ class PanelReplayDashboard:
 
         self.day_select.param.watch(self._dataset_changed, "value")
         self.etf_select.param.watch(self._dataset_changed, "value")
-        self.entry_threshold.param.watch(self._threshold_changed, "value")
+        for widget in (
+            self.entry_threshold,
+            self.exit_threshold,
+            self.max_holding,
+            self.transaction_cost,
+            self.execution_mode,
+        ):
+            widget.param.watch(self._strategy_parameters_changed, "value")
         self.play_button.on_click(self._play)
         self.pause_button.on_click(self._pause)
         self.step_button.on_click(self._single_step)
@@ -328,6 +399,62 @@ class PanelReplayDashboard:
         chart.outline_line_color = "#cfd5d8"
         return chart
 
+    def _build_strategy_figure(self):
+        chart = figure(
+            title="均值回复累计价差收益指数",
+            x_axis_type="datetime",
+            height=300,
+            sizing_mode="stretch_width",
+            tools="xpan,xwheel_zoom,box_zoom,reset,save",
+            active_scroll="xwheel_zoom",
+        )
+        chart.line(
+            "timestamp",
+            "equity",
+            source=self.source,
+            legend_label="累计价差收益指数",
+            color=ACCENT,
+            line_width=2,
+        )
+        chart.scatter(
+            "timestamp",
+            "open_equity",
+            source=self.source,
+            legend_label="开仓",
+            color=POSITIVE,
+            marker="triangle",
+            size=9,
+        )
+        chart.scatter(
+            "timestamp",
+            "close_equity",
+            source=self.source,
+            legend_label="平仓",
+            color=NEGATIVE,
+            marker="inverted_triangle",
+            size=9,
+        )
+        chart.add_tools(
+            CrosshairTool(dimensions="height"),
+            HoverTool(
+                tooltips=[
+                    ("时间", "@timestamp{%F %T}"),
+                    ("收益指数", "@equity{0.000000}"),
+                    ("仓位", "@position"),
+                    ("动作", "@action"),
+                ],
+                formatters={"@timestamp": "datetime"},
+                mode="vline",
+            ),
+        )
+        chart.yaxis.axis_label = "累计价差收益指数"
+        chart.legend.orientation = "horizontal"
+        chart.legend.location = "top_left"
+        chart.legend.click_policy = "hide"
+        chart.grid.grid_line_color = "#e4e8ea"
+        chart.outline_line_color = "#cfd5d8"
+        return chart
+
     def _dataset_changed(self, event: Any) -> None:
         if self._changing_dataset:
             return
@@ -344,7 +471,8 @@ class PanelReplayDashboard:
 
     def _load_selected_dataset(self) -> None:
         self._stop_callback()
-        self.frame = load_observations(self.dataset)
+        self.observations = load_observations(self.dataset)
+        self._recompute_backtest()
         self.cursor = 0
         self._clear_source()
         self._update_quality_summary()
@@ -402,20 +530,74 @@ class PanelReplayDashboard:
             "ask_price": list(rows["ask_price"]),
             "iopv": list(rows["iopv"]),
             "premium_pct": list(rows["premium"] * 100.0),
+            "position": list(rows["position"]),
+            "action": list(rows["action"]),
+            "equity": list(rows["equity"]),
+            "strategy_return": list(rows["strategy_return"]),
+            "open_equity": list(
+                rows["equity"].where(rows["action"].str.startswith("open_"))
+            ),
+            "close_equity": list(
+                rows["equity"].where(rows["action"].str.startswith("close_"))
+            ),
         }
         self.source.stream(payload, rollover=int(self.window_size.value))
         self.cursor = end
         self._update_metrics(rows.iloc[-1])
+        self._update_strategy_metrics(rows.iloc[-1])
         self._update_table()
         self.progress.value = int(round(self.cursor / len(self.frame) * 100))
         self._update_status("running" if self.cursor < len(self.frame) else "completed")
         if self.cursor >= len(self.frame):
             self._stop_callback()
 
-    def _threshold_changed(self, event: Any) -> None:
-        threshold = float(event.new)
-        self.upper_span.location = threshold
-        self.lower_span.location = -threshold
+    def _strategy_parameters_changed(self, _event: Any) -> None:
+        self._stop_callback()
+        target_cursor = min(max(self.cursor, 2), len(self.observations))
+        self.upper_span.location = float(self.entry_threshold.value)
+        self.lower_span.location = -float(self.entry_threshold.value)
+        self.exit_upper_span.location = float(self.exit_threshold.value)
+        self.exit_lower_span.location = -float(self.exit_threshold.value)
+        self._recompute_backtest()
+        self.cursor = 0
+        self._clear_source()
+        self._update_quality_summary()
+        self._stream_rows(target_cursor)
+        if self.cursor < len(self.frame):
+            self._update_status("paused")
+
+    def _recompute_backtest(self) -> None:
+        backtest_input = self.observations.copy()
+        mode = str(self.execution_mode.value)
+        if mode == "indicative" and "indicative_risk_blocked" in backtest_input:
+            backtest_input["risk_blocked"] = (
+                backtest_input["indicative_risk_blocked"].fillna(False).astype(bool)
+            )
+        for column in ("premium_at_bid", "discount_at_ask"):
+            if column not in backtest_input:
+                backtest_input[column] = float("nan")
+
+        try:
+            result = PremiumBacktester(
+                BacktestConfig(
+                    entry_threshold=float(self.entry_threshold.value) / 100.0,
+                    exit_threshold=float(self.exit_threshold.value) / 100.0,
+                    max_holding_periods=int(self.max_holding.value),
+                    transaction_cost_bps=float(self.transaction_cost.value),
+                    execution_mode=mode,
+                )
+            ).run(backtest_input)
+            self.backtest_result = result
+            self.strategy_error = ""
+            self.frame = result.timeline
+        except ValueError as exc:
+            self.backtest_result = None
+            self.strategy_error = str(exc)
+            self.frame = backtest_input.copy()
+            self.frame["position"] = 0
+            self.frame["action"] = "flat"
+            self.frame["strategy_return"] = 0.0
+            self.frame["equity"] = 1.0
 
     def _stop_callback(self) -> None:
         if self.callback is not None and self.callback.running:
@@ -465,6 +647,57 @@ class PanelReplayDashboard:
             )
         )
 
+    def _update_strategy_metrics(self, row: pd.Series) -> None:
+        prefix = self.frame.iloc[:self.cursor]
+        equity = float(row.get("equity", 1.0))
+        drawdown = prefix["equity"] / prefix["equity"].cummax() - 1.0
+        timestamp = pd.Timestamp(row["timestamp"]).to_pydatetime()
+        completed_trades = (
+            [
+                trade
+                for trade in self.backtest_result.trades
+                if trade.exit_time <= timestamp
+            ]
+            if self.backtest_result is not None
+            else []
+        )
+        win_rate = (
+            sum(trade.net_return > 0 for trade in completed_trades)
+            / len(completed_trades)
+            if completed_trades
+            else 0.0
+        )
+        position = int(row.get("position", 0))
+        action = str(row.get("action", "flat"))
+        self.strategy_metrics.object = """
+        <div class="metric-strip">
+          {cells}
+        </div>
+        """.format(
+            cells="".join(
+                [
+                    _metric_cell(
+                        "当前仓位",
+                        _position_label(position),
+                        POSITIVE if position < 0 else NEGATIVE if position > 0 else ACCENT,
+                    ),
+                    _metric_cell("当前动作", _action_label(action), IOPV_COLOR),
+                    _metric_cell(
+                        "累计价差收益",
+                        "{:+.3%}".format(equity - 1.0),
+                        POSITIVE if equity >= 1.0 else NEGATIVE,
+                    ),
+                    _metric_cell("已平仓", str(len(completed_trades)), ETF_COLOR),
+                    _metric_cell("胜率", "{:.1%}".format(win_rate), BID_COLOR),
+                    _metric_cell(
+                        "最大回撤",
+                        "{:.3%}".format(float(drawdown.min())),
+                        ASK_COLOR,
+                    ),
+                ]
+            )
+        )
+
     def _update_status(self, state: str) -> None:
         labels = {
             "ready": "就绪",
@@ -484,14 +717,20 @@ class PanelReplayDashboard:
         )
         self.status.object = (
             '<div class="status-line">'
-            "状态：{}　进度：{}/{}　行情时间：{}　数据源：{}"
+            "状态：{}　进度：{}/{}　行情时间：{}　模型：{}　数据源：{}{}"
             "</div>"
         ).format(
             labels.get(state, state),
             self.cursor,
             len(self.frame),
             time_text,
+            (
+                "指示性（最新价）"
+                if self.execution_mode.value == "indicative"
+                else "可执行（买一卖一）"
+            ),
             self.dataset.source_kind,
+            "　参数错误：{}".format(self.strategy_error) if self.strategy_error else "",
         )
 
     def _update_table(self) -> None:
@@ -502,6 +741,9 @@ class PanelReplayDashboard:
                 "etf_price",
                 "iopv",
                 "premium",
+                "position",
+                "action",
+                "equity",
                 "valuation_quality",
                 "risk_level",
                 "risk_blockers",
@@ -534,6 +776,21 @@ class PanelReplayDashboard:
                     "估值质量": ", ".join(
                         "{}={}".format(key, value) for key, value in quality.items()
                     ),
+                    "模型交易数": (
+                        len(self.backtest_result.trades)
+                        if self.backtest_result is not None
+                        else 0
+                    ),
+                    "模型收益": (
+                        self.backtest_result.performance.total_return
+                        if self.backtest_result is not None
+                        else 0.0
+                    ),
+                    "模型最大回撤": (
+                        self.backtest_result.performance.max_drawdown
+                        if self.backtest_result is not None
+                        else 0.0
+                    ),
                     "来源": self.dataset.source_kind,
                     "文件": str(self.dataset.path.relative_to(self.project_root)),
                 }
@@ -548,7 +805,13 @@ class PanelReplayDashboard:
             self.day_select,
             self.etf_select,
             self.speed_select,
+            pn.pane.Markdown("### 均值回复模型"),
             self.entry_threshold,
+            self.exit_threshold,
+            self.max_holding,
+            self.transaction_cost,
+            self.execution_mode,
+            pn.pane.Markdown("### 图表与回放"),
             self.window_size,
             pn.Row(self.play_button, self.pause_button),
             pn.Row(self.step_button, self.reset_button),
@@ -560,6 +823,8 @@ class PanelReplayDashboard:
             self.status,
             pn.pane.Bokeh(self.price_figure, sizing_mode="stretch_width"),
             pn.pane.Bokeh(self.premium_figure, sizing_mode="stretch_width"),
+            self.strategy_metrics,
+            pn.pane.Bokeh(self.strategy_figure, sizing_mode="stretch_width"),
             pn.pane.Markdown("#### 最近观察"),
             self.table,
             sizing_mode="stretch_width",
@@ -570,14 +835,14 @@ class PanelReplayDashboard:
             sizing_mode="stretch_width",
         )
         return pn.template.FastListTemplate(
-            title="深市ETF套利监控实验台",
+            title="深市ETF均值回复监控实验台",
             site="ETF Arbitrage",
             accent_base_color=ACCENT,
             header_background="#202A2E",
             sidebar=[controls],
             main=[
                 pn.Tabs(
-                    ("行情增量回放", replay_view),
+                    ("均值回复监控", replay_view),
                     ("数据状态", quality_view),
                     dynamic=False,
                     sizing_mode="stretch_width",
@@ -600,3 +865,26 @@ def _metric_cell(label: str, value: str, accent: str) -> str:
         '<div class="metric-value">{value}</div>'
         "</div>"
     ).format(label=label, value=value, accent=accent)
+
+
+def _position_label(position: int) -> str:
+    return {
+        -1: "做空溢价",
+        0: "空仓",
+        1: "做多折价",
+    }.get(position, "未知")
+
+
+def _action_label(action: str) -> str:
+    labels = {
+        "flat": "观望",
+        "hold": "持有",
+        "open_premium": "开仓：做空溢价",
+        "open_discount": "开仓：做多折价",
+        "close_converged": "平仓：偏离收敛",
+        "close_max_holding": "平仓：持有超时",
+        "close_risk_blocked": "平仓：风险阻断",
+        "close_invalid_data": "平仓：数据失效",
+        "close_end_of_replay": "平仓：回放结束",
+    }
+    return labels.get(action, action)

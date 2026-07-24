@@ -16,6 +16,8 @@ NUMERIC_COLUMNS = (
     "ask_price",
     "iopv",
     "premium",
+    "premium_at_bid",
+    "discount_at_ask",
     "missing_weight",
     "suspension_ratio",
     "limit_up_ratio",
