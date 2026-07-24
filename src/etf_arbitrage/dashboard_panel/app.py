@@ -112,6 +112,7 @@ class PanelReplayDashboard:
         self.cursor = 0
         self.callback: Optional[Any] = None
         self._changing_dataset = False
+        self._loaded_signature: Optional[tuple[str, int, int]] = None
 
         self.day_select = pn.widgets.DatePicker(
             label="研究日期",
@@ -134,6 +135,11 @@ class PanelReplayDashboard:
                 "100x": 100,
             },
             value=5,
+        )
+        self.follow_latest = pn.widgets.Toggle(
+            label="跟随最新行情",
+            value=True,
+            icon="live-view",
         )
         self.entry_threshold = pn.widgets.FloatInput(
             label="开仓阈值（%）",
@@ -270,7 +276,7 @@ class PanelReplayDashboard:
             stylesheets=[RAW_CSS],
         )
         self.progress = pn.indicators.Progress(
-            label="回放进度",
+            label="数据进度",
             value=0,
             max=100,
             sizing_mode="stretch_width",
@@ -308,6 +314,7 @@ class PanelReplayDashboard:
 
         self.day_select.param.watch(self._dataset_changed, "value")
         self.etf_select.param.watch(self._dataset_changed, "value")
+        self.follow_latest.param.watch(self._follow_latest_changed, "value")
         for widget in (
             self.entry_threshold,
             self.exit_threshold,
@@ -499,15 +506,16 @@ class PanelReplayDashboard:
             return
         self.datasets = datasets
         self.by_day = datasets_by_day(datasets)
-        self._load_selected_dataset()
+        self._load_selected_dataset(skip_unchanged=True)
 
     def _refresh_data_clicked(self, _event: Any) -> None:
         self.refresh_datasets()
 
-    def _load_selected_dataset(self) -> None:
+    def _load_selected_dataset(self, skip_unchanged: bool = False) -> None:
         self._stop_callback()
         dataset = self.dataset
         if dataset is None:
+            self._loaded_signature = None
             self.observations = pd.DataFrame(
                 columns=[
                     "timestamp",
@@ -542,7 +550,16 @@ class PanelReplayDashboard:
             self._update_table()
             self._update_status("ready")
             return
+        signature = self._dataset_signature(dataset)
+        if (
+            skip_unchanged
+            and self.follow_latest.value
+            and signature == self._loaded_signature
+        ):
+            self._update_status("following")
+            return
         self.observations = load_observations(dataset)
+        self._loaded_signature = signature
         self._set_dataset_hint(
             "{} / {} 已加载 {:,} 条记录。".format(
                 dataset.trade_date,
@@ -552,16 +569,20 @@ class PanelReplayDashboard:
             "ready",
         )
         self._recompute_backtest()
-        self.cursor = 0
-        self._clear_source()
         self._update_quality_summary()
-        self._stream_rows(min(2, len(self.frame)))
-        self._update_status("ready")
+        if self.follow_latest.value:
+            self._show_latest_window()
+        else:
+            self.cursor = 0
+            self._clear_source()
+            self._stream_rows(min(2, len(self.frame)))
+            self._update_status("ready")
 
     def _clear_source(self) -> None:
         self.source.data = {key: [] for key in EMPTY_SOURCE}
 
     def _play(self, _event: Any) -> None:
+        self.follow_latest.value = False
         if self.cursor >= len(self.frame):
             self.cursor = 0
             self._clear_source()
@@ -580,12 +601,14 @@ class PanelReplayDashboard:
         self._update_status("paused")
 
     def _single_step(self, _event: Any) -> None:
+        self.follow_latest.value = False
         self._stop_callback()
         self._stream_rows(1)
         if self.cursor < len(self.frame):
             self._update_status("paused")
 
     def _reset_clicked(self, _event: Any) -> None:
+        self.follow_latest.value = False
         self._stop_callback()
         self.cursor = 0
         self._clear_source()
@@ -602,7 +625,20 @@ class PanelReplayDashboard:
             return
         end = min(len(self.frame), self.cursor + max(1, count))
         rows = self.frame.iloc[self.cursor:end]
-        payload = {
+        payload = self._rows_payload(rows)
+        self.source.stream(payload, rollover=int(self.window_size.value))
+        self.cursor = end
+        self._update_metrics(rows.iloc[-1])
+        self._update_strategy_metrics(rows.iloc[-1])
+        self._update_table()
+        self.progress.value = int(round(self.cursor / len(self.frame) * 100))
+        self._update_status("running" if self.cursor < len(self.frame) else "completed")
+        if self.cursor >= len(self.frame):
+            self._stop_callback()
+
+    @staticmethod
+    def _rows_payload(rows: pd.DataFrame) -> dict[str, list[Any]]:
+        return {
             "timestamp": list(rows["timestamp"]),
             "etf_price": list(rows["etf_price"]),
             "bid_price": list(rows["bid_price"]),
@@ -620,18 +656,47 @@ class PanelReplayDashboard:
                 rows["equity"].where(rows["action"].str.startswith("close_"))
             ),
         }
-        self.source.stream(payload, rollover=int(self.window_size.value))
-        self.cursor = end
+
+    def _show_latest_window(self) -> None:
+        if self.frame.empty:
+            self._clear_source()
+            self.cursor = 0
+            self.progress.value = 0
+            self._update_status("ready")
+            return
+        count = min(len(self.frame), int(self.window_size.value))
+        rows = self.frame.iloc[-count:]
+        self.source.data = self._rows_payload(rows)
+        self.cursor = len(self.frame)
         self._update_metrics(rows.iloc[-1])
         self._update_strategy_metrics(rows.iloc[-1])
         self._update_table()
-        self.progress.value = int(round(self.cursor / len(self.frame) * 100))
-        self._update_status("running" if self.cursor < len(self.frame) else "completed")
-        if self.cursor >= len(self.frame):
+        self.progress.value = 100
+        self._update_status("following")
+
+    def _follow_latest_changed(self, event: Any) -> None:
+        if event.new:
             self._stop_callback()
+            self.refresh_datasets()
+
+    @staticmethod
+    def _dataset_signature(
+        dataset: ObservationDataset,
+    ) -> tuple[str, int, int]:
+        stat = dataset.path.stat()
+        return str(dataset.path), stat.st_mtime_ns, stat.st_size
 
     def _strategy_parameters_changed(self, _event: Any) -> None:
         self._stop_callback()
+        if self.follow_latest.value:
+            self.upper_span.location = float(self.entry_threshold.value)
+            self.lower_span.location = -float(self.entry_threshold.value)
+            self.exit_upper_span.location = float(self.exit_threshold.value)
+            self.exit_lower_span.location = -float(self.exit_threshold.value)
+            self._recompute_backtest()
+            self._update_quality_summary()
+            self._show_latest_window()
+            return
         target_cursor = min(max(self.cursor, 2), len(self.observations))
         self.upper_span.location = float(self.entry_threshold.value)
         self.lower_span.location = -float(self.entry_threshold.value)
@@ -783,6 +848,7 @@ class PanelReplayDashboard:
             "running": "回放中",
             "paused": "已暂停",
             "completed": "回放完成",
+            "following": "跟随最新",
         }
         timestamp = (
             self.frame.iloc[min(max(self.cursor - 1, 0), len(self.frame) - 1)]["timestamp"]
@@ -952,6 +1018,7 @@ class PanelReplayDashboard:
             sizing_mode="stretch_width",
         )
         replay_controls = pn.Column(
+            self.follow_latest,
             self.speed_select,
             self.window_size,
             pn.Row(self.play_button, self.pause_button),

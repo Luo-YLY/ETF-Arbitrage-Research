@@ -105,6 +105,13 @@ def test_panel_replay_streams_rows_without_replacing_chart_models():
             "hold",
             "close_end_of_replay",
         ]
+        assert dashboard.source.data["position"] == [-1, -1, 0]
+        assert dashboard.cursor == 3
+        assert dashboard.progress.value == 100
+        assert "跟随最新" in dashboard.status.object
+
+        dashboard.follow_latest.value = False
+        dashboard._reset_clicked(None)
         assert dashboard.source.data["position"] == [-1, -1]
         dashboard._stream_rows(1)
 

@@ -80,8 +80,8 @@ class MeanReversionOperations:
             icon="refresh",
         )
         self.auto_refresh = pn.widgets.Toggle(
-            label="自动刷新任务状态",
-            value=False,
+            label="自动刷新行情与任务",
+            value=True,
             icon="refresh",
         )
         self.message = pn.pane.HTML("", sizing_mode="stretch_width")
@@ -127,6 +127,7 @@ class MeanReversionOperations:
         self.refresh_button.on_click(self._refresh_clicked)
         self.auto_refresh.param.watch(self._auto_refresh_changed, "value")
         self.refresh()
+        pn.state.onload(self.start_runtime)
 
     @property
     def trading_day(self) -> str:
@@ -226,6 +227,18 @@ class MeanReversionOperations:
         if self.callback is not None and self.callback.running:
             self.callback.stop()
 
+    def start_runtime(self) -> None:
+        if not self.auto_refresh.value:
+            return
+        if self.callback is None:
+            self.callback = pn.state.add_periodic_callback(
+                self._periodic_refresh,
+                period=3000,
+                start=True,
+            )
+        elif not self.callback.running:
+            self.callback.start()
+
     def _start(self, _event) -> None:
         selected = tuple(self.monitor_etfs.value)
         if not os.getenv("SZ_REDIS_HOST"):
@@ -287,14 +300,7 @@ class MeanReversionOperations:
 
     def _auto_refresh_changed(self, event) -> None:
         if event.new:
-            if self.callback is None:
-                self.callback = pn.state.add_periodic_callback(
-                    self._periodic_refresh,
-                    period=3000,
-                    start=True,
-                )
-            elif not self.callback.running:
-                self.callback.start()
+            self.start_runtime()
         elif self.callback is not None and self.callback.running:
             self.callback.stop()
 

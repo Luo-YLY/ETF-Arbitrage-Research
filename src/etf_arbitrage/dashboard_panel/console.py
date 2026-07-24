@@ -56,6 +56,8 @@ class PanelConsoleDashboard:
         elif event.old == EXECUTABLE_PAGE and self.executable_page is not None:
             self.executable_page.stop_runtime()
         self._show_page(event.new)
+        if event.new == MEAN_PAGE and self.mean_operations is not None:
+            self.mean_operations.start_runtime()
 
     def _show_page(self, page: str) -> None:
         if page == MEAN_PAGE:
