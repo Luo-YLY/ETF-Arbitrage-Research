@@ -32,14 +32,14 @@ ETF_Arbitrage_Project/
 │   ├── risk/          # 停牌、涨跌停和流动性风险
 │   ├── backtest/      # 统一回放与价差头寸模拟
 │   ├── dashboard/     # Streamlit 每日研究控制台
-│   ├── dashboard_panel/ # Panel + Bokeh 增量回放实验台
+│   ├── dashboard_panel/ # Panel + Bokeh 双页面研究控制台
 │   ├── operations/    # 交易时段与后台采集任务控制
 │   └── utils/         # 绩效统计
 ├── config/            # 示例研究参数
 ├── scripts/           # 命令行演示
 ├── tests/             # 基础与集成测试
 ├── streamlit_app.py   # Streamlit 看板入口
-└── panel_app.py       # Panel 实验台入口
+└── panel_app.py       # Panel 双页面控制台入口
 ```
 
 采用 `src/etf_arbitrage/signal` 命名空间而非项目根目录的 `signal` 包，是为了避免覆盖 Python
@@ -61,12 +61,12 @@ python -m panel serve panel_app.py --address 127.0.0.1 --port 8505
 当前工作区也可将环境直接创建在 `.conda/py314`，通过
 `.\.conda\py314\python.exe` 使用，无需修改全局环境。各运行入口会自动加载本地 `src` 目录。
 
-Panel 实验台打开地址为 `http://127.0.0.1:8505/panel_app`。它优先读取
-`tmp/observations/YYYYMMDD/ETF.jsonl`，缺少实时观察结果时再读取
-`outputs/data_check/YYYYMMDD/ETF/observations.csv`。开始、暂停、单步、重置和倍速回放均在
-同一组 Bokeh 图表模型上增量更新。实验台直接复用 `PremiumBacktester`，支持控制开仓阈值、
-平仓阈值、最长持有期、单边成本和指示性/可执行价格模式，并同步展示仓位、开平仓动作、
-累计价差收益指数、胜率和最大回撤。
+Panel 控制台打开地址为 `http://127.0.0.1:8505/panel_app`，直接进入套利模拟可使用
+`http://127.0.0.1:8505/panel_app?page=executable`。控制台分为“实盘均值回复监控”和
+“实盘套利模拟”两个独立页面。前者接入 PCF、内网 Redis 最新价采集、观察文件回放和收盘
+均值回复回测；后者接入 PCF、模拟行情、上传/本地历史行情或标准化 Redis 快照，使用 ETF
+与成分股 Bid/Ask、多档深度完成纸面申赎套利、订单成交、一级市场申赎和 PnL 模拟。两页
+均复用持久化 Bokeh 数据源进行增量刷新，切页时会停止隐藏页面的定时任务。
 
 ## 数据接入
 

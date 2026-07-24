@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
+from datetime import date
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -101,8 +103,6 @@ class PanelReplayDashboard:
     def __init__(self, project_root: Union[Path, str]) -> None:
         self.project_root = Path(project_root).resolve()
         self.datasets = discover_observation_datasets(self.project_root)
-        if not self.datasets:
-            raise RuntimeError("No observation datasets were found")
         self.by_day = datasets_by_day(self.datasets)
         self.observations = pd.DataFrame()
         self.frame = pd.DataFrame()
@@ -112,13 +112,13 @@ class PanelReplayDashboard:
         self.callback: Optional[Any] = None
         self._changing_dataset = False
 
-        days = list(self.by_day)
+        days = list(self.by_day) or [date.today().strftime("%Y%m%d")]
         self.day_select = pn.widgets.Select(
             label="交易日",
             options=days,
             value=days[0],
         )
-        codes = self.by_day[self.day_select.value]
+        codes = self.by_day.get(self.day_select.value, ["159915"])
         self.etf_select = pn.widgets.Select(
             label="ETF",
             options=codes,
@@ -196,6 +196,11 @@ class PanelReplayDashboard:
             label="重置",
             color="default",
             icon="refresh",
+        )
+        self.refresh_data_button = pn.widgets.Button(
+            label="刷新真实行情文件",
+            color="default",
+            icon="database",
         )
 
         self.source = ColumnDataSource(data={key: [] for key in EMPTY_SOURCE})
@@ -281,6 +286,20 @@ class PanelReplayDashboard:
             height=250,
             sizing_mode="stretch_width",
         )
+        self.backtest_metrics = pn.pane.HTML(
+            "",
+            sizing_mode="stretch_width",
+            stylesheets=[RAW_CSS],
+        )
+        self.trades_table = pn.widgets.Tabulator(
+            pd.DataFrame(),
+            show_index=False,
+            disabled=True,
+            pagination="remote",
+            page_size=20,
+            height=390,
+            sizing_mode="stretch_width",
+        )
 
         self.day_select.param.watch(self._dataset_changed, "value")
         self.etf_select.param.watch(self._dataset_changed, "value")
@@ -296,11 +315,14 @@ class PanelReplayDashboard:
         self.pause_button.on_click(self._pause)
         self.step_button.on_click(self._single_step)
         self.reset_button.on_click(self._reset_clicked)
+        self.refresh_data_button.on_click(self._refresh_data_clicked)
         self._load_selected_dataset()
 
     @property
-    def dataset(self) -> ObservationDataset:
-        return self.datasets[(self.day_select.value, self.etf_select.value)]
+    def dataset(self) -> Optional[ObservationDataset]:
+        return self.datasets.get(
+            (str(self.day_select.value), str(self.etf_select.value))
+        )
 
     def _build_price_figure(self):
         chart = figure(
@@ -461,7 +483,7 @@ class PanelReplayDashboard:
         if event.obj is self.day_select:
             self._changing_dataset = True
             try:
-                codes = self.by_day[self.day_select.value]
+                codes = self.by_day.get(self.day_select.value, ["159915"])
                 self.etf_select.options = codes
                 if self.etf_select.value not in codes:
                     self.etf_select.value = codes[0]
@@ -469,9 +491,61 @@ class PanelReplayDashboard:
                 self._changing_dataset = False
         self._load_selected_dataset()
 
+    def refresh_datasets(self) -> None:
+        datasets = discover_observation_datasets(self.project_root)
+        if not datasets:
+            self._load_selected_dataset()
+            return
+        self.datasets = datasets
+        self.by_day = datasets_by_day(datasets)
+        days = list(self.by_day)
+        self._changing_dataset = True
+        try:
+            self.day_select.options = days
+            self.day_select.value = days[0]
+            codes = self.by_day[self.day_select.value]
+            self.etf_select.options = codes
+            if self.etf_select.value not in codes:
+                self.etf_select.value = codes[0]
+        finally:
+            self._changing_dataset = False
+        self._load_selected_dataset()
+
+    def _refresh_data_clicked(self, _event: Any) -> None:
+        self.refresh_datasets()
+
     def _load_selected_dataset(self) -> None:
         self._stop_callback()
-        self.observations = load_observations(self.dataset)
+        dataset = self.dataset
+        if dataset is None:
+            self.observations = pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "ETF_code",
+                    "etf_price",
+                    "bid_price",
+                    "ask_price",
+                    "iopv",
+                    "premium",
+                    "missing_weight",
+                    "valuation_quality",
+                ]
+            )
+            self.frame = self.observations.assign(
+                position=pd.Series(dtype=int),
+                action=pd.Series(dtype=str),
+                strategy_return=pd.Series(dtype=float),
+                equity=pd.Series(dtype=float),
+            )
+            self.backtest_result = None
+            self.strategy_error = "尚未发现真实行情记录"
+            self.cursor = 0
+            self._clear_source()
+            self._update_quality_summary()
+            self._update_table()
+            self._update_status("ready")
+            return
+        self.observations = load_observations(dataset)
         self._recompute_backtest()
         self.cursor = 0
         self._clear_source()
@@ -729,7 +803,7 @@ class PanelReplayDashboard:
                 if self.execution_mode.value == "indicative"
                 else "可执行（买一卖一）"
             ),
-            self.dataset.source_kind,
+            self.dataset.source_kind if self.dataset is not None else "等待采集",
             "　参数错误：{}".format(self.strategy_error) if self.strategy_error else "",
         )
 
@@ -757,6 +831,20 @@ class PanelReplayDashboard:
         self.table.value = values.iloc[::-1].reset_index(drop=True)
 
     def _update_quality_summary(self) -> None:
+        dataset = self.dataset
+        if dataset is None or self.frame.empty:
+            self.quality_table.value = pd.DataFrame(
+                [
+                    {
+                        "状态": "尚未发现行情记录",
+                        "交易日": self.day_select.value,
+                        "ETF": self.etf_select.value,
+                    }
+                ]
+            )
+            self.backtest_metrics.object = ""
+            self.trades_table.value = pd.DataFrame()
+            return
         quality = (
             self.frame["valuation_quality"].value_counts().to_dict()
             if "valuation_quality" in self.frame
@@ -765,8 +853,8 @@ class PanelReplayDashboard:
         summary = pd.DataFrame(
             [
                 {
-                    "交易日": self.dataset.trade_date,
-                    "ETF": self.dataset.etf_code,
+                    "交易日": dataset.trade_date,
+                    "ETF": dataset.etf_code,
                     "记录数": len(self.frame),
                     "开始时间": self.frame["timestamp"].min(),
                     "结束时间": self.frame["timestamp"].max(),
@@ -791,16 +879,66 @@ class PanelReplayDashboard:
                         if self.backtest_result is not None
                         else 0.0
                     ),
-                    "来源": self.dataset.source_kind,
-                    "文件": str(self.dataset.path.relative_to(self.project_root)),
+                    "来源": dataset.source_kind,
+                    "文件": str(dataset.path.relative_to(self.project_root)),
                 }
             ]
         )
         self.quality_table.value = summary
+        if self.backtest_result is None:
+            self.backtest_metrics.object = ""
+            self.trades_table.value = pd.DataFrame()
+        else:
+            result = self.backtest_result
+            self.backtest_metrics.object = """
+            <div class="metric-strip">
+              {cells}
+            </div>
+            """.format(
+                cells="".join(
+                    [
+                        _metric_cell(
+                            "价差收益",
+                            "{:+.3%}".format(result.performance.total_return),
+                            ACCENT,
+                        ),
+                        _metric_cell(
+                            "Sharpe",
+                            "{:.2f}".format(result.performance.sharpe),
+                            IOPV_COLOR,
+                        ),
+                        _metric_cell(
+                            "最大回撤",
+                            "{:.3%}".format(result.performance.max_drawdown),
+                            ASK_COLOR,
+                        ),
+                        _metric_cell(
+                            "胜率",
+                            "{:.1%}".format(result.win_rate),
+                            BID_COLOR,
+                        ),
+                        _metric_cell(
+                            "平均持有",
+                            "{:.1f}个快照".format(
+                                result.average_holding_periods
+                            ),
+                            ETF_COLOR,
+                        ),
+                        _metric_cell(
+                            "已平仓",
+                            str(len(result.trades)),
+                            POSITIVE,
+                        ),
+                    ]
+                )
+            )
+            self.trades_table.value = pd.DataFrame(
+                [asdict(trade) for trade in result.trades]
+            )
         self._update_status("ready")
 
-    def template(self):
-        controls = pn.Column(
+    def sidebar_controls(self):
+        return pn.Column(
             pn.pane.Markdown("### 数据与回放"),
             self.day_select,
             self.etf_select,
@@ -815,10 +953,13 @@ class PanelReplayDashboard:
             self.window_size,
             pn.Row(self.play_button, self.pause_button),
             pn.Row(self.step_button, self.reset_button),
+            self.refresh_data_button,
             self.progress,
             sizing_mode="stretch_width",
         )
-        replay_view = pn.Column(
+
+    def replay_view(self):
+        return pn.Column(
             self.metrics,
             self.status,
             pn.pane.Bokeh(self.price_figure, sizing_mode="stretch_width"),
@@ -829,21 +970,38 @@ class PanelReplayDashboard:
             self.table,
             sizing_mode="stretch_width",
         )
-        quality_view = pn.Column(
+
+    def backtest_view(self):
+        return pn.Column(
+            pn.pane.Markdown("## 收盘后均值回复回测"),
+            self.backtest_metrics,
+            pn.pane.Markdown("#### 完整交易记录"),
+            self.trades_table,
+            sizing_mode="stretch_width",
+        )
+
+    def quality_view(self):
+        return pn.Column(
             pn.pane.Markdown("#### 数据完整性"),
             self.quality_table,
             sizing_mode="stretch_width",
         )
+
+    def stop_runtime(self) -> None:
+        self._stop_callback()
+
+    def template(self):
         return pn.template.FastListTemplate(
             title="深市ETF均值回复监控实验台",
             site="ETF Arbitrage",
             accent_base_color=ACCENT,
             header_background="#202A2E",
-            sidebar=[controls],
+            sidebar=[self.sidebar_controls()],
             main=[
                 pn.Tabs(
-                    ("均值回复监控", replay_view),
-                    ("数据状态", quality_view),
+                    ("均值回复监控", self.replay_view()),
+                    ("收盘回测", self.backtest_view()),
+                    ("数据状态", self.quality_view()),
                     dynamic=False,
                     sizing_mode="stretch_width",
                 )
@@ -855,7 +1013,9 @@ class PanelReplayDashboard:
 
 
 def build_panel_dashboard(project_root: Union[Path, str]):
-    return PanelReplayDashboard(project_root).template()
+    from .console import PanelConsoleDashboard
+
+    return PanelConsoleDashboard(project_root).template()
 
 
 def _metric_cell(label: str, value: str, accent: str) -> str:
