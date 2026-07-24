@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
@@ -95,6 +96,7 @@ def test_panel_replay_streams_rows_without_replacing_chart_models():
             encoding="utf-8",
         )
         dashboard = PanelReplayDashboard(root)
+        dashboard.day_select.value = date(2026, 7, 23)
         source_identity = id(dashboard.source)
         template = dashboard.template()
 

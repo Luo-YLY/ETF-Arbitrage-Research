@@ -15,6 +15,7 @@ from bokeh.plotting import figure
 
 from etf_arbitrage.backtest import BacktestResult, PremiumBacktester
 from etf_arbitrage.config import BacktestConfig
+from etf_arbitrage.data import SZSE_ETFS
 
 from .data import (
     ObservationDataset,
@@ -112,17 +113,17 @@ class PanelReplayDashboard:
         self.callback: Optional[Any] = None
         self._changing_dataset = False
 
-        days = list(self.by_day) or [date.today().strftime("%Y%m%d")]
-        self.day_select = pn.widgets.Select(
-            label="交易日",
-            options=days,
-            value=days[0],
+        self.day_select = pn.widgets.DatePicker(
+            label="研究日期",
+            value=date.today(),
         )
-        codes = self.by_day.get(self.day_select.value, ["159915"])
         self.etf_select = pn.widgets.Select(
             label="ETF",
-            options=codes,
-            value=codes[0],
+            options={
+                "{} {}".format(code, profile.name): code
+                for code, profile in SZSE_ETFS.items()
+            },
+            value="159915",
         )
         self.speed_select = pn.widgets.Select(
             label="回放速度",
@@ -198,9 +199,13 @@ class PanelReplayDashboard:
             icon="refresh",
         )
         self.refresh_data_button = pn.widgets.Button(
-            label="刷新真实行情文件",
+            label="刷新行情数据",
             color="default",
             icon="database",
+        )
+        self.dataset_hint = pn.pane.HTML(
+            "",
+            sizing_mode="stretch_width",
         )
 
         self.source = ColumnDataSource(data={key: [] for key in EMPTY_SOURCE})
@@ -321,8 +326,13 @@ class PanelReplayDashboard:
     @property
     def dataset(self) -> Optional[ObservationDataset]:
         return self.datasets.get(
-            (str(self.day_select.value), str(self.etf_select.value))
+            (self.selected_day, str(self.etf_select.value))
         )
+
+    @property
+    def selected_day(self) -> str:
+        value = self.day_select.value or date.today()
+        return value.strftime("%Y%m%d")
 
     def _build_price_figure(self):
         chart = figure(
@@ -480,15 +490,6 @@ class PanelReplayDashboard:
     def _dataset_changed(self, event: Any) -> None:
         if self._changing_dataset:
             return
-        if event.obj is self.day_select:
-            self._changing_dataset = True
-            try:
-                codes = self.by_day.get(self.day_select.value, ["159915"])
-                self.etf_select.options = codes
-                if self.etf_select.value not in codes:
-                    self.etf_select.value = codes[0]
-            finally:
-                self._changing_dataset = False
         self._load_selected_dataset()
 
     def refresh_datasets(self) -> None:
@@ -498,17 +499,6 @@ class PanelReplayDashboard:
             return
         self.datasets = datasets
         self.by_day = datasets_by_day(datasets)
-        days = list(self.by_day)
-        self._changing_dataset = True
-        try:
-            self.day_select.options = days
-            self.day_select.value = days[0]
-            codes = self.by_day[self.day_select.value]
-            self.etf_select.options = codes
-            if self.etf_select.value not in codes:
-                self.etf_select.value = codes[0]
-        finally:
-            self._changing_dataset = False
         self._load_selected_dataset()
 
     def _refresh_data_clicked(self, _event: Any) -> None:
@@ -539,6 +529,13 @@ class PanelReplayDashboard:
             )
             self.backtest_result = None
             self.strategy_error = "尚未发现真实行情记录"
+            self._set_dataset_hint(
+                "{} / {} 尚无行情记录，等待采集或导入。".format(
+                    self.selected_day,
+                    self.etf_select.value,
+                ),
+                "waiting",
+            )
             self.cursor = 0
             self._clear_source()
             self._update_quality_summary()
@@ -546,6 +543,14 @@ class PanelReplayDashboard:
             self._update_status("ready")
             return
         self.observations = load_observations(dataset)
+        self._set_dataset_hint(
+            "{} / {} 已加载 {:,} 条记录。".format(
+                dataset.trade_date,
+                dataset.etf_code,
+                len(self.observations),
+            ),
+            "ready",
+        )
         self._recompute_backtest()
         self.cursor = 0
         self._clear_source()
@@ -938,25 +943,49 @@ class PanelReplayDashboard:
         self._update_status("ready")
 
     def sidebar_controls(self):
-        return pn.Column(
-            pn.pane.Markdown("### 数据与回放"),
-            self.day_select,
-            self.etf_select,
-            self.speed_select,
-            pn.pane.Markdown("### 均值回复模型"),
+        model_controls = pn.Column(
             self.entry_threshold,
             self.exit_threshold,
             self.max_holding,
             self.transaction_cost,
             self.execution_mode,
-            pn.pane.Markdown("### 图表与回放"),
+            sizing_mode="stretch_width",
+        )
+        replay_controls = pn.Column(
+            self.speed_select,
             self.window_size,
             pn.Row(self.play_button, self.pause_button),
             pn.Row(self.step_button, self.reset_button),
-            self.refresh_data_button,
             self.progress,
             sizing_mode="stretch_width",
         )
+        return pn.Column(
+            pn.pane.Markdown("### 实盘均值回复监控"),
+            self.day_select,
+            self.etf_select,
+            self.dataset_hint,
+            self.refresh_data_button,
+            pn.Accordion(
+                ("均值回复参数", model_controls),
+                ("回放设置", replay_controls),
+                active=[],
+                sizing_mode="stretch_width",
+            ),
+            sizing_mode="stretch_width",
+        )
+
+    def _set_dataset_hint(self, text: str, state: str) -> None:
+        colors = {
+            "ready": ("#2F6B4F", "#eef7f2"),
+            "waiting": ("#8B5E34", "#fff8ec"),
+        }
+        foreground, background = colors.get(
+            state, ("#374147", "#f4f7f7")
+        )
+        self.dataset_hint.object = (
+            '<div style="border-left:3px solid {fg};background:{bg};'
+            'padding:8px 10px;color:{fg};font-size:12px">{text}</div>'
+        ).format(fg=foreground, bg=background, text=text)
 
     def replay_view(self):
         return pn.Column(
@@ -1002,7 +1031,7 @@ class PanelReplayDashboard:
                     ("均值回复监控", self.replay_view()),
                     ("收盘回测", self.backtest_view()),
                     ("数据状态", self.quality_view()),
-                    dynamic=False,
+                    dynamic=True,
                     sizing_mode="stretch_width",
                 )
             ],

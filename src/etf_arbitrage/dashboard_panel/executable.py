@@ -586,7 +586,7 @@ class PanelExecutableDashboard:
                 ("损益", self._pnl_view()),
                 ("数据质量与日志", self._quality_view()),
                 ("历史数据与导出", self._history_view()),
-                dynamic=False,
+                dynamic=True,
                 sizing_mode="stretch_width",
             ),
             sizing_mode="stretch_width",

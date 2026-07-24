@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import os
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -45,7 +45,10 @@ class MeanReversionOperations:
         self.on_observations_changed = on_observations_changed
         self.callback = None
 
-        self.pcf = PanelPCFControls(self.project_root)
+        self.pcf = PanelPCFControls(
+            self.project_root,
+            default_date=date.today(),
+        )
         self.monitor_etfs = pn.widgets.MultiChoice(
             label="监控ETF",
             options=list(SZSE_ETFS),
@@ -160,7 +163,7 @@ class MeanReversionOperations:
                         self.log_pane,
                     ),
                 ),
-                dynamic=False,
+                dynamic=True,
                 sizing_mode="stretch_width",
             ),
             sizing_mode="stretch_width",

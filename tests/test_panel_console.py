@@ -26,12 +26,15 @@ def test_console_separates_mean_reversion_and_executable_pages():
 
     assert dashboard.page_select.value == MEAN_PAGE
     assert len(dashboard.main.objects) == 1
+    assert dashboard.mean_page is not None
+    assert dashboard.executable_page is None
     mean_main = dashboard.main.objects[0]
 
     dashboard.page_select.value = EXECUTABLE_PAGE
 
     assert dashboard.page_select.value == EXECUTABLE_PAGE
     assert dashboard.main.objects[0] is not mean_main
+    assert dashboard.executable_page is not None
     assert isinstance(dashboard.main.objects[0], pn.Column)
     assert dashboard.executable_page.source_mode in dashboard.sidebar.objects[-1]
 
@@ -53,6 +56,57 @@ def test_mean_reversion_page_opens_before_first_observation():
         assert "尚未发现真实行情记录" in dashboard.strategy_error
         assert dashboard.quality_table.value.iloc[0]["状态"] == "尚未发现行情记录"
     finally:
+        root.rmdir()
+
+
+def test_mean_reversion_refresh_keeps_selected_day_and_loads_new_file():
+    root = Path("tmp") / "tests" / uuid4().hex
+    root.mkdir(parents=True)
+    dashboard = PanelReplayDashboard(root)
+    target_day = pd.Timestamp("2026-07-24").date()
+    dashboard.day_select.value = target_day
+    output = (
+        root
+        / "tmp"
+        / "observations"
+        / "20260724"
+        / "159915.jsonl"
+    )
+    output.parent.mkdir(parents=True)
+    rows = [
+        {
+            "timestamp": "2026-07-24T09:30:00",
+            "ETF_code": "159915",
+            "etf_price": 3.60,
+            "iopv": 3.59,
+            "premium": 3.60 / 3.59 - 1,
+        },
+        {
+            "timestamp": "2026-07-24T09:30:03",
+            "ETF_code": "159915",
+            "etf_price": 3.61,
+            "iopv": 3.60,
+            "premium": 3.61 / 3.60 - 1,
+        },
+    ]
+    output.write_text(
+        "\n".join(pd.Series(row).to_json() for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    try:
+        dashboard.refresh_datasets()
+
+        assert dashboard.day_select.value == target_day
+        assert dashboard.dataset is not None
+        assert len(dashboard.observations) == 2
+        assert "已加载 2 条记录" in dashboard.dataset_hint.object
+    finally:
+        for path in sorted(root.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
         root.rmdir()
 
 

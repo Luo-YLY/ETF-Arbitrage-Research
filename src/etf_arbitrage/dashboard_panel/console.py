@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import panel as pn
 
-from .app import ACCENT, RAW_CSS, PanelReplayDashboard
-from .executable import EXECUTABLE_CSS, PanelExecutableDashboard
+from .app import PanelReplayDashboard
+from .executable import PanelExecutableDashboard
 from .mean_operations import MeanReversionOperations
 
 
@@ -21,12 +21,10 @@ class PanelConsoleDashboard:
 
     def __init__(self, project_root: Union[Path, str]) -> None:
         self.project_root = Path(project_root).resolve()
-        self.mean_page = PanelReplayDashboard(self.project_root)
-        self.mean_operations = MeanReversionOperations(
-            self.project_root,
-            on_observations_changed=self.mean_page.refresh_datasets,
-        )
-        self.executable_page = PanelExecutableDashboard(self.project_root)
+        self.mean_page: Optional[PanelReplayDashboard] = None
+        self.mean_operations: Optional[MeanReversionOperations] = None
+        self.executable_page: Optional[PanelExecutableDashboard] = None
+        self._syncing_mean_selection = False
         initial_page = self._initial_page()
         self.page_select = pn.widgets.RadioButtonGroup(
             label="页面",
@@ -41,28 +39,27 @@ class PanelConsoleDashboard:
         self._show_page(initial_page)
 
     def template(self):
-        return pn.template.FastListTemplate(
+        return pn.template.BootstrapTemplate(
             title="深市ETF套利研究控制台",
             site="ETF Arbitrage",
-            accent_base_color=ACCENT,
             header_background="#202A2E",
             sidebar=[self.sidebar],
             main=[self.main],
             sidebar_width=320,
-            main_layout=None,
-            raw_css=[RAW_CSS, EXECUTABLE_CSS],
         )
 
     def _page_changed(self, event) -> None:
-        if event.old == MEAN_PAGE:
+        if event.old == MEAN_PAGE and self.mean_page is not None:
             self.mean_page.stop_runtime()
-            self.mean_operations.stop_runtime()
-        elif event.old == EXECUTABLE_PAGE:
+            if self.mean_operations is not None:
+                self.mean_operations.stop_runtime()
+        elif event.old == EXECUTABLE_PAGE and self.executable_page is not None:
             self.executable_page.stop_runtime()
         self._show_page(event.new)
 
     def _show_page(self, page: str) -> None:
         if page == MEAN_PAGE:
+            self._ensure_mean_page()
             self.sidebar.objects = [
                 self.page_select,
                 pn.layout.Divider(),
@@ -74,17 +71,75 @@ class PanelConsoleDashboard:
                     ("实时观察", self.mean_page.replay_view()),
                     ("收盘回测", self.mean_page.backtest_view()),
                     ("数据状态", self.mean_page.quality_view()),
-                    dynamic=False,
+                    dynamic=True,
                     sizing_mode="stretch_width",
                 )
             ]
         else:
+            self._ensure_executable_page()
             self.sidebar.objects = [
                 self.page_select,
                 pn.layout.Divider(),
                 self.executable_page.sidebar_controls(),
             ]
             self.main.objects = [self.executable_page.view()]
+
+    def _ensure_mean_page(self) -> None:
+        if self.mean_page is not None:
+            return
+        self.mean_page = PanelReplayDashboard(self.project_root)
+        self.mean_operations = MeanReversionOperations(
+            self.project_root,
+            on_observations_changed=self.mean_page.refresh_datasets,
+        )
+        self.mean_page.day_select.param.watch(
+            self._sync_research_selection_to_pcf,
+            "value",
+        )
+        self.mean_page.etf_select.param.watch(
+            self._sync_research_selection_to_pcf,
+            "value",
+        )
+        self.mean_operations.pcf.date_picker.param.watch(
+            self._sync_pcf_selection_to_research,
+            "value",
+        )
+        self.mean_operations.pcf.etf_select.param.watch(
+            self._sync_pcf_selection_to_research,
+            "value",
+        )
+
+    def _ensure_executable_page(self) -> None:
+        if self.executable_page is None:
+            self.executable_page = PanelExecutableDashboard(self.project_root)
+
+    def _sync_research_selection_to_pcf(self, _event) -> None:
+        if self._syncing_mean_selection or self.mean_operations is None:
+            return
+        self._syncing_mean_selection = True
+        try:
+            self.mean_operations.pcf.date_picker.value = (
+                self.mean_page.day_select.value
+            )
+            self.mean_operations.pcf.etf_select.value = (
+                self.mean_page.etf_select.value
+            )
+        finally:
+            self._syncing_mean_selection = False
+
+    def _sync_pcf_selection_to_research(self, _event) -> None:
+        if self._syncing_mean_selection or self.mean_page is None:
+            return
+        self._syncing_mean_selection = True
+        try:
+            self.mean_page.day_select.value = (
+                self.mean_operations.pcf.date_picker.value
+            )
+            self.mean_page.etf_select.value = (
+                self.mean_operations.pcf.etf_select.value
+            )
+        finally:
+            self._syncing_mean_selection = False
 
     @staticmethod
     def _initial_page() -> str:
