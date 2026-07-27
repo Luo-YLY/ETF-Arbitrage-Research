@@ -14,7 +14,12 @@ import panel as pn
 from bokeh.models import ColumnDataSource, CrosshairTool, HoverTool, Span
 from bokeh.plotting import figure
 
-from etf_arbitrage.data import validate_executable_pcf
+from etf_arbitrage.data import (
+    SZRedisQuotationClient,
+    SZRedisSettings,
+    load_pcf_price_seed,
+    validate_executable_pcf,
+)
 from etf_arbitrage.engine import PaperArbitrageEngine, PaperEngineResult
 from etf_arbitrage.executable_config import (
     AccountConfig,
@@ -142,6 +147,7 @@ class PanelExecutableDashboard:
         self.config: Optional[PaperArbitrageConfig] = None
         self.pcf_document = None
         self.pcf_report = None
+        self.redis_price_seed = None
         self.callback = None
         self.history = _new_history()
 
@@ -172,6 +178,19 @@ class PanelExecutableDashboard:
             value=SimulationScenario.NORMAL,
         )
         self.random_seed = _int_input("随机种子", 42, 0, 1_000_000, 1)
+        self.use_redis_price_seed = pn.widgets.Checkbox(
+            label="使用内网Redis最新价初始化",
+            value=False,
+        )
+        self.redis_seed_suffix = pn.widgets.TextInput(
+            label="Redis代码后缀",
+            value=".SZ",
+            placeholder=".SZ",
+        )
+        self.redis_seed_message = pn.pane.HTML(
+            '<div class="exec-status">价格基准：完全模拟。启用后仅使用Redis最新成交价定基准，买卖盘与后续路径仍由模拟器生成。</div>',
+            sizing_mode="stretch_width",
+        )
         self.tick_ms = _int_input("Tick间隔（毫秒）", 1000, 10, 60_000, 10)
         self.total_ticks = _int_input(
             "模拟时间轴长度（Tick）", 300, 10, 100_000, 10
@@ -601,6 +620,8 @@ class PanelExecutableDashboard:
     def _configuration_view(self):
         simulation_controls = pn.Column(
             pn.Row(self.scenario, self.random_seed),
+            pn.Row(self.use_redis_price_seed, self.redis_seed_suffix),
+            self.redis_seed_message,
             pn.Row(self.tick_ms, self.total_ticks, self.simulation_speed),
             pn.Row(self.premium_shock, self.base_volatility),
             pn.Row(self.book_levels, self.depth_per_level, self.quote_latency),
@@ -787,6 +808,8 @@ class PanelExecutableDashboard:
             simulation=SimulationConfig(
                 scenario=self.scenario.value,
                 random_seed=int(self.random_seed.value),
+                use_redis_price_seed=bool(self.use_redis_price_seed.value),
+                redis_code_suffix=self.redis_seed_suffix.value.strip() or ".SZ",
                 tick_interval_ms=int(self.tick_ms.value),
                 total_ticks=int(self.total_ticks.value),
                 simulation_speed=float(self.simulation_speed.value),
@@ -895,8 +918,24 @@ class PanelExecutableDashboard:
         self.pcf_document = pcf
         self.pcf_report = report
         self.engine = PaperArbitrageEngine(pcf, config)
+        self.redis_price_seed = None
         if config.data_source == DataSourceMode.SIMULATED:
-            self.source = SimulatedMarketDataSource(pcf, config.simulation)
+            if config.simulation.use_redis_price_seed:
+                self.redis_price_seed = _load_redis_price_seed(
+                    pcf,
+                    config.simulation.redis_code_suffix,
+                )
+                self.source = SimulatedMarketDataSource(
+                    pcf,
+                    config.simulation,
+                    initial_component_prices=(
+                        self.redis_price_seed.component_prices
+                    ),
+                    initial_etf_price=self.redis_price_seed.etf_price,
+                    price_seed_source="sz_redis_latest_trade",
+                )
+            else:
+                self.source = SimulatedMarketDataSource(pcf, config.simulation)
         elif config.data_source == DataSourceMode.FILE_REPLAY:
             if self.file_source is None:
                 raise ValueError("请先上传或读取历史行情")
@@ -915,9 +954,24 @@ class PanelExecutableDashboard:
             DataSourceMode.FILE_REPLAY: "历史行情回放",
             DataSourceMode.REDIS: "标准化Redis",
         }.get(config.data_source, str(config.data_source))
+        if self.redis_price_seed is not None:
+            seed_text = (
+                "价格基准：Redis最新成交价，ETF={:.4f}，"
+                "PCF实物成分股={}/{}；买卖盘深度与后续路径为模拟值。"
+            ).format(
+                self.redis_price_seed.etf_price,
+                self.redis_price_seed.component_count,
+                self.redis_price_seed.component_count,
+            )
+        else:
+            seed_text = "价格基准：完全模拟。"
+        self.redis_seed_message.object = (
+            '<div class="exec-status">{}</div>'.format(seed_text)
+        )
         self._set_status(
-            "配置已应用，数据源：{}。仅进行纸面模拟，不连接真实交易柜台。".format(
-                source_label
+            "配置已应用，数据源：{}。{}仅进行纸面模拟，不连接真实交易柜台。".format(
+                source_label,
+                seed_text,
             ),
             "ready",
         )
@@ -1079,6 +1133,7 @@ class PanelExecutableDashboard:
         self.source = None
         self.engine = None
         self.config = None
+        self.redis_price_seed = None
         self._refresh_pcf_views()
         self._set_status("PCF选择已变化，请应用配置。", "ready")
 
@@ -1739,6 +1794,30 @@ def _book_rows(book) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _load_redis_price_seed(pcf, redis_code_suffix: str):
+    try:
+        settings = SZRedisSettings.from_env()
+    except ValueError as exc:
+        raise ValueError(
+            "启用Redis价格基准前，请先在启动Panel的同一终端设置SZ_REDIS_HOST"
+        ) from exc
+    client = SZRedisQuotationClient(settings)
+    try:
+        if not client.ping():
+            raise ConnectionError("Redis连接探测未通过")
+        return load_pcf_price_seed(
+            client,
+            pcf,
+            trade_date=pcf.trading_day,
+            redis_code_suffix=redis_code_suffix,
+        )
+    finally:
+        connection = getattr(client, "_redis_client", None)
+        close = getattr(connection, "close", None)
+        if callable(close):
+            close()
 
 
 def _component_book_rows(snapshot) -> pd.DataFrame:

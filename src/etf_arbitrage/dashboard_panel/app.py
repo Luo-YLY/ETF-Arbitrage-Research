@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -108,6 +107,7 @@ class PanelReplayDashboard:
         self.observations = pd.DataFrame()
         self.frame = pd.DataFrame()
         self.backtest_result: Optional[BacktestResult] = None
+        self.cost_sensitivity = ()
         self.strategy_error = ""
         self.cursor = 0
         self.callback: Optional[Any] = None
@@ -168,6 +168,11 @@ class PanelReplayDashboard:
             step=0.5,
             start=0.0,
             end=100.0,
+        )
+        self.cost_scenarios = pn.widgets.TextInput(
+            label="往返成本情景（bp）",
+            value="6, 15, 30, 50",
+            placeholder="例如：6, 15, 30, 50",
         )
         self.execution_mode = pn.widgets.Select(
             label="回测价格模式",
@@ -302,6 +307,13 @@ class PanelReplayDashboard:
             sizing_mode="stretch_width",
             stylesheets=[RAW_CSS],
         )
+        self.cost_sensitivity_table = pn.widgets.Tabulator(
+            pd.DataFrame(),
+            show_index=False,
+            disabled=True,
+            height=230,
+            sizing_mode="stretch_width",
+        )
         self.trades_table = pn.widgets.Tabulator(
             pd.DataFrame(),
             show_index=False,
@@ -320,6 +332,7 @@ class PanelReplayDashboard:
             self.exit_threshold,
             self.max_holding,
             self.transaction_cost,
+            self.cost_scenarios,
             self.execution_mode,
         ):
             widget.param.watch(self._strategy_parameters_changed, "value")
@@ -440,7 +453,7 @@ class PanelReplayDashboard:
 
     def _build_strategy_figure(self):
         chart = figure(
-            title="均值回复累计价差收益指数",
+            title="折溢价收敛研究指数",
             x_axis_type="datetime",
             height=300,
             sizing_mode="stretch_width",
@@ -451,7 +464,7 @@ class PanelReplayDashboard:
             "timestamp",
             "equity",
             source=self.source,
-            legend_label="累计价差收益指数",
+            legend_label="收敛研究指数",
             color=ACCENT,
             line_width=2,
         )
@@ -478,7 +491,7 @@ class PanelReplayDashboard:
             HoverTool(
                 tooltips=[
                     ("时间", "@timestamp{%F %T}"),
-                    ("收益指数", "@equity{0.000000}"),
+                    ("研究指数", "@equity{0.000000}"),
                     ("仓位", "@position"),
                     ("动作", "@action"),
                 ],
@@ -486,7 +499,7 @@ class PanelReplayDashboard:
                 mode="vline",
             ),
         )
-        chart.yaxis.axis_label = "累计价差收益指数"
+        chart.yaxis.axis_label = "折溢价收敛研究指数"
         chart.legend.orientation = "horizontal"
         chart.legend.location = "top_left"
         chart.legend.click_policy = "hide"
@@ -722,20 +735,25 @@ class PanelReplayDashboard:
                 backtest_input[column] = float("nan")
 
         try:
-            result = PremiumBacktester(
-                BacktestConfig(
-                    entry_threshold=float(self.entry_threshold.value) / 100.0,
-                    exit_threshold=float(self.exit_threshold.value) / 100.0,
-                    max_holding_periods=int(self.max_holding.value),
-                    transaction_cost_bps=float(self.transaction_cost.value),
-                    execution_mode=mode,
-                )
-            ).run(backtest_input)
+            config = BacktestConfig(
+                entry_threshold=float(self.entry_threshold.value) / 100.0,
+                exit_threshold=float(self.exit_threshold.value) / 100.0,
+                max_holding_periods=int(self.max_holding.value),
+                transaction_cost_bps=float(self.transaction_cost.value),
+                execution_mode=mode,
+            )
+            engine = PremiumBacktester(config)
+            result = engine.run(backtest_input)
             self.backtest_result = result
+            self.cost_sensitivity = engine.cost_sensitivity(
+                backtest_input,
+                _parse_cost_scenarios(self.cost_scenarios.value),
+            )
             self.strategy_error = ""
             self.frame = result.timeline
         except ValueError as exc:
             self.backtest_result = None
+            self.cost_sensitivity = ()
             self.strategy_error = str(exc)
             self.frame = backtest_input.copy()
             self.frame["position"] = 0
@@ -792,9 +810,7 @@ class PanelReplayDashboard:
         )
 
     def _update_strategy_metrics(self, row: pd.Series) -> None:
-        prefix = self.frame.iloc[:self.cursor]
         equity = float(row.get("equity", 1.0))
-        drawdown = prefix["equity"] / prefix["equity"].cummax() - 1.0
         timestamp = pd.Timestamp(row["timestamp"]).to_pydatetime()
         completed_trades = (
             [
@@ -805,11 +821,24 @@ class PanelReplayDashboard:
             if self.backtest_result is not None
             else []
         )
-        win_rate = (
-            sum(trade.net_return > 0 for trade in completed_trades)
-            / len(completed_trades)
+        converged_trades = [
+            trade for trade in completed_trades if trade.exit_reason == "converged"
+        ]
+        convergence_rate = (
+            len(converged_trades) / len(completed_trades)
             if completed_trades
             else 0.0
+        )
+        convergence_seconds = [trade.holding_seconds for trade in converged_trades]
+        median_convergence = (
+            float(np.median(convergence_seconds)) if convergence_seconds else 0.0
+        )
+        worst_mae_bps = max(
+            (
+                max(0.0, -trade.max_adverse_excursion * 10_000.0)
+                for trade in completed_trades
+            ),
+            default=0.0,
         )
         position = int(row.get("position", 0))
         action = str(row.get("action", "flat"))
@@ -827,15 +856,24 @@ class PanelReplayDashboard:
                     ),
                     _metric_cell("当前动作", _action_label(action), IOPV_COLOR),
                     _metric_cell(
-                        "累计价差收益",
+                        "收敛研究指数变动",
                         "{:+.3%}".format(equity - 1.0),
                         POSITIVE if equity >= 1.0 else NEGATIVE,
                     ),
                     _metric_cell("已平仓", str(len(completed_trades)), ETF_COLOR),
-                    _metric_cell("胜率", "{:.1%}".format(win_rate), BID_COLOR),
                     _metric_cell(
-                        "最大回撤",
-                        "{:.3%}".format(float(drawdown.min())),
+                        "收敛率",
+                        "{:.1%}".format(convergence_rate),
+                        BID_COLOR,
+                    ),
+                    _metric_cell(
+                        "中位收敛时间",
+                        _format_seconds(median_convergence),
+                        IOPV_COLOR,
+                    ),
+                    _metric_cell(
+                        "最差MAE",
+                        "{:.1f} bp".format(worst_mae_bps),
                         ASK_COLOR,
                     ),
                 ]
@@ -914,6 +952,7 @@ class PanelReplayDashboard:
                 ]
             )
             self.backtest_metrics.object = ""
+            self.cost_sensitivity_table.value = pd.DataFrame()
             self.trades_table.value = pd.DataFrame()
             return
         quality = (
@@ -935,17 +974,47 @@ class PanelReplayDashboard:
                     "估值质量": ", ".join(
                         "{}={}".format(key, value) for key, value in quality.items()
                     ),
-                    "模型交易数": (
-                        len(self.backtest_result.trades)
+                    "研究交易数": (
+                        self.backtest_result.convergence.trade_count
                         if self.backtest_result is not None
                         else 0
                     ),
-                    "模型收益": (
+                    "收敛交易数": (
+                        self.backtest_result.convergence.converged_trade_count
+                        if self.backtest_result is not None
+                        else 0
+                    ),
+                    "收敛率": (
+                        self.backtest_result.convergence.convergence_rate
+                        if self.backtest_result is not None
+                        else 0.0
+                    ),
+                    "中位收敛秒": (
+                        self.backtest_result.convergence.median_convergence_seconds
+                        if self.backtest_result is not None
+                        else 0.0
+                    ),
+                    "P90收敛秒": (
+                        self.backtest_result.convergence.p90_convergence_seconds
+                        if self.backtest_result is not None
+                        else 0.0
+                    ),
+                    "最差MAE(bp)": (
+                        self.backtest_result.convergence.worst_mae_bps
+                        if self.backtest_result is not None
+                        else 0.0
+                    ),
+                    "平均MFE(bp)": (
+                        self.backtest_result.convergence.average_mfe_bps
+                        if self.backtest_result is not None
+                        else 0.0
+                    ),
+                    "收敛研究指数变动": (
                         self.backtest_result.performance.total_return
                         if self.backtest_result is not None
                         else 0.0
                     ),
-                    "模型最大回撤": (
+                    "价差指数最大回撤": (
                         self.backtest_result.performance.max_drawdown
                         if self.backtest_result is not None
                         else 0.0
@@ -958,9 +1027,11 @@ class PanelReplayDashboard:
         self.quality_table.value = summary
         if self.backtest_result is None:
             self.backtest_metrics.object = ""
+            self.cost_sensitivity_table.value = pd.DataFrame()
             self.trades_table.value = pd.DataFrame()
         else:
             result = self.backtest_result
+            convergence = result.convergence
             self.backtest_metrics.object = """
             <div class="metric-strip">
               {cells}
@@ -969,43 +1040,66 @@ class PanelReplayDashboard:
                 cells="".join(
                     [
                         _metric_cell(
-                            "价差收益",
-                            "{:+.3%}".format(result.performance.total_return),
+                            "研究交易数",
+                            str(convergence.trade_count),
                             ACCENT,
                         ),
                         _metric_cell(
-                            "Sharpe",
-                            "{:.2f}".format(result.performance.sharpe),
+                            "收敛率",
+                            "{:.1%}".format(convergence.convergence_rate),
                             IOPV_COLOR,
                         ),
                         _metric_cell(
-                            "最大回撤",
-                            "{:.3%}".format(result.performance.max_drawdown),
-                            ASK_COLOR,
-                        ),
-                        _metric_cell(
-                            "胜率",
-                            "{:.1%}".format(result.win_rate),
+                            "30秒内收敛",
+                            "{:.1%}".format(convergence.rate_within(30)),
                             BID_COLOR,
                         ),
                         _metric_cell(
-                            "平均持有",
-                            "{:.1f}个快照".format(
-                                result.average_holding_periods
+                            "60秒内收敛",
+                            "{:.1%}".format(convergence.rate_within(60)),
+                            BID_COLOR,
+                        ),
+                        _metric_cell(
+                            "300秒内收敛",
+                            "{:.1%}".format(convergence.rate_within(300)),
+                            BID_COLOR,
+                        ),
+                        _metric_cell(
+                            "中位收敛时间",
+                            _format_seconds(
+                                convergence.median_convergence_seconds
                             ),
                             ETF_COLOR,
                         ),
                         _metric_cell(
-                            "已平仓",
-                            str(len(result.trades)),
+                            "最差MAE",
+                            "{:.1f} bp".format(convergence.worst_mae_bps),
+                            ASK_COLOR,
+                        ),
+                        _metric_cell(
+                            "中位毛捕获",
+                            "{:+.1f} bp".format(
+                                convergence.median_gross_capture_bps
+                            ),
                             POSITIVE,
                         ),
                     ]
                 )
             )
-            self.trades_table.value = pd.DataFrame(
-                [asdict(trade) for trade in result.trades]
+            self.cost_sensitivity_table.value = pd.DataFrame(
+                [
+                    {
+                        "往返成本(bp)": point.round_trip_cost_bps,
+                        "交易数": point.trade_count,
+                        "收敛率": point.convergence_rate,
+                        "净捕获为正比例": point.profitable_trade_rate,
+                        "累计净捕获(bp)": point.total_net_capture_bps,
+                        "单笔中位净捕获(bp)": point.median_net_capture_bps,
+                    }
+                    for point in self.cost_sensitivity
+                ]
             )
+            self.trades_table.value = _trades_frame(result)
         self._update_status("ready")
 
     def sidebar_controls(self):
@@ -1014,6 +1108,7 @@ class PanelReplayDashboard:
             self.exit_threshold,
             self.max_holding,
             self.transaction_cost,
+            self.cost_scenarios,
             self.execution_mode,
             sizing_mode="stretch_width",
         )
@@ -1069,9 +1164,11 @@ class PanelReplayDashboard:
 
     def backtest_view(self):
         return pn.Column(
-            pn.pane.Markdown("## 收盘后均值回复回测"),
+            pn.pane.Markdown("## 收盘后折溢价收敛研究"),
             self.backtest_metrics,
-            pn.pane.Markdown("#### 完整交易记录"),
+            pn.pane.Markdown("#### 往返成本敏感性"),
+            self.cost_sensitivity_table,
+            pn.pane.Markdown("#### 收敛事件明细"),
             self.trades_table,
             sizing_mode="stretch_width",
         )
@@ -1144,3 +1241,55 @@ def _action_label(action: str) -> str:
         "close_end_of_replay": "平仓：回放结束",
     }
     return labels.get(action, action)
+
+
+def _parse_cost_scenarios(value: str) -> tuple[float, ...]:
+    parts = str(value).replace("，", ",").replace(";", ",").split(",")
+    costs = tuple(float(part.strip()) for part in parts if part.strip())
+    if not costs:
+        raise ValueError("请至少填写一个往返成本情景")
+    if any(not np.isfinite(cost) or cost < 0 for cost in costs):
+        raise ValueError("往返成本情景必须是非负数字")
+    return costs
+
+
+def _format_seconds(value: float) -> str:
+    seconds = max(0.0, float(value))
+    if seconds < 60:
+        return "{:.1f}秒".format(seconds)
+    return "{:.1f}分钟".format(seconds / 60.0)
+
+
+def _trades_frame(result: BacktestResult) -> pd.DataFrame:
+    direction_labels = {"premium": "溢价收敛", "discount": "折价收敛"}
+    exit_labels = {
+        "converged": "达到收敛阈值",
+        "max_holding": "超过最长持有期",
+        "risk_blocked": "风险过滤触发",
+        "invalid_data": "行情数据失效",
+        "end_of_replay": "回放结束",
+    }
+    return pd.DataFrame(
+        [
+            {
+                "方向": direction_labels.get(trade.direction, trade.direction),
+                "开仓时间": trade.entry_time,
+                "平仓时间": trade.exit_time,
+                "开仓折溢价(%)": trade.entry_premium * 100.0,
+                "平仓折溢价(%)": trade.exit_premium * 100.0,
+                "持有快照数": trade.holding_periods,
+                "持有秒数": trade.holding_seconds,
+                "毛价差捕获(bp)": trade.gross_return * 10_000.0,
+                "成本(bp)": trade.total_cost * 10_000.0,
+                "净价差捕获(bp)": trade.net_return * 10_000.0,
+                "MAE(bp)": max(
+                    0.0, -trade.max_adverse_excursion * 10_000.0
+                ),
+                "MFE(bp)": max(
+                    0.0, trade.max_favorable_excursion * 10_000.0
+                ),
+                "结束原因": exit_labels.get(trade.exit_reason, trade.exit_reason),
+            }
+            for trade in result.trades
+        ]
+    )

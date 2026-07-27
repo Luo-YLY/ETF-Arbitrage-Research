@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, time, timedelta
 from math import exp
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -28,7 +28,14 @@ CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class SimulatedMarketDataSource(MarketDataSource):
-    def __init__(self, pcf: PCFDocument, config: SimulationConfig = SimulationConfig()) -> None:
+    def __init__(
+        self,
+        pcf: PCFDocument,
+        config: SimulationConfig = SimulationConfig(),
+        initial_component_prices: Optional[Mapping[str, float]] = None,
+        initial_etf_price: Optional[float] = None,
+        price_seed_source: str = "synthetic",
+    ) -> None:
         self.pcf = pcf
         self.config = config
         self._rng = np.random.default_rng(config.random_seed)
@@ -38,8 +45,18 @@ class SimulatedMarketDataSource(MarketDataSource):
         self._tick = 0
         self._sequence = 0
         self._latest: Optional[MarketSnapshot] = None
-        self._base_prices = self._initial_component_prices()
+        self.price_seed_source = str(price_seed_source)
+        self._base_prices = self._initial_component_prices(initial_component_prices)
         self._prices = dict(self._base_prices)
+        self.initial_etf_price = _optional_positive_price(
+            initial_etf_price, "initial ETF price"
+        )
+        base_iopv = self._internal_iopv()
+        self.base_premium_bps = (
+            (self.initial_etf_price / base_iopv - 1.0) * 10_000.0
+            if self.initial_etf_price is not None
+            else 0.0
+        )
         self._start = datetime.combine(pcf.trading_day, time(9, 30), tzinfo=CHINA_TZ)
 
     def connect(self) -> None:
@@ -109,15 +126,39 @@ class SimulatedMarketDataSource(MarketDataSource):
             running=self._running,
             status="RUNNING" if self._running else "READY" if self._connected else "DISCONNECTED",
             last_snapshot_time=self._latest.snapshot_timestamp if self._latest else None,
-            message="deterministic simulated feed",
+            message="deterministic simulated feed; price seed={}".format(
+                self.price_seed_source
+            ),
         )
 
-    def _initial_component_prices(self) -> Dict[str, float]:
+    def _initial_component_prices(
+        self,
+        initial_component_prices: Optional[Mapping[str, float]],
+    ) -> Dict[str, float]:
         active = [
             item
             for item in self.pcf.components
             if item.component_share > 0 and item.substitute_flag != SubstituteFlag.MANDATORY
         ]
+        if initial_component_prices is not None:
+            missing = [
+                item.stock_code
+                for item in active
+                if item.stock_code not in initial_component_prices
+            ]
+            if missing:
+                raise ValueError(
+                    "initial component prices are missing: {}".format(
+                        ", ".join(missing[:8])
+                    )
+                )
+            return {
+                item.stock_code: _positive_price(
+                    initial_component_prices[item.stock_code],
+                    "initial component price {}".format(item.stock_code),
+                )
+                for item in active
+            }
         raw = {item.stock_code: float(self._rng.uniform(8.0, 80.0)) for item in active}
         raw_value = sum(item.component_share * raw[item.stock_code] for item in active)
         fixed_cash = sum(
@@ -135,6 +176,8 @@ class SimulatedMarketDataSource(MarketDataSource):
         return {code: max(0.01, price * scale) for code, price in raw.items()}
 
     def _evolve_prices(self) -> None:
+        if self._tick == 0:
+            return
         for code, price in list(self._prices.items()):
             change = float(self._rng.normal(0.0, self.config.base_volatility))
             self._prices[code] = max(0.01, price * (1.0 + change))
@@ -148,17 +191,21 @@ class SimulatedMarketDataSource(MarketDataSource):
             SimulationScenario.MEAN_REVERSION,
         }:
             if self._tick < self.config.shock_start_tick:
-                return 0.0
+                return self.base_premium_bps
             elapsed = self._tick - self.config.shock_start_tick
             if elapsed >= self.config.shock_duration_ticks:
-                return 0.0
+                return self.base_premium_bps
         if scenario == SimulationScenario.PREMIUM_SHOCK:
-            return magnitude
+            return self.base_premium_bps + magnitude
         if scenario == SimulationScenario.DISCOUNT_SHOCK:
-            return -magnitude
+            return self.base_premium_bps - magnitude
         if scenario == SimulationScenario.MEAN_REVERSION:
-            return magnitude * exp(-self.config.mean_reversion_speed * elapsed)
-        return float(self._rng.normal(0.0, 0.5))
+            return self.base_premium_bps + magnitude * exp(
+                -self.config.mean_reversion_speed * elapsed
+            )
+        if self.initial_etf_price is not None and self._tick == 0:
+            return self.base_premium_bps
+        return self.base_premium_bps + float(self._rng.normal(0.0, 0.5))
 
     def _build_snapshot(self, timestamp: datetime) -> MarketSnapshot:
         internal_iopv = self._internal_iopv()
@@ -280,7 +327,7 @@ class SimulatedMarketDataSource(MarketDataSource):
             upper_limit_price=mid * 1.20,
             lower_limit_price=mid * 0.80,
             sequence_number=self._sequence,
-            source="simulated",
+            source="simulated:{}".format(self.price_seed_source),
         )
 
     def _internal_iopv(self) -> float:
@@ -304,3 +351,17 @@ class SimulatedMarketDataSource(MarketDataSource):
         if self.config.sequence_gap_probability > 0 and self._rng.random() < self.config.sequence_gap_probability:
             return 2
         return 1
+
+
+def _positive_price(value: float, label: str) -> float:
+    try:
+        price = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("{} must be numeric".format(label)) from exc
+    if not np.isfinite(price) or price <= 0:
+        raise ValueError("{} must be finite and positive".format(label))
+    return price
+
+
+def _optional_positive_price(value: Optional[float], label: str) -> Optional[float]:
+    return None if value is None else _positive_price(value, label)

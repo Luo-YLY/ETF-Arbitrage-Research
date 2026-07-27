@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Iterable, List, Mapping, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from .feed import DataFeed
@@ -19,6 +20,7 @@ from .models import (
     MarketSnapshot,
     StockQuote,
 )
+from .pcf import PCFDocument, SubstituteFlag
 
 
 class RedisDependencyError(RuntimeError):
@@ -193,6 +195,108 @@ class SZRedisFieldMap:
     amount: str = "amount"
     is_suspended: Optional[str] = None
     limit_status: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SZRedisPriceSeed:
+    """Latest-trade price anchors used to initialize a synthetic order book."""
+
+    trade_date: str
+    etf_code: str
+    etf_price: float
+    component_prices: Mapping[str, float]
+
+    @property
+    def component_count(self) -> int:
+        return len(self.component_prices)
+
+
+def load_pcf_price_seed(
+    client: SZRedisQuotationClient,
+    pcf: PCFDocument,
+    trade_date: Optional[Any] = None,
+    redis_code_suffix: str = ".SZ",
+    field_map: SZRedisFieldMap = SZRedisFieldMap(),
+) -> SZRedisPriceSeed:
+    """Load positive latest prices for the ETF and all physical PCF components."""
+    active_components = [
+        item
+        for item in pcf.components
+        if item.component_share > 0
+        and item.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    suffix = redis_code_suffix.strip()
+
+    def redis_code(code: str) -> str:
+        if not suffix or code.upper().endswith(suffix.upper()):
+            return code
+        return code + suffix
+
+    etf_redis_code = redis_code(pcf.etf_code)
+    component_redis_codes = {
+        item.stock_code: redis_code(item.stock_code) for item in active_components
+    }
+    requested = [etf_redis_code, *component_redis_codes.values()]
+    resolved_trade_date = trade_date or pcf.trading_day
+    frame = client.get_security_records(requested, resolved_trade_date)
+    if frame.empty:
+        raise QuotationSchemaError(
+            "Redis中未找到{}的ETF及成分股行情".format(
+                SZRedisQuotationClient._trade_date_key(resolved_trade_date)
+            )
+        )
+    if etf_redis_code not in frame.index:
+        raise QuotationSchemaError(
+            "Redis行情缺少ETF：{}".format(etf_redis_code)
+        )
+
+    etf_price = _positive_price(
+        frame.loc[etf_redis_code],
+        field_map.last_price,
+        etf_redis_code,
+    )
+    component_prices = {}
+    missing = []
+    for stock_code, vendor_code in component_redis_codes.items():
+        if vendor_code not in frame.index:
+            missing.append(vendor_code)
+            continue
+        component_prices[stock_code] = _positive_price(
+            frame.loc[vendor_code],
+            field_map.last_price,
+            vendor_code,
+        )
+    if missing:
+        preview = ", ".join(missing[:8])
+        if len(missing) > 8:
+            preview += " 等{}只".format(len(missing))
+        raise QuotationSchemaError(
+            "Redis行情缺少PCF实物成分股：{}".format(preview)
+        )
+    return SZRedisPriceSeed(
+        trade_date=SZRedisQuotationClient._trade_date_key(resolved_trade_date),
+        etf_code=pcf.etf_code,
+        etf_price=etf_price,
+        component_prices=component_prices,
+    )
+
+
+def _positive_price(row: pd.Series, field: str, code: str) -> float:
+    if field not in row or pd.isna(row[field]):
+        raise QuotationSchemaError(
+            "Redis行情{}缺少最新价字段{}".format(code, field)
+        )
+    try:
+        price = float(row[field])
+    except (TypeError, ValueError) as exc:
+        raise QuotationSchemaError(
+            "Redis行情{}的{}不是数字".format(code, field)
+        ) from exc
+    if not np.isfinite(price) or price <= 0:
+        raise QuotationSchemaError(
+            "Redis行情{}的{}必须为正数，当前值为{}".format(code, field, row[field])
+        )
+    return price
 
 
 class SZRedisDataFeed(DataFeed):

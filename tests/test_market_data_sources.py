@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from etf_arbitrage.data import SZSEPCFParser
+from etf_arbitrage.data import SZSEPCFParser, SubstituteFlag
 from etf_arbitrage.executable_config import RedisConfig, SimulationConfig, SimulationScenario
 from etf_arbitrage.market_data import (
     DynamicMarketDataLoader,
@@ -41,6 +41,65 @@ def test_simulated_timeline_stops_at_configured_length():
     with pytest.raises(StopIteration):
         source.step()
     assert not source.health().running
+
+
+def test_simulated_feed_can_start_from_latest_trade_price_anchors():
+    pcf = SZSEPCFParser().parse(PCF)
+    active = [
+        item
+        for item in pcf.components
+        if item.component_share > 0
+        and item.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    prices = {
+        item.stock_code: 10.0 + index / 100.0
+        for index, item in enumerate(active)
+    }
+    physical = sum(
+        item.component_share * prices[item.stock_code] for item in active
+    )
+    mandatory = sum(
+        item.creation_cash_substitute
+        for item in pcf.components
+        if item.substitute_flag == SubstituteFlag.MANDATORY
+    )
+    expected_iopv = (
+        physical + mandatory + pcf.estimate_cash_component
+    ) / pcf.creation_redemption_unit
+    etf_price = expected_iopv * 1.002
+    source = SimulatedMarketDataSource(
+        pcf,
+        SimulationConfig(
+            scenario=SimulationScenario.NORMAL,
+            base_volatility=0.0,
+        ),
+        initial_component_prices=prices,
+        initial_etf_price=etf_price,
+        price_seed_source="test_redis",
+    )
+
+    snapshot = source.step()
+
+    assert snapshot.internal_iopv == pytest.approx(expected_iopv)
+    assert snapshot.etf_order_book.last_price == pytest.approx(etf_price)
+    assert source.base_premium_bps == pytest.approx(20.0)
+    assert source.price_seed_source == "test_redis"
+    assert snapshot.component_order_books[active[0].stock_code].last_price == pytest.approx(
+        prices[active[0].stock_code]
+    )
+    assert snapshot.etf_order_book.source == "simulated:test_redis"
+
+
+def test_simulated_feed_rejects_incomplete_component_price_seed():
+    pcf = SZSEPCFParser().parse(PCF)
+
+    with pytest.raises(ValueError, match="initial component prices are missing"):
+        SimulatedMarketDataSource(
+            pcf,
+            SimulationConfig(),
+            initial_component_prices={},
+            initial_etf_price=3.7,
+        )
 
 
 def test_file_replay_never_returns_future_snapshot():

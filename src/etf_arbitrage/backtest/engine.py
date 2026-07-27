@@ -1,8 +1,8 @@
-"""Position simulation on the ETF premium spread."""
+"""Position simulation and convergence diagnostics on the ETF premium spread."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,42 @@ class Trade:
     holding_periods: int
     net_return: float
     exit_reason: str
+    gross_return: float = 0.0
+    total_cost: float = 0.0
+    holding_seconds: float = 0.0
+    max_adverse_excursion: float = 0.0
+    max_favorable_excursion: float = 0.0
+
+
+@dataclass(frozen=True)
+class ConvergenceMetrics:
+    """Diagnostics describing whether and how quickly premium gaps converge."""
+
+    trade_count: int = 0
+    converged_trade_count: int = 0
+    convergence_rate: float = 0.0
+    median_convergence_seconds: float = 0.0
+    p90_convergence_seconds: float = 0.0
+    average_mae_bps: float = 0.0
+    worst_mae_bps: float = 0.0
+    average_mfe_bps: float = 0.0
+    median_gross_capture_bps: float = 0.0
+    horizon_rates: Tuple[Tuple[int, float], ...] = ()
+
+    def rate_within(self, seconds: int) -> float:
+        return dict(self.horizon_rates).get(int(seconds), 0.0)
+
+
+@dataclass(frozen=True)
+class CostSensitivityPoint:
+    """Net spread capture under one assumed round-trip cost."""
+
+    round_trip_cost_bps: float
+    trade_count: int
+    convergence_rate: float
+    profitable_trade_rate: float
+    total_net_capture_bps: float
+    median_net_capture_bps: float
 
 
 @dataclass(frozen=True)
@@ -30,6 +66,7 @@ class BacktestResult:
     performance: PerformanceMetrics
     win_rate: float
     average_holding_periods: float
+    convergence: ConvergenceMetrics = field(default_factory=ConvergenceMetrics)
 
 
 class PremiumBacktester:
@@ -69,6 +106,9 @@ class PremiumBacktester:
         entry_time: Optional[datetime] = None
         entry_premium = 0.0
         trade_return = 0.0
+        trade_gross_return = 0.0
+        max_adverse_excursion = 0.0
+        max_favorable_excursion = 0.0
         trades: List[Trade] = []
         positions: List[int] = []
         actions: List[str] = []
@@ -82,8 +122,14 @@ class PremiumBacktester:
             risk_blocked = bool(row.risk_blocked)
             period_return = 0.0
             if previous_premium is not None and np.isfinite(premium):
-                period_return = position * (premium - previous_premium)
-                trade_return += period_return
+                gross_period_return = position * (premium - previous_premium)
+                period_return = gross_period_return
+                trade_return += gross_period_return
+                trade_gross_return += gross_period_return
+                if position:
+                    excursion = position * (premium - entry_premium)
+                    max_adverse_excursion = min(max_adverse_excursion, excursion)
+                    max_favorable_excursion = max(max_favorable_excursion, excursion)
 
             new_position = position
             action = "hold" if position else "flat"
@@ -130,6 +176,9 @@ class PremiumBacktester:
                     entry_time = timestamp
                     entry_premium = premium
                     holding_periods = 0
+                    trade_gross_return = 0.0
+                    max_adverse_excursion = 0.0
+                    max_favorable_excursion = 0.0
                 else:
                     action = "close_{}".format(exit_reason)
                     trades.append(
@@ -142,10 +191,18 @@ class PremiumBacktester:
                             holding_periods=holding_periods,
                             net_return=trade_return,
                             exit_reason=exit_reason or "closed",
+                            gross_return=trade_gross_return,
+                            total_cost=max(0.0, trade_gross_return - trade_return),
+                            holding_seconds=_elapsed_seconds(entry_time, timestamp),
+                            max_adverse_excursion=max_adverse_excursion,
+                            max_favorable_excursion=max_favorable_excursion,
                         )
                     )
                     entry_time = None
                     trade_return = 0.0
+                    trade_gross_return = 0.0
+                    max_adverse_excursion = 0.0
+                    max_favorable_excursion = 0.0
                     holding_periods = 0
                 position = new_position
 
@@ -171,6 +228,11 @@ class PremiumBacktester:
                     holding_periods=holding_periods,
                     net_return=trade_return,
                     exit_reason="end_of_replay",
+                    gross_return=trade_gross_return,
+                    total_cost=max(0.0, trade_gross_return - trade_return),
+                    holding_seconds=_elapsed_seconds(entry_time, final_timestamp),
+                    max_adverse_excursion=max_adverse_excursion,
+                    max_favorable_excursion=max_favorable_excursion,
                 )
             )
 
@@ -196,4 +258,87 @@ class PremiumBacktester:
             performance=performance,
             win_rate=win_rate,
             average_holding_periods=average_holding,
+            convergence=_calculate_convergence_metrics(trades),
         )
+
+    def cost_sensitivity(
+        self,
+        observations: pd.DataFrame,
+        round_trip_costs_bps: Iterable[float] = (6.0, 15.0, 30.0, 50.0),
+    ) -> Tuple[CostSensitivityPoint, ...]:
+        """Re-run identical signals under alternative round-trip cost assumptions."""
+        points: List[CostSensitivityPoint] = []
+        seen: set[float] = set()
+        for value in round_trip_costs_bps:
+            round_trip_cost = float(value)
+            if not np.isfinite(round_trip_cost) or round_trip_cost < 0:
+                raise ValueError("round-trip costs must be finite and non-negative")
+            if round_trip_cost in seen:
+                continue
+            seen.add(round_trip_cost)
+            scenario_config = replace(
+                self.config,
+                transaction_cost_bps=round_trip_cost / 2.0,
+            )
+            result = PremiumBacktester(scenario_config).run(observations)
+            net_captures = [trade.net_return * 10_000.0 for trade in result.trades]
+            points.append(
+                CostSensitivityPoint(
+                    round_trip_cost_bps=round_trip_cost,
+                    trade_count=len(result.trades),
+                    convergence_rate=result.convergence.convergence_rate,
+                    profitable_trade_rate=result.win_rate,
+                    total_net_capture_bps=float(sum(net_captures)),
+                    median_net_capture_bps=(
+                        float(np.median(net_captures)) if net_captures else 0.0
+                    ),
+                )
+            )
+        return tuple(points)
+
+
+def _elapsed_seconds(entry_time: Optional[datetime], exit_time: datetime) -> float:
+    if entry_time is None:
+        return 0.0
+    return max(0.0, float((exit_time - entry_time).total_seconds()))
+
+
+def _calculate_convergence_metrics(trades: List[Trade]) -> ConvergenceMetrics:
+    if not trades:
+        return ConvergenceMetrics(horizon_rates=((30, 0.0), (60, 0.0), (300, 0.0)))
+
+    converged = [trade for trade in trades if trade.exit_reason == "converged"]
+    convergence_seconds = [trade.holding_seconds for trade in converged]
+    horizons = (30, 60, 300)
+    horizon_rates = tuple(
+        (
+            seconds,
+            sum(trade.holding_seconds <= seconds for trade in converged) / len(trades),
+        )
+        for seconds in horizons
+    )
+    mae_bps = [
+        max(0.0, -trade.max_adverse_excursion * 10_000.0) for trade in trades
+    ]
+    mfe_bps = [
+        max(0.0, trade.max_favorable_excursion * 10_000.0) for trade in trades
+    ]
+    gross_capture_bps = [trade.gross_return * 10_000.0 for trade in trades]
+    return ConvergenceMetrics(
+        trade_count=len(trades),
+        converged_trade_count=len(converged),
+        convergence_rate=len(converged) / len(trades),
+        median_convergence_seconds=(
+            float(np.median(convergence_seconds)) if convergence_seconds else 0.0
+        ),
+        p90_convergence_seconds=(
+            float(np.percentile(convergence_seconds, 90))
+            if convergence_seconds
+            else 0.0
+        ),
+        average_mae_bps=float(np.mean(mae_bps)),
+        worst_mae_bps=float(max(mae_bps)),
+        average_mfe_bps=float(np.mean(mfe_bps)),
+        median_gross_capture_bps=float(np.median(gross_capture_bps)),
+        horizon_rates=horizon_rates,
+    )

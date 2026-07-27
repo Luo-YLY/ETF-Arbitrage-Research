@@ -10,6 +10,9 @@ from etf_arbitrage.data import (
     SZRedisDataFeed,
     SZRedisQuotationClient,
     SZRedisSettings,
+    SZSEPCFParser,
+    SubstituteFlag,
+    load_pcf_price_seed,
 )
 from etf_arbitrage.backtest import ResearchReplay
 
@@ -154,3 +157,74 @@ def test_maps_real_last_price_fields_in_indicative_mode() -> None:
     assert row["signal_reason"] == "missing_bid_ask"
     assert "missing_bid_ask" in row["risk_blockers"]
     assert not row["indicative_risk_blocked"]
+
+
+def test_loads_complete_pcf_latest_price_seed() -> None:
+    pcf = SZSEPCFParser().parse(
+        "data/pcf/20260722/pcf_159915_20260722.xml"
+    )
+    active = [
+        item
+        for item in pcf.components
+        if item.component_share > 0
+        and item.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    raw = {
+        "159915.SZ": {"code": "159915.SZ", "closepx": 3.709},
+        **{
+            item.stock_code + ".SZ": {
+                "code": item.stock_code + ".SZ",
+                "closepx": 10.0 + index / 100.0,
+            }
+            for index, item in enumerate(active)
+        },
+    }
+    quotation_client = SZRedisQuotationClient(
+        SZRedisSettings(host="example.invalid"),
+        redis_client=FakeRedis(raw),
+    )
+
+    seed = load_pcf_price_seed(
+        quotation_client,
+        pcf,
+        trade_date="20260720",
+    )
+
+    assert seed.etf_price == pytest.approx(3.709)
+    assert seed.component_count == len(active)
+    assert set(seed.component_prices) == {
+        item.stock_code for item in active
+    }
+
+
+def test_price_seed_rejects_missing_physical_component() -> None:
+    pcf = SZSEPCFParser().parse(
+        "data/pcf/20260722/pcf_159915_20260722.xml"
+    )
+    active = [
+        item
+        for item in pcf.components
+        if item.component_share > 0
+        and item.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    raw = {
+        "159915.SZ": {"code": "159915.SZ", "closepx": 3.709},
+        **{
+            item.stock_code + ".SZ": {
+                "code": item.stock_code + ".SZ",
+                "closepx": 10.0,
+            }
+            for item in active[1:]
+        },
+    }
+    quotation_client = SZRedisQuotationClient(
+        SZRedisSettings(host="example.invalid"),
+        redis_client=FakeRedis(raw),
+    )
+
+    with pytest.raises(QuotationSchemaError, match="缺少PCF实物成分股"):
+        load_pcf_price_seed(
+            quotation_client,
+            pcf,
+            trade_date="20260720",
+        )

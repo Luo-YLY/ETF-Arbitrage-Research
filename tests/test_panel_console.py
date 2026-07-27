@@ -3,7 +3,10 @@ from uuid import uuid4
 
 import pandas as pd
 import panel as pn
+import pytest
 
+import etf_arbitrage.dashboard_panel.executable as executable_module
+from etf_arbitrage.data import SZRedisPriceSeed, SubstituteFlag
 from etf_arbitrage.dashboard_panel import (
     PanelConsoleDashboard,
     PanelExecutableDashboard,
@@ -120,6 +123,76 @@ def test_executable_page_generates_full_depth_simulated_snapshot():
     assert len(dashboard.etf_book_table.value) == int(dashboard.book_levels.value)
     assert not dashboard.component_books_table.value.empty
     assert not dashboard.pcf_components_table.value.empty
+
+
+def test_executable_page_can_seed_simulation_from_sz_redis_latest_prices(
+    monkeypatch,
+):
+    class FakeSettings:
+        @classmethod
+        def from_env(cls):
+            return object()
+
+    class FakeClient:
+        def __init__(self, _settings):
+            pass
+
+        def ping(self):
+            return True
+
+    def fake_price_seed(_client, pcf, **_kwargs):
+        active = [
+            item
+            for item in pcf.components
+            if item.component_share > 0
+            and item.substitute_flag != SubstituteFlag.MANDATORY
+        ]
+        prices = {
+            item.stock_code: 10.0 + index / 100.0
+            for index, item in enumerate(active)
+        }
+        physical = sum(
+            item.component_share * prices[item.stock_code] for item in active
+        )
+        mandatory = sum(
+            item.creation_cash_substitute
+            for item in pcf.components
+            if item.substitute_flag == SubstituteFlag.MANDATORY
+        )
+        iopv = (
+            physical + mandatory + pcf.estimate_cash_component
+        ) / pcf.creation_redemption_unit
+        return SZRedisPriceSeed(
+            trade_date=pcf.trading_day.strftime("%Y%m%d"),
+            etf_code=pcf.etf_code,
+            etf_price=iopv * 1.001,
+            component_prices=prices,
+        )
+
+    monkeypatch.setattr(executable_module, "SZRedisSettings", FakeSettings)
+    monkeypatch.setattr(executable_module, "SZRedisQuotationClient", FakeClient)
+    monkeypatch.setattr(
+        executable_module,
+        "load_pcf_price_seed",
+        fake_price_seed,
+    )
+    dashboard = PanelExecutableDashboard(PROJECT_ROOT)
+    dashboard.use_redis_price_seed.value = True
+    dashboard.base_volatility.value = 0.0
+
+    dashboard._ensure_runtime(force=True)
+    snapshot = dashboard.source.step()
+
+    assert isinstance(
+        dashboard.source,
+        executable_module.SimulatedMarketDataSource,
+    )
+    assert dashboard.source.price_seed_source == "sz_redis_latest_trade"
+    assert snapshot.etf_order_book.last_price == pytest.approx(
+        dashboard.redis_price_seed.etf_price
+    )
+    assert "Redis最新成交价" in dashboard.runtime_status.object
+    assert "买卖盘深度与后续路径为模拟值" in dashboard.runtime_status.object
 
 
 def test_executable_page_uploads_and_replays_market_file():

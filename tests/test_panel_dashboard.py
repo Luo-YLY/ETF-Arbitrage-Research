@@ -109,6 +109,9 @@ def test_panel_replay_streams_rows_without_replacing_chart_models():
         assert dashboard.cursor == 3
         assert dashboard.progress.value == 100
         assert "跟随最新" in dashboard.status.object
+        assert "收敛率" in dashboard.backtest_metrics.object
+        assert "Sharpe" not in dashboard.backtest_metrics.object
+        assert len(dashboard.cost_sensitivity_table.value) == 4
 
         dashboard.follow_latest.value = False
         dashboard._reset_clicked(None)
