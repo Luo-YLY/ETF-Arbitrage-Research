@@ -4,6 +4,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pandas as pd
+from bokeh.models import BoxAnnotation
 
 from etf_arbitrage.dashboard_panel import (
     PanelReplayDashboard,
@@ -112,6 +113,39 @@ def test_panel_replay_streams_rows_without_replacing_chart_models():
         assert "收敛率" in dashboard.backtest_metrics.object
         assert "Sharpe" not in dashboard.backtest_metrics.object
         assert len(dashboard.cost_sensitivity_table.value) == 4
+        backtest_layout = dashboard.backtest_chart_pane.object
+        premium_chart, strategy_chart = backtest_layout.children
+        assert premium_chart.x_range is strategy_chart.x_range
+        holding_bands = [
+            annotation
+            for annotation in premium_chart.select(dict(type=BoxAnnotation))
+            if annotation.fill_alpha == 0.055
+        ]
+        assert len(holding_bands) == 1
+        event_renderers = [
+            renderer
+            for renderer in premium_chart.renderers
+            if "event"
+            in getattr(getattr(renderer, "data_source", None), "data", {})
+        ]
+        assert sum(len(renderer.data_source.data["event"]) for renderer in event_renderers) == 2
+        aggregated_renderer = next(
+            renderer
+            for renderer in premium_chart.renderers
+            if "premium_min_pct"
+            in getattr(getattr(renderer, "data_source", None), "data", {})
+        )
+        assert len(aggregated_renderer.data_source.data["timestamp"]) == 1
+
+        dashboard.backtest_chart_interval.value = None
+        raw_premium_chart = dashboard.backtest_chart_pane.object.children[0]
+        raw_renderer = next(
+            renderer
+            for renderer in raw_premium_chart.renderers
+            if "premium_min_pct"
+            in getattr(getattr(renderer, "data_source", None), "data", {})
+        )
+        assert len(raw_renderer.data_source.data["timestamp"]) == 3
 
         dashboard.follow_latest.value = False
         dashboard._reset_clicked(None)

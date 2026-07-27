@@ -9,7 +9,14 @@ from typing import Any, Optional, Union
 import numpy as np
 import pandas as pd
 import panel as pn
-from bokeh.models import ColumnDataSource, CrosshairTool, HoverTool, Span
+from bokeh.layouts import column as bokeh_column
+from bokeh.models import (
+    BoxAnnotation,
+    ColumnDataSource,
+    CrosshairTool,
+    HoverTool,
+    Span,
+)
 from bokeh.plotting import figure
 
 from etf_arbitrage.backtest import BacktestResult, PremiumBacktester
@@ -174,6 +181,16 @@ class PanelReplayDashboard:
             value="6, 15, 30, 50",
             placeholder="例如：6, 15, 30, 50",
         )
+        self.backtest_chart_interval = pn.widgets.Select(
+            label="回测图频率",
+            options={
+                "原始快照": None,
+                "30秒": "30s",
+                "1分钟": "1min",
+                "5分钟": "5min",
+            },
+            value="30s",
+        )
         self.execution_mode = pn.widgets.Select(
             label="回测价格模式",
             options={
@@ -314,6 +331,10 @@ class PanelReplayDashboard:
             height=230,
             sizing_mode="stretch_width",
         )
+        self.backtest_chart_pane = pn.pane.Bokeh(
+            _empty_backtest_layout(),
+            sizing_mode="stretch_width",
+        )
         self.trades_table = pn.widgets.Tabulator(
             pd.DataFrame(),
             show_index=False,
@@ -327,6 +348,10 @@ class PanelReplayDashboard:
         self.day_select.param.watch(self._dataset_changed, "value")
         self.etf_select.param.watch(self._dataset_changed, "value")
         self.follow_latest.param.watch(self._follow_latest_changed, "value")
+        self.backtest_chart_interval.param.watch(
+            self._backtest_chart_interval_changed,
+            "value",
+        )
         for widget in (
             self.entry_threshold,
             self.exit_threshold,
@@ -692,6 +717,9 @@ class PanelReplayDashboard:
             self._stop_callback()
             self.refresh_datasets()
 
+    def _backtest_chart_interval_changed(self, _event: Any) -> None:
+        self._update_backtest_visualization()
+
     @staticmethod
     def _dataset_signature(
         dataset: ObservationDataset,
@@ -954,6 +982,7 @@ class PanelReplayDashboard:
             self.backtest_metrics.object = ""
             self.cost_sensitivity_table.value = pd.DataFrame()
             self.trades_table.value = pd.DataFrame()
+            self._update_backtest_visualization()
             return
         quality = (
             self.frame["valuation_quality"].value_counts().to_dict()
@@ -1100,7 +1129,19 @@ class PanelReplayDashboard:
                 ]
             )
             self.trades_table.value = _trades_frame(result)
+        self._update_backtest_visualization()
         self._update_status("ready")
+
+    def _update_backtest_visualization(self) -> None:
+        if self.backtest_result is None or self.frame.empty:
+            self.backtest_chart_pane.object = _empty_backtest_layout()
+            return
+        self.backtest_chart_pane.object = _build_backtest_layout(
+            self.backtest_result,
+            entry_threshold=float(self.entry_threshold.value),
+            exit_threshold=float(self.exit_threshold.value),
+            interval=self.backtest_chart_interval.value,
+        )
 
     def sidebar_controls(self):
         model_controls = pn.Column(
@@ -1166,6 +1207,8 @@ class PanelReplayDashboard:
         return pn.Column(
             pn.pane.Markdown("## 收盘后折溢价收敛研究"),
             self.backtest_metrics,
+            self.backtest_chart_interval,
+            self.backtest_chart_pane,
             pn.pane.Markdown("#### 往返成本敏感性"),
             self.cost_sensitivity_table,
             pn.pane.Markdown("#### 收敛事件明细"),
@@ -1241,6 +1284,373 @@ def _action_label(action: str) -> str:
         "close_end_of_replay": "平仓：回放结束",
     }
     return labels.get(action, action)
+
+
+def _empty_backtest_layout():
+    return _build_backtest_charts(
+        pd.DataFrame(columns=["timestamp", "premium", "equity", "action"]),
+        (),
+        entry_threshold=0.0,
+        exit_threshold=0.0,
+        interval=None,
+    )
+
+
+def _build_backtest_layout(
+    result: BacktestResult,
+    entry_threshold: float,
+    exit_threshold: float,
+    interval: Optional[str],
+):
+    return _build_backtest_charts(
+        result.timeline,
+        result.trades,
+        entry_threshold=entry_threshold,
+        exit_threshold=exit_threshold,
+        interval=interval,
+    )
+
+
+def _build_backtest_charts(
+    timeline: pd.DataFrame,
+    trades,
+    entry_threshold: float,
+    exit_threshold: float,
+    interval: Optional[str],
+):
+    display = _resample_backtest_timeline(timeline, interval)
+    line_source = ColumnDataSource(display)
+    open_source, close_source = _trade_event_sources(timeline, trades)
+
+    premium_chart = figure(
+        title="折溢价与开平仓周期",
+        x_axis_type="datetime",
+        height=390,
+        sizing_mode="stretch_width",
+        tools="xpan,xwheel_zoom,box_zoom,reset,save",
+        active_scroll="xwheel_zoom",
+        min_border_left=72,
+        min_border_right=24,
+    )
+    strategy_chart = figure(
+        title="折溢价收敛研究指数",
+        x_axis_type="datetime",
+        x_range=premium_chart.x_range,
+        height=290,
+        sizing_mode="stretch_width",
+        tools="xpan,xwheel_zoom,box_zoom,reset,save",
+        active_scroll="xwheel_zoom",
+        min_border_left=72,
+        min_border_right=24,
+    )
+    for trade in trades:
+        color = POSITIVE if trade.direction == "premium" else NEGATIVE
+        for chart in (premium_chart, strategy_chart):
+            chart.add_layout(
+                BoxAnnotation(
+                    left=trade.entry_time,
+                    right=trade.exit_time,
+                    fill_color=color,
+                    fill_alpha=0.055,
+                    line_alpha=0.0,
+                    level="underlay",
+                )
+            )
+
+    if interval is not None:
+        premium_chart.varea(
+            x="timestamp",
+            y1="premium_min_pct",
+            y2="premium_max_pct",
+            source=line_source,
+            fill_color=ACCENT,
+            fill_alpha=0.14,
+            legend_label="区间内范围",
+        )
+    premium_line = premium_chart.line(
+        "timestamp",
+        "premium_pct",
+        source=line_source,
+        color=ACCENT,
+        line_width=2,
+        legend_label="区间末折溢价" if interval else "折溢价",
+    )
+    if display["premium_at_bid_pct"].notna().any():
+        premium_chart.line(
+            "timestamp",
+            "premium_at_bid_pct",
+            source=line_source,
+            color=POSITIVE,
+            line_width=1,
+            line_alpha=0.8,
+            legend_label="买一溢价边界",
+        )
+    if display["premium_at_ask_pct"].notna().any():
+        premium_chart.line(
+            "timestamp",
+            "premium_at_ask_pct",
+            source=line_source,
+            color=NEGATIVE,
+            line_width=1,
+            line_alpha=0.8,
+            legend_label="卖一折价边界",
+        )
+
+    open_premium = premium_chart.scatter(
+        "timestamp",
+        "premium_pct",
+        source=open_source,
+        marker="triangle",
+        size=10,
+        color=POSITIVE,
+        line_color="#ffffff",
+        line_width=1,
+        legend_label="开仓",
+    )
+    close_premium = premium_chart.scatter(
+        "timestamp",
+        "premium_pct",
+        source=close_source,
+        marker="inverted_triangle",
+        size=10,
+        color=BID_COLOR,
+        line_color="#ffffff",
+        line_width=1,
+        legend_label="平仓",
+    )
+
+    for location, color, dash in (
+        (entry_threshold, POSITIVE, "dashed"),
+        (-entry_threshold, NEGATIVE, "dashed"),
+        (exit_threshold, IOPV_COLOR, "dotdash"),
+        (-exit_threshold, IOPV_COLOR, "dotdash"),
+        (0.0, "#596368", "solid"),
+    ):
+        premium_chart.add_layout(
+            Span(
+                location=location,
+                dimension="width",
+                line_color=color,
+                line_dash=dash,
+                line_width=1,
+            )
+        )
+
+    strategy_line = strategy_chart.line(
+        "timestamp",
+        "equity",
+        source=line_source,
+        color=ACCENT,
+        line_width=2,
+        legend_label="收敛研究指数",
+    )
+    open_equity = strategy_chart.scatter(
+        "timestamp",
+        "equity",
+        source=open_source,
+        marker="triangle",
+        size=9,
+        color=POSITIVE,
+        line_color="#ffffff",
+        line_width=1,
+        legend_label="开仓",
+    )
+    close_equity = strategy_chart.scatter(
+        "timestamp",
+        "equity",
+        source=close_source,
+        marker="inverted_triangle",
+        size=9,
+        color=BID_COLOR,
+        line_color="#ffffff",
+        line_width=1,
+        legend_label="平仓",
+    )
+
+    event_tooltips = [
+        ("事件", "@event"),
+        ("方向", "@direction"),
+        ("时间", "@timestamp{%F %T}"),
+        ("折溢价", "@premium_pct{+0.000}%"),
+        ("持有时间", "@holding_time"),
+        ("结束原因", "@exit_reason"),
+    ]
+    for chart, renderers in (
+        (premium_chart, [open_premium, close_premium]),
+        (strategy_chart, [open_equity, close_equity]),
+    ):
+        chart.add_tools(
+            CrosshairTool(dimensions="height"),
+            HoverTool(
+                renderers=renderers,
+                tooltips=event_tooltips,
+                formatters={"@timestamp": "datetime"},
+                mode="mouse",
+            ),
+        )
+        chart.legend.orientation = "horizontal"
+        chart.legend.location = "top_left"
+        chart.legend.click_policy = "hide"
+        chart.grid.grid_line_color = "#e4e8ea"
+        chart.outline_line_color = "#cfd5d8"
+
+    premium_chart.add_tools(
+        HoverTool(
+            renderers=[premium_line],
+            tooltips=[
+                ("时间", "@timestamp{%F %T}"),
+                ("折溢价", "@premium_pct{+0.000}%"),
+                ("区间上沿", "@premium_max_pct{+0.000}%"),
+                ("区间下沿", "@premium_min_pct{+0.000}%"),
+            ],
+            formatters={"@timestamp": "datetime"},
+            mode="vline",
+        )
+    )
+    strategy_chart.add_tools(
+        HoverTool(
+            renderers=[strategy_line],
+            tooltips=[
+                ("时间", "@timestamp{%F %T}"),
+                ("研究指数", "@equity{0.000000}"),
+            ],
+            formatters={"@timestamp": "datetime"},
+            mode="vline",
+        )
+    )
+    premium_chart.yaxis.axis_label = "折溢价率（%）"
+    premium_chart.xaxis.visible = False
+    strategy_chart.yaxis.axis_label = "收敛研究指数"
+    strategy_chart.xaxis.axis_label = "时间"
+    return bokeh_column(
+        premium_chart,
+        strategy_chart,
+        sizing_mode="stretch_width",
+        spacing=8,
+    )
+
+
+def _resample_backtest_timeline(
+    timeline: pd.DataFrame,
+    interval: Optional[str],
+) -> pd.DataFrame:
+    columns = [
+        "timestamp",
+        "premium",
+        "equity",
+        "premium_at_bid",
+        "discount_at_ask",
+    ]
+    frame = timeline.copy()
+    for column in columns:
+        if column not in frame:
+            frame[column] = float("nan")
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    frame.sort_values("timestamp", kind="stable", inplace=True)
+    frame = frame[columns]
+
+    if interval and not frame.empty:
+        indexed = frame.set_index("timestamp")
+        display = (
+            indexed.resample(interval)
+            .agg(
+                premium=("premium", "last"),
+                premium_min=("premium", "min"),
+                premium_max=("premium", "max"),
+                equity=("equity", "last"),
+                premium_at_bid=("premium_at_bid", "last"),
+                discount_at_ask=("discount_at_ask", "last"),
+            )
+            .dropna(subset=["premium", "equity"])
+            .reset_index()
+        )
+    else:
+        display = frame.copy()
+        display["premium_min"] = display["premium"]
+        display["premium_max"] = display["premium"]
+
+    return pd.DataFrame(
+        {
+            "timestamp": display["timestamp"],
+            "premium_pct": display["premium"] * 100.0,
+            "premium_min_pct": display["premium_min"] * 100.0,
+            "premium_max_pct": display["premium_max"] * 100.0,
+            "premium_at_bid_pct": display["premium_at_bid"] * 100.0,
+            "premium_at_ask_pct": -display["discount_at_ask"] * 100.0,
+            "equity": display["equity"],
+        }
+    )
+
+
+def _trade_event_sources(timeline: pd.DataFrame, trades):
+    frame = timeline.copy()
+    if not frame.empty:
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    open_rows = []
+    close_rows = []
+    exit_labels = {
+        "converged": "达到收敛阈值",
+        "max_holding": "超过最长持有期",
+        "risk_blocked": "风险过滤触发",
+        "invalid_data": "行情数据失效",
+        "end_of_replay": "回放结束",
+    }
+    for index, trade in enumerate(trades, start=1):
+        direction = "溢价收敛" if trade.direction == "premium" else "折价收敛"
+        common = {
+            "direction": direction,
+            "holding_time": _format_seconds(trade.holding_seconds),
+            "exit_reason": exit_labels.get(trade.exit_reason, trade.exit_reason),
+            "trade_number": index,
+        }
+        open_rows.append(
+            {
+                **common,
+                "timestamp": trade.entry_time,
+                "premium_pct": trade.entry_premium * 100.0,
+                "equity": _event_equity(frame, trade.entry_time, "open_"),
+                "event": "开仓 #{}".format(index),
+            }
+        )
+        close_rows.append(
+            {
+                **common,
+                "timestamp": trade.exit_time,
+                "premium_pct": trade.exit_premium * 100.0,
+                "equity": _event_equity(frame, trade.exit_time, "close_"),
+                "event": "平仓 #{}".format(index),
+            }
+        )
+    event_columns = [
+        "timestamp",
+        "premium_pct",
+        "equity",
+        "event",
+        "direction",
+        "holding_time",
+        "exit_reason",
+        "trade_number",
+    ]
+    return (
+        ColumnDataSource(pd.DataFrame(open_rows, columns=event_columns)),
+        ColumnDataSource(pd.DataFrame(close_rows, columns=event_columns)),
+    )
+
+
+def _event_equity(
+    timeline: pd.DataFrame,
+    timestamp,
+    action_prefix: str,
+) -> float:
+    if timeline.empty:
+        return float("nan")
+    matches = timeline[
+        (timeline["timestamp"] == pd.Timestamp(timestamp))
+        & timeline["action"].astype(str).str.startswith(action_prefix)
+    ]
+    if matches.empty:
+        matches = timeline[timeline["timestamp"] == pd.Timestamp(timestamp)]
+    return float(matches.iloc[-1]["equity"]) if not matches.empty else float("nan")
 
 
 def _parse_cost_scenarios(value: str) -> tuple[float, ...]:
