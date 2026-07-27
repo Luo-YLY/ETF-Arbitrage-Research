@@ -1314,7 +1314,6 @@ class PanelExecutableDashboard:
             ("etf_last", "ETF最新价", ETF_COLOR, "solid", 2.2),
             ("etf_bid", "ETF买一价", BID_COLOR, "dotted", 1.4),
             ("etf_ask", "ETF卖一价", ASK_COLOR, "dotted", 1.4),
-            ("official_iopv", "官方IOPV", NEGATIVE, "dashed", 1.7),
             ("internal_iopv", "内部IOPV", IOPV_COLOR, "solid", 1.8),
             ("lower_bound", "套利下界", "#8B5E34", "dotdash", 1.2),
             ("upper_bound", "套利上界", "#8B5E34", "dotdash", 1.2),
@@ -1341,11 +1340,6 @@ class PanelExecutableDashboard:
                         "内部IOPV",
                         "@internal_iopv{0.0000} / "
                         "@internal_iopv_rel_bps{0.00} bp",
-                    ),
-                    (
-                        "官方IOPV",
-                        "@official_iopv{0.0000} / "
-                        "@official_iopv_rel_bps{0.00} bp",
                     ),
                     (
                         "套利边界",

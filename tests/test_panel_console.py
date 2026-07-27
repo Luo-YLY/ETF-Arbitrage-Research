@@ -132,9 +132,14 @@ def test_mean_reversion_refresh_keeps_selected_day_and_loads_new_file():
 
 def test_executable_page_generates_full_depth_simulated_snapshot():
     dashboard = PanelExecutableDashboard(PROJECT_ROOT)
+    price_legend_labels = {
+        item.label.value for item in dashboard.price_figure.legend[0].items
+    }
 
     dashboard._step(None)
 
+    assert "官方IOPV" not in price_legend_labels
+    assert "内部IOPV" in price_legend_labels
     assert len(dashboard.history["snapshots"]) == 1
     assert len(dashboard.history["opportunities"]) == 2
     assert len(dashboard.etf_book_table.value) == int(dashboard.book_levels.value)
