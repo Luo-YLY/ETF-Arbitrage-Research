@@ -284,6 +284,13 @@ def test_executable_page_replays_local_history_with_synthetic_books_without_redi
         assert dashboard.market_source.data["etf_bid_rel_bps"][0] < 0
         assert dashboard.market_source.data["etf_ask_rel_bps"][0] > 0
         assert "3.6000=0 bp" in dashboard.price_figure.title.text
+        assert dashboard.opening_source.data["price"] == pytest.approx([3.600])
+        assert dashboard.opening_span.location == pytest.approx(3.600)
+        assert dashboard.opening_span.visible is True
+        assert all(
+            value is None or value > 0
+            for value in dashboard.market_source.data["official_iopv"]
+        )
         assert dashboard.progress.name == "回放进度 2/2"
         assert dashboard.progress.value == 100
         assert "逐条回放本地历史数据" in dashboard.runtime_status.object
@@ -291,9 +298,11 @@ def test_executable_page_replays_local_history_with_synthetic_books_without_redi
 
         dashboard._clear_sources()
         assert dashboard.opening_reference_price is None
+        assert dashboard.opening_source.data["price"] == [None]
+        assert dashboard.opening_span.visible is False
         assert dashboard.market_source.data["etf_last_rel_bps"] == []
         assert dashboard.price_figure.title.text == (
-            "ETF价格、盘口与IOPV（相对开盘价，bp）"
+            "ETF价格、盘口与IOPV（实际价格窄幅缩放）"
         )
         dashboard.source.disconnect()
     finally:
