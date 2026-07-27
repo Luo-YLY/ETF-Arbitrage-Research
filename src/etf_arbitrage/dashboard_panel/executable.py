@@ -18,7 +18,6 @@ from etf_arbitrage.data import (
     SZRedisQuotationClient,
     SZRedisSettings,
     load_pcf_price_seed,
-    load_recording_price_seed,
     validate_executable_pcf,
 )
 from etf_arbitrage.engine import PaperArbitrageEngine, PaperEngineResult
@@ -43,6 +42,7 @@ from etf_arbitrage.market_data import (
     DynamicMarketDataLoader,
     FileReplayMarketDataSource,
     MarketDataSource,
+    RecordedHistoryMarketDataSource,
     RedisMarketDataSource,
     SimulatedMarketDataSource,
 )
@@ -149,7 +149,6 @@ class PanelExecutableDashboard:
         self.config: Optional[PaperArbitrageConfig] = None
         self.pcf_document = None
         self.pcf_report = None
-        self.local_price_seed = None
         self.redis_price_seed = None
         self.callback = None
         self.history = _new_history()
@@ -185,7 +184,7 @@ class PanelExecutableDashboard:
         self.price_seed_mode = pn.widgets.Select(
             label="模拟价格来源",
             options={
-                "本地历史数据（自动读取）": (
+                "本地历史数据（逐条回放）": (
                     SimulationPriceSeedMode.AUTO_LOCAL
                 ),
                 "指定本地历史文件": (
@@ -952,12 +951,14 @@ class PanelExecutableDashboard:
         if not force and self.engine is not None and signature == current_signature:
             return
 
+        previous_source = self.source
         self.stop_runtime()
+        if isinstance(previous_source, RecordedHistoryMarketDataSource):
+            previous_source.disconnect()
         self.config = config
         self.pcf_document = pcf
         self.pcf_report = report
         self.engine = PaperArbitrageEngine(pcf, config)
-        self.local_price_seed = None
         self.redis_price_seed = None
         if config.data_source == DataSourceMode.SIMULATED:
             seed_mode = config.simulation.price_seed_mode
@@ -971,16 +972,12 @@ class PanelExecutableDashboard:
                 SimulationPriceSeedMode.LOCAL_RECORDING,
             }
             if use_local and local_path.exists():
-                self.local_price_seed = load_recording_price_seed(local_path, pcf)
-                self.source = SimulatedMarketDataSource(
+                self.source = RecordedHistoryMarketDataSource(
+                    local_path,
                     pcf,
                     config.simulation,
-                    initial_component_prices=dict(
-                        self.local_price_seed.component_prices
-                    ),
-                    initial_etf_price=self.local_price_seed.etf_price,
-                    price_seed_source="local_recording_latest",
                 )
+                self.source.prime()
             elif seed_mode == SimulationPriceSeedMode.LOCAL_RECORDING:
                 raise ValueError(
                     "未找到本地采集文件：{}".format(local_path)
@@ -1026,17 +1023,16 @@ class PanelExecutableDashboard:
             DataSourceMode.FILE_REPLAY: "历史行情回放",
             DataSourceMode.REDIS: "标准化Redis",
         }.get(config.data_source, str(config.data_source))
-        if self.local_price_seed is not None:
+        if isinstance(self.source, RecordedHistoryMarketDataSource):
+            first_snapshot = self.source.prime()
+            source_label = "本地历史数据（真实价格轨迹+合成盘口）"
             seed_text = (
-                "价格基准：本地历史数据最后一条快照（{}），时间={}，ETF={:.4f}，"
-                "PCF实物成分股={}/{}，昨收回退={}；买卖盘深度与后续路径为模拟值。"
+                "逐条回放本地历史数据（{}），记录数={}，首条有效时间={}；"
+                "ETF与成分股Last沿用历史轨迹，Bid/Ask与多档深度为模拟值。"
             ).format(
-                self.local_price_seed.source_path,
-                self.local_price_seed.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                self.local_price_seed.etf_price,
-                self.local_price_seed.component_count,
-                self.local_price_seed.component_count,
-                self.local_price_seed.previous_close_fallback_count,
+                self.source.path,
+                self.source.total_records,
+                first_snapshot.snapshot_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             )
         elif self.redis_price_seed is not None:
             seed_text = (
@@ -1220,7 +1216,9 @@ class PanelExecutableDashboard:
         self.price_seed_mode.visible = is_simulated
         self.scenario.visible = is_simulated
         self.simulation_speed.visible = is_simulated
-        self.total_ticks.visible = is_simulated
+        self.total_ticks.visible = (
+            is_simulated and not self._uses_local_history()
+        )
 
     def _price_seed_mode_changed(self, _event) -> None:
         mode = self.price_seed_mode.value
@@ -1234,12 +1232,12 @@ class PanelExecutableDashboard:
         message = {
             SimulationPriceSeedMode.AUTO_LOCAL: (
                 "价格来源：本地历史数据。自动读取PCF交易日与ETF代码对应的"
-                "tmp/recordings文件，只使用最后一条快照锚定起始价格，不逐条"
-                "回放整日轨迹，也不连接内网Redis。"
+                "tmp/recordings文件，逐条保留ETF与成分股Last历史轨迹，并为"
+                "每个时点生成Bid/Ask和多档深度；不连接内网Redis。"
             ),
             SimulationPriceSeedMode.LOCAL_RECORDING: (
-                "价格来源：指定的本地历史文件。只使用最后一条快照锚定起始"
-                "价格，不逐条回放整日轨迹，也不连接内网Redis。"
+                "价格来源：指定的本地历史文件。逐条保留Last历史轨迹并生成"
+                "模拟盘口；不连接内网Redis。"
             ),
             SimulationPriceSeedMode.SYNTHETIC: (
                 "价格来源：完全模拟数据，不读取本地文件或内网Redis。"
@@ -1251,18 +1249,30 @@ class PanelExecutableDashboard:
         self.price_seed_message.object = (
             '<div class="exec-status">{}</div>'.format(message)
         )
+        self.total_ticks.visible = (
+            self.source_mode.value == DataSourceMode.SIMULATED
+            and not self._uses_local_history()
+        )
         if _event is not None:
             self._set_status(
                 "{} 请点击“应用配置并重置”或直接开始。".format(message),
                 "ready",
             )
 
+    def _uses_local_history(self) -> bool:
+        return self.price_seed_mode.value in {
+            SimulationPriceSeedMode.AUTO_LOCAL,
+            SimulationPriceSeedMode.LOCAL_RECORDING,
+        }
+
     def _pcf_changed(self) -> None:
+        previous_source = self.source
         self.stop_runtime()
+        if isinstance(previous_source, RecordedHistoryMarketDataSource):
+            previous_source.disconnect()
         self.source = None
         self.engine = None
         self.config = None
-        self.local_price_seed = None
         self.redis_price_seed = None
         self._refresh_pcf_views()
         self._set_status("PCF选择已变化，请应用配置。", "ready")
@@ -1514,24 +1524,41 @@ class PanelExecutableDashboard:
             DataSourceMode.FILE_REPLAY: "历史行情回放",
             DataSourceMode.REDIS: "标准化Redis",
         }.get(self.source_mode.value, str(self.source_mode.value))
+        if isinstance(self.source, RecordedHistoryMarketDataSource):
+            source_label = "本地历史数据（真实Last+模拟盘口）"
         self.runtime_status.object = (
             '<div class="exec-status">状态：就绪　数据源：{}　'
             "仅进行纸面模拟，不连接真实交易柜台。</div>"
         ).format(source_label)
 
     def _update_progress(self) -> None:
-        if isinstance(self.source, SimulatedMarketDataSource):
+        if isinstance(self.source, RecordedHistoryMarketDataSource):
+            total = max(self.source.total_records, 1)
+            current = min(self.source.records_read, total)
+            percentage = min(
+                100,
+                int(round(current / total * 100)),
+            )
+            self.progress.value = max(1, percentage) if current > 0 else 0
+            self.progress.name = "回放进度 {}/{}".format(current, total)
+        elif isinstance(self.source, SimulatedMarketDataSource):
             total = max(int(self.total_ticks.value), 1)
             self.progress.value = min(
                 100,
                 int(round(self.source.current_tick / total * 100)),
             )
+            self.progress.name = "模拟进度 {}/{}".format(
+                self.source.current_tick,
+                total,
+            )
         elif isinstance(self.source, FileReplayMarketDataSource):
             total = max(len(self.source.snapshots), 1)
             current = max(self.source._index + 1, 0)
             self.progress.value = min(100, int(round(current / total * 100)))
+            self.progress.name = "文件回放进度 {}/{}".format(current, total)
         else:
             self.progress.value = 0
+            self.progress.name = "进度"
 
     def _refresh_pcf_views(self) -> None:
         path = self.pcf.selected_path

@@ -9,6 +9,7 @@ from .models import (
     OrderBookLevel,
     TradingStatus,
 )
+from .recorded_history import RecordedHistoryMarketDataSource
 from .redis_source import RedisMarketDataSource
 from .quality import DataQualityChecker, DataQualityReport
 from .simulated import SimulatedMarketDataSource
@@ -26,6 +27,7 @@ __all__ = [
     "MarketSnapshot",
     "OrderBook",
     "OrderBookLevel",
+    "RecordedHistoryMarketDataSource",
     "RedisMarketDataSource",
     "SimulatedMarketDataSource",
     "TradingStatus",

@@ -8,8 +8,12 @@ import pytest
 
 import etf_arbitrage.dashboard_panel.executable as executable_module
 from etf_arbitrage.data import (
-    RecordingPriceSeed,
+    ETFQuote,
+    JsonlSnapshotStore,
+    MarketSnapshot as RecordedMarketSnapshot,
     SZRedisPriceSeed,
+    SZSEPCFParser,
+    StockQuote,
     SubstituteFlag,
 )
 from etf_arbitrage.dashboard_panel import (
@@ -25,6 +29,7 @@ from etf_arbitrage.executable_config import (
 )
 from etf_arbitrage.market_data import (
     FileReplayMarketDataSource,
+    RecordedHistoryMarketDataSource,
     RedisMarketDataSource,
 )
 
@@ -207,57 +212,76 @@ def test_executable_page_can_seed_simulation_from_sz_redis_latest_prices(
     assert "买卖盘深度与后续路径为模拟值" in dashboard.runtime_status.object
 
 
-def test_executable_page_can_seed_simulation_from_local_recording_without_redis(
+def test_executable_page_replays_local_history_with_synthetic_books_without_redis(
     monkeypatch,
 ):
     recording = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
     recording.parent.mkdir(parents=True, exist_ok=True)
-    recording.write_text("{}\n", encoding="utf-8")
-
-    def fake_recording_seed(path, pcf):
-        active = [
-            item
-            for item in pcf.components
-            if item.component_share > 0
-            and item.substitute_flag != SubstituteFlag.MANDATORY
-        ]
-        prices = {
-            item.stock_code: 10.0 + index / 100.0
-            for index, item in enumerate(active)
-        }
-        return RecordingPriceSeed(
-            timestamp=datetime(2026, 7, 22, 15, 0),
-            etf_code=pcf.etf_code,
-            etf_price=1.234,
-            component_prices=prices,
-            source_path=Path(path).resolve(),
-            previous_close_fallback_count=2,
+    pcf = SZSEPCFParser().parse(
+        PROJECT_ROOT / "data/pcf/20260722/pcf_159915_20260722.xml"
+    )
+    active = [
+        item
+        for item in pcf.components
+        if item.component_share > 0
+        and item.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    store = JsonlSnapshotStore(recording)
+    for tick, etf_price in enumerate((3.600, 3.610)):
+        timestamp = datetime(2026, 7, 22, 9, 30, 3 * tick)
+        store.append(
+            RecordedMarketSnapshot(
+                timestamp=timestamp,
+                etf_quote=ETFQuote(
+                    timestamp,
+                    "159915",
+                    etf_price,
+                    None,
+                    None,
+                    1_000,
+                    1_000_000,
+                ),
+                stock_quotes={
+                    component.stock_code: StockQuote(
+                        timestamp=timestamp,
+                        stock_code=component.stock_code,
+                        last_price=10.0 + index / 100.0 + tick / 1000.0,
+                        previous_close=9.9 + index / 100.0,
+                        volume=1_000,
+                    )
+                    for index, component in enumerate(active)
+                },
+            )
         )
 
     try:
-        monkeypatch.setattr(
-            executable_module,
-            "load_recording_price_seed",
-            fake_recording_seed,
-        )
         monkeypatch.setattr(
             executable_module,
             "_load_redis_price_seed",
             lambda *_args, **_kwargs: pytest.fail("Redis must not be accessed"),
         )
         dashboard = PanelExecutableDashboard(PROJECT_ROOT)
+        dashboard.pcf.date_picker.value = datetime(2026, 7, 22).date()
         dashboard.price_seed_mode.value = SimulationPriceSeedMode.LOCAL_RECORDING
         dashboard.local_recording_path.value = str(recording)
-        dashboard.base_volatility.value = 0.0
 
         dashboard._ensure_runtime(force=True)
-        snapshot = dashboard.source.step()
+        first = dashboard._advance_once()
+        second = dashboard._advance_once()
 
-        assert dashboard.source.price_seed_source == "local_recording_latest"
+        assert isinstance(dashboard.source, RecordedHistoryMarketDataSource)
         assert dashboard.redis_price_seed is None
-        assert snapshot.etf_order_book.last_price == pytest.approx(1.234)
-        assert "本地历史数据最后一条快照" in dashboard.runtime_status.object
-        assert "昨收回退=2" in dashboard.runtime_status.object
+        assert dashboard.history["snapshots"][0]["etf_last"] == pytest.approx(3.600)
+        assert dashboard.history["snapshots"][1]["etf_last"] == pytest.approx(3.610)
+        assert first.decision_evaluation.timestamp < second.decision_evaluation.timestamp
+        assert len(dashboard.snapshot.etf_order_book.bids) == int(
+            dashboard.book_levels.value
+        )
+        assert dashboard.progress.name == "回放进度 2/2"
+        assert dashboard.progress.value == 100
+        assert "逐条回放本地历史数据" in dashboard.runtime_status.object
+        assert "Bid/Ask与多档深度为模拟值" in dashboard.runtime_status.object
+        dashboard.source.disconnect()
     finally:
         recording.unlink(missing_ok=True)
 
@@ -365,7 +389,7 @@ def test_executable_sidebar_names_local_recording_without_implying_live_redis():
         DataSourceMode.SIMULATED
     )
     assert dashboard.price_seed_mode.options[
-        "本地历史数据（自动读取）"
+        "本地历史数据（逐条回放）"
     ] == SimulationPriceSeedMode.AUTO_LOCAL
     assert dashboard.price_seed_mode.value == SimulationPriceSeedMode.AUTO_LOCAL
 
@@ -376,7 +400,7 @@ def test_executable_sidebar_names_local_recording_without_implying_live_redis():
     dashboard.price_seed_mode.value = SimulationPriceSeedMode.AUTO_LOCAL
 
     assert "不连接内网Redis" in dashboard.runtime_status.object
-    assert "不逐条回放整日轨迹" in dashboard.runtime_status.object
+    assert "逐条保留ETF与成分股Last历史轨迹" in dashboard.runtime_status.object
     assert "旧的Redis连接错误" not in dashboard.runtime_status.object
 
 

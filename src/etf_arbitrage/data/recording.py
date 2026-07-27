@@ -92,6 +92,13 @@ class JsonlSnapshotStore:
                 "Invalid last snapshot record in {}".format(self.path)
             ) from exc
 
+    def count_records(self) -> int:
+        """Count non-empty records without parsing their JSON payloads."""
+        if not self.path.exists():
+            raise FileNotFoundError("Snapshot recording does not exist: {}".format(self.path))
+        with self.path.open("rb") as handle:
+            return sum(1 for line in handle if line.strip())
+
     def to_frames(self, etf_code: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         etf_rows = []
         stock_rows = []

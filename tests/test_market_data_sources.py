@@ -1,14 +1,23 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 import pytest
 
-from etf_arbitrage.data import SZSEPCFParser, SubstituteFlag
+from etf_arbitrage.data import (
+    ETFQuote,
+    JsonlSnapshotStore,
+    MarketSnapshot as RecordedMarketSnapshot,
+    SZSEPCFParser,
+    StockQuote,
+    SubstituteFlag,
+)
 from etf_arbitrage.executable_config import RedisConfig, SimulationConfig, SimulationScenario
 from etf_arbitrage.market_data import (
     DynamicMarketDataLoader,
     FileReplayMarketDataSource,
+    RecordedHistoryMarketDataSource,
     RedisMarketDataSource,
     SimulatedMarketDataSource,
 )
@@ -100,6 +109,79 @@ def test_simulated_feed_rejects_incomplete_component_price_seed():
             initial_component_prices={},
             initial_etf_price=3.7,
         )
+
+
+def test_recorded_history_replays_each_price_snapshot_with_synthetic_depth():
+    pcf = SZSEPCFParser().parse(PCF)
+    active = [
+        item
+        for item in pcf.components
+        if item.component_share > 0
+        and item.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    start = datetime(2026, 7, 22, 9, 30)
+    try:
+        store = JsonlSnapshotStore(path)
+        for tick, etf_price in enumerate((3.60, 3.61)):
+            timestamp = start + timedelta(seconds=3 * tick)
+            stocks = {
+                component.stock_code: StockQuote(
+                    timestamp=timestamp,
+                    stock_code=component.stock_code,
+                    last_price=10.0 + index / 100.0 + tick / 1000.0,
+                    previous_close=9.9 + index / 100.0,
+                    volume=1_000.0,
+                )
+                for index, component in enumerate(active)
+            }
+            store.append(
+                RecordedMarketSnapshot(
+                    timestamp=timestamp,
+                    etf_quote=ETFQuote(
+                        timestamp,
+                        "159915",
+                        etf_price,
+                        None,
+                        None,
+                        1_000,
+                        1_000_000,
+                    ),
+                    stock_quotes=stocks,
+                )
+            )
+
+        source = RecordedHistoryMarketDataSource(
+            path,
+            pcf,
+            SimulationConfig(
+                scenario=SimulationScenario.NORMAL,
+                number_of_book_levels=5,
+            ),
+        )
+        source.prime()
+        first = source.step()
+        second_for_fill = source.snapshot_at_or_after(
+            start + timedelta(milliseconds=100)
+        )
+        second = source.step()
+
+        assert source.total_records == 2
+        assert first.snapshot_timestamp == start
+        assert first.etf_order_book.last_price == pytest.approx(3.60)
+        assert len(first.etf_order_book.bids) == 5
+        assert len(first.etf_order_book.asks) == 5
+        assert first.etf_order_book.best_bid < 3.60
+        assert first.etf_order_book.best_ask > 3.60
+        assert len(first.component_order_books) == len(active)
+        assert first.source_mode == "LOCAL_HISTORY_SYNTHETIC_BOOK"
+        assert second_for_fill is second
+        assert second.etf_order_book.last_price == pytest.approx(3.61)
+        assert second.snapshot_timestamp == start + timedelta(seconds=3)
+        assert source.current_tick == 2
+        source.disconnect()
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_file_replay_never_returns_future_snapshot():
