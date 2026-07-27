@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import timedelta
 from io import BytesIO
 import json
+from math import isfinite
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -150,6 +151,7 @@ class PanelExecutableDashboard:
         self.pcf_document = None
         self.pcf_report = None
         self.redis_price_seed = None
+        self.opening_reference_price: Optional[float] = None
         self.callback = None
         self.history = _new_history()
 
@@ -517,6 +519,13 @@ class PanelExecutableDashboard:
                 "internal_iopv": [],
                 "lower_bound": [],
                 "upper_bound": [],
+                "etf_last_rel_bps": [],
+                "etf_bid_rel_bps": [],
+                "etf_ask_rel_bps": [],
+                "official_iopv_rel_bps": [],
+                "internal_iopv_rel_bps": [],
+                "lower_bound_rel_bps": [],
+                "upper_bound_rel_bps": [],
                 "creation_bps": [],
                 "redemption_bps": [],
             }
@@ -1279,7 +1288,7 @@ class PanelExecutableDashboard:
 
     def _build_price_figure(self):
         chart = figure(
-            title="ETF价格、盘口与IOPV",
+            title="ETF价格、盘口与IOPV（相对开盘价，bp）",
             x_axis_type="datetime",
             height=340,
             sizing_mode="stretch_width",
@@ -1287,13 +1296,37 @@ class PanelExecutableDashboard:
             active_scroll="xwheel_zoom",
         )
         specs = (
-            ("etf_last", "ETF最新价", ETF_COLOR, "solid", 2.2),
-            ("etf_bid", "ETF买一价", BID_COLOR, "dotted", 1.4),
-            ("etf_ask", "ETF卖一价", ASK_COLOR, "dotted", 1.4),
-            ("official_iopv", "官方IOPV", NEGATIVE, "dashed", 1.7),
-            ("internal_iopv", "内部IOPV", IOPV_COLOR, "solid", 1.8),
-            ("lower_bound", "套利下界", "#8B5E34", "dotdash", 1.2),
-            ("upper_bound", "套利上界", "#8B5E34", "dotdash", 1.2),
+            ("etf_last_rel_bps", "ETF最新价", ETF_COLOR, "solid", 2.2),
+            ("etf_bid_rel_bps", "ETF买一价", BID_COLOR, "dotted", 1.4),
+            ("etf_ask_rel_bps", "ETF卖一价", ASK_COLOR, "dotted", 1.4),
+            (
+                "official_iopv_rel_bps",
+                "官方IOPV",
+                NEGATIVE,
+                "dashed",
+                1.7,
+            ),
+            (
+                "internal_iopv_rel_bps",
+                "内部IOPV",
+                IOPV_COLOR,
+                "solid",
+                1.8,
+            ),
+            (
+                "lower_bound_rel_bps",
+                "套利下界",
+                "#8B5E34",
+                "dotdash",
+                1.2,
+            ),
+            (
+                "upper_bound_rel_bps",
+                "套利上界",
+                "#8B5E34",
+                "dotdash",
+                1.2,
+            ),
         )
         for field, label, color, dash, width in specs:
             chart.line(
@@ -1310,18 +1343,40 @@ class PanelExecutableDashboard:
             HoverTool(
                 tooltips=[
                     ("时间", "@timestamp{%F %T.%3N}"),
-                    ("ETF", "@etf_last{0.0000}"),
-                    ("买一", "@etf_bid{0.0000}"),
-                    ("卖一", "@etf_ask{0.0000}"),
-                    ("内部IOPV", "@internal_iopv{0.0000}"),
+                    ("ETF", "@etf_last{0.0000} / @etf_last_rel_bps{0.00} bp"),
+                    ("买一", "@etf_bid{0.0000} / @etf_bid_rel_bps{0.00} bp"),
+                    ("卖一", "@etf_ask{0.0000} / @etf_ask_rel_bps{0.00} bp"),
+                    (
+                        "内部IOPV",
+                        "@internal_iopv{0.0000} / "
+                        "@internal_iopv_rel_bps{0.00} bp",
+                    ),
+                    (
+                        "官方IOPV",
+                        "@official_iopv{0.0000} / "
+                        "@official_iopv_rel_bps{0.00} bp",
+                    ),
+                    (
+                        "套利边界",
+                        "@lower_bound{0.0000} - @upper_bound{0.0000}",
+                    ),
                 ],
                 formatters={"@timestamp": "datetime"},
                 mode="vline",
             ),
         )
+        chart.add_layout(
+            Span(
+                location=0,
+                dimension="width",
+                line_color="#596368",
+                line_width=1.2,
+            )
+        )
         chart.legend.orientation = "horizontal"
         chart.legend.location = "top_left"
         chart.legend.click_policy = "hide"
+        chart.yaxis.axis_label = "相对开盘价（bp）"
         chart.grid.grid_line_color = "#e4e8ea"
         return chart
 
@@ -1417,6 +1472,15 @@ class PanelExecutableDashboard:
     def _stream_snapshot(self, snapshot, result: PaperEngineResult) -> None:
         evaluation = result.decision_evaluation
         etf = snapshot.etf_order_book
+        if self.opening_reference_price is None and _is_valid_price(
+            etf.last_price
+        ):
+            self.opening_reference_price = float(etf.last_price)
+            self.price_figure.title.text = (
+                "ETF价格、盘口与IOPV（开盘基准 {:.4f}=0 bp）"
+            ).format(self.opening_reference_price)
+
+        reference = self.opening_reference_price
         payload = {
             "timestamp": [snapshot.snapshot_timestamp],
             "etf_last": [etf.last_price],
@@ -1426,6 +1490,27 @@ class PanelExecutableDashboard:
             "internal_iopv": [evaluation.internal_iopv],
             "lower_bound": [evaluation.lower_bound],
             "upper_bound": [evaluation.upper_bound],
+            "etf_last_rel_bps": [
+                _relative_bps(etf.last_price, reference)
+            ],
+            "etf_bid_rel_bps": [
+                _relative_bps(etf.best_bid, reference)
+            ],
+            "etf_ask_rel_bps": [
+                _relative_bps(etf.best_ask, reference)
+            ],
+            "official_iopv_rel_bps": [
+                _relative_bps(evaluation.official_iopv, reference)
+            ],
+            "internal_iopv_rel_bps": [
+                _relative_bps(evaluation.internal_iopv, reference)
+            ],
+            "lower_bound_rel_bps": [
+                _relative_bps(evaluation.lower_bound, reference)
+            ],
+            "upper_bound_rel_bps": [
+                _relative_bps(evaluation.upper_bound, reference)
+            ],
             "creation_bps": [evaluation.creation.net_profit_bps],
             "redemption_bps": [evaluation.redemption.net_profit_bps],
         }
@@ -1720,6 +1805,8 @@ class PanelExecutableDashboard:
         )
 
     def _clear_sources(self) -> None:
+        self.opening_reference_price = None
+        self.price_figure.title.text = "ETF价格、盘口与IOPV（相对开盘价，bp）"
         self.market_source.data = {
             "timestamp": [],
             "etf_last": [],
@@ -1729,6 +1816,13 @@ class PanelExecutableDashboard:
             "internal_iopv": [],
             "lower_bound": [],
             "upper_bound": [],
+            "etf_last_rel_bps": [],
+            "etf_bid_rel_bps": [],
+            "etf_ask_rel_bps": [],
+            "official_iopv_rel_bps": [],
+            "internal_iopv_rel_bps": [],
+            "lower_bound_rel_bps": [],
+            "upper_bound_rel_bps": [],
             "creation_bps": [],
             "redemption_bps": [],
         }
@@ -2073,3 +2167,22 @@ def _price(value: Optional[float]) -> str:
     if value is None or pd.isna(value):
         return "--"
     return "{:.4f}".format(float(value))
+
+
+def _is_valid_price(value: Optional[float]) -> bool:
+    if value is None:
+        return False
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return False
+    return isfinite(price) and price > 0
+
+
+def _relative_bps(
+    value: Optional[float],
+    reference: Optional[float],
+) -> Optional[float]:
+    if not _is_valid_price(value) or not _is_valid_price(reference):
+        return None
+    return (float(value) / float(reference) - 1.0) * 10_000.0

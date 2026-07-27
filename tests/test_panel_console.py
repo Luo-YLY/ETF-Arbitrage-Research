@@ -277,10 +277,24 @@ def test_executable_page_replays_local_history_with_synthetic_books_without_redi
         assert len(dashboard.snapshot.etf_order_book.bids) == int(
             dashboard.book_levels.value
         )
+        assert dashboard.opening_reference_price == pytest.approx(3.600)
+        assert dashboard.market_source.data["etf_last_rel_bps"] == pytest.approx(
+            [0.0, (3.610 / 3.600 - 1.0) * 10_000.0]
+        )
+        assert dashboard.market_source.data["etf_bid_rel_bps"][0] < 0
+        assert dashboard.market_source.data["etf_ask_rel_bps"][0] > 0
+        assert "3.6000=0 bp" in dashboard.price_figure.title.text
         assert dashboard.progress.name == "回放进度 2/2"
         assert dashboard.progress.value == 100
         assert "逐条回放本地历史数据" in dashboard.runtime_status.object
         assert "Bid/Ask与多档深度为模拟值" in dashboard.runtime_status.object
+
+        dashboard._clear_sources()
+        assert dashboard.opening_reference_price is None
+        assert dashboard.market_source.data["etf_last_rel_bps"] == []
+        assert dashboard.price_figure.title.text == (
+            "ETF价格、盘口与IOPV（相对开盘价，bp）"
+        )
         dashboard.source.disconnect()
     finally:
         recording.unlink(missing_ok=True)
