@@ -185,10 +185,10 @@ class PanelExecutableDashboard:
         self.price_seed_mode = pn.widgets.Select(
             label="模拟价格来源",
             options={
-                "本地历史Redis数据（自动读取）": (
+                "本地历史数据（自动读取）": (
                     SimulationPriceSeedMode.AUTO_LOCAL
                 ),
-                "指定本地历史Redis文件": (
+                "指定本地历史文件": (
                     SimulationPriceSeedMode.LOCAL_RECORDING
                 ),
                 "完全模拟数据": SimulationPriceSeedMode.SYNTHETIC,
@@ -1028,7 +1028,7 @@ class PanelExecutableDashboard:
         }.get(config.data_source, str(config.data_source))
         if self.local_price_seed is not None:
             seed_text = (
-                "价格基准：本地采集文件最后一条快照（{}），时间={}，ETF={:.4f}，"
+                "价格基准：本地历史数据最后一条快照（{}），时间={}，ETF={:.4f}，"
                 "PCF实物成分股={}/{}，昨收回退={}；买卖盘深度与后续路径为模拟值。"
             ).format(
                 self.local_price_seed.source_path,
@@ -1233,11 +1233,13 @@ class PanelExecutableDashboard:
         )
         message = {
             SimulationPriceSeedMode.AUTO_LOCAL: (
-                "价格来源：本地历史Redis数据。自动读取PCF交易日与ETF代码对应的"
-                "tmp/recordings文件，不连接内网Redis。"
+                "价格来源：本地历史数据。自动读取PCF交易日与ETF代码对应的"
+                "tmp/recordings文件，只使用最后一条快照锚定起始价格，不逐条"
+                "回放整日轨迹，也不连接内网Redis。"
             ),
             SimulationPriceSeedMode.LOCAL_RECORDING: (
-                "价格来源：指定的本地历史Redis文件，不连接内网Redis。"
+                "价格来源：指定的本地历史文件。只使用最后一条快照锚定起始"
+                "价格，不逐条回放整日轨迹，也不连接内网Redis。"
             ),
             SimulationPriceSeedMode.SYNTHETIC: (
                 "价格来源：完全模拟数据，不读取本地文件或内网Redis。"

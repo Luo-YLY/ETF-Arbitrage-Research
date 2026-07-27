@@ -256,7 +256,7 @@ def test_executable_page_can_seed_simulation_from_local_recording_without_redis(
         assert dashboard.source.price_seed_source == "local_recording_latest"
         assert dashboard.redis_price_seed is None
         assert snapshot.etf_order_book.last_price == pytest.approx(1.234)
-        assert "本地采集文件最后一条快照" in dashboard.runtime_status.object
+        assert "本地历史数据最后一条快照" in dashboard.runtime_status.object
         assert "昨收回退=2" in dashboard.runtime_status.object
     finally:
         recording.unlink(missing_ok=True)
@@ -365,7 +365,7 @@ def test_executable_sidebar_names_local_recording_without_implying_live_redis():
         DataSourceMode.SIMULATED
     )
     assert dashboard.price_seed_mode.options[
-        "本地历史Redis数据（自动读取）"
+        "本地历史数据（自动读取）"
     ] == SimulationPriceSeedMode.AUTO_LOCAL
     assert dashboard.price_seed_mode.value == SimulationPriceSeedMode.AUTO_LOCAL
 
@@ -376,6 +376,7 @@ def test_executable_sidebar_names_local_recording_without_implying_live_redis():
     dashboard.price_seed_mode.value = SimulationPriceSeedMode.AUTO_LOCAL
 
     assert "不连接内网Redis" in dashboard.runtime_status.object
+    assert "不逐条回放整日轨迹" in dashboard.runtime_status.object
     assert "旧的Redis连接错误" not in dashboard.runtime_status.object
 
 
