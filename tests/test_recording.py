@@ -12,7 +12,10 @@ from etf_arbitrage.data import (
     ETFQuote,
     JsonlSnapshotStore,
     MarketSnapshot,
+    SZSEPCFParser,
     StockQuote,
+    SubstituteFlag,
+    load_recording_price_seed,
 )
 
 
@@ -51,6 +54,60 @@ def test_jsonl_store_deduplicates_and_loads_replay_frames() -> None:
         assert etf_frame.iloc[-1]["last_price"] == pytest.approx(1.201)
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_latest_recording_snapshot_builds_complete_price_seed() -> None:
+    pcf = SZSEPCFParser().parse(
+        Path("data/pcf/20260722/pcf_159915_20260722.xml")
+    )
+    active = [
+        component
+        for component in pcf.components
+        if component.component_share > 0
+        and component.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    timestamp = datetime(2026, 7, 22, 15, 0)
+    stock_quotes = {}
+    for index, component in enumerate(active):
+        stock_quotes[component.stock_code] = StockQuote(
+            timestamp=timestamp,
+            stock_code=component.stock_code,
+            last_price=None if index == 0 else 10.0 + index / 100.0,
+            previous_close=9.99 if index == 0 else 9.90,
+            volume=1_000.0,
+        )
+    recording = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    try:
+        store = JsonlSnapshotStore(recording)
+        store.append(snapshot(timestamp - timedelta(seconds=3), 1.20))
+        store.append(
+            MarketSnapshot(
+                timestamp=timestamp,
+                etf_quote=ETFQuote(
+                    timestamp,
+                    "159915",
+                    1.234,
+                    None,
+                    None,
+                    1_000,
+                    2_000,
+                ),
+                stock_quotes=stock_quotes,
+            )
+        )
+
+        latest = store.latest_snapshot()
+        seed = load_recording_price_seed(recording, pcf)
+
+        assert latest.timestamp == timestamp
+        assert seed.timestamp == timestamp
+        assert seed.etf_price == pytest.approx(1.234)
+        assert seed.component_count == len(active)
+        assert seed.component_prices[active[0].stock_code] == pytest.approx(9.99)
+        assert seed.previous_close_fallback_count == 1
+        assert seed.source_path == recording.resolve()
+    finally:
+        recording.unlink(missing_ok=True)
 
 
 def test_replay_keeps_distinct_snapshots_with_the_same_timestamp() -> None:

@@ -18,6 +18,7 @@ from etf_arbitrage.data import (
     SZRedisQuotationClient,
     SZRedisSettings,
     load_pcf_price_seed,
+    load_recording_price_seed,
     validate_executable_pcf,
 )
 from etf_arbitrage.engine import PaperArbitrageEngine, PaperEngineResult
@@ -35,6 +36,7 @@ from etf_arbitrage.executable_config import (
     PrimaryMarketConfig,
     RedisConfig,
     SimulationConfig,
+    SimulationPriceSeedMode,
     SimulationScenario,
 )
 from etf_arbitrage.market_data import (
@@ -147,6 +149,7 @@ class PanelExecutableDashboard:
         self.config: Optional[PaperArbitrageConfig] = None
         self.pcf_document = None
         self.pcf_report = None
+        self.local_price_seed = None
         self.redis_price_seed = None
         self.callback = None
         self.history = _new_history()
@@ -157,6 +160,7 @@ class PanelExecutableDashboard:
         self._build_output_models()
         self._wire_events()
         self._source_mode_changed(None)
+        self._price_seed_mode_changed(None)
         self._refresh_pcf_views()
         self._update_views()
 
@@ -178,17 +182,28 @@ class PanelExecutableDashboard:
             value=SimulationScenario.NORMAL,
         )
         self.random_seed = _int_input("随机种子", 42, 0, 1_000_000, 1)
-        self.use_redis_price_seed = pn.widgets.Checkbox(
-            label="使用内网Redis最新价初始化",
-            value=False,
+        self.price_seed_mode = pn.widgets.Select(
+            label="模拟价格基准",
+            options={
+                "自动（优先本地采集）": SimulationPriceSeedMode.AUTO_LOCAL,
+                "本地已采集快照": SimulationPriceSeedMode.LOCAL_RECORDING,
+                "完全模拟": SimulationPriceSeedMode.SYNTHETIC,
+                "内网Redis最新价": SimulationPriceSeedMode.REDIS_LATEST,
+            },
+            value=SimulationPriceSeedMode.AUTO_LOCAL,
+        )
+        self.local_recording_path = pn.widgets.TextInput(
+            label="本地采集文件（可选）",
+            value="",
+            placeholder="留空自动读取 tmp/recordings/交易日/ETF代码.jsonl",
         )
         self.redis_seed_suffix = pn.widgets.TextInput(
             label="Redis代码后缀",
             value=".SZ",
             placeholder=".SZ",
         )
-        self.redis_seed_message = pn.pane.HTML(
-            '<div class="exec-status">价格基准：完全模拟。启用后仅使用Redis最新成交价定基准，买卖盘与后续路径仍由模拟器生成。</div>',
+        self.price_seed_message = pn.pane.HTML(
+            '<div class="exec-status">价格基准：自动优先读取PCF交易日对应的本地采集文件；不存在时使用完全模拟。买卖盘深度与后续路径仍由模拟器生成。</div>',
             sizing_mode="stretch_width",
         )
         self.tick_ms = _int_input("Tick间隔（毫秒）", 1000, 10, 60_000, 10)
@@ -564,6 +579,7 @@ class PanelExecutableDashboard:
 
     def _wire_events(self) -> None:
         self.source_mode.param.watch(self._source_mode_changed, "value")
+        self.price_seed_mode.param.watch(self._price_seed_mode_changed, "value")
         self.load_market_button.on_click(self._load_market_data)
         self.apply_button.on_click(self._apply_config)
         self.start_button.on_click(self._start)
@@ -620,28 +636,28 @@ class PanelExecutableDashboard:
     def _configuration_view(self):
         simulation_controls = pn.Column(
             pn.Row(self.scenario, self.random_seed),
-            pn.Row(self.use_redis_price_seed, self.redis_seed_suffix),
-            self.redis_seed_message,
+            pn.Row(self.price_seed_mode, self.local_recording_path),
+            self.redis_seed_suffix,
+            self.price_seed_message,
             pn.Row(self.tick_ms, self.total_ticks, self.simulation_speed),
             pn.Row(self.premium_shock, self.base_volatility),
             pn.Row(self.book_levels, self.depth_per_level, self.quote_latency),
             pn.Row(self.stale_ratio, self.missing_ratio),
-            pn.Accordion(
-                (
-                    "模拟行情高级参数",
-                    pn.Column(
-                        pn.Row(self.etf_spread, self.component_spread),
-                        pn.Row(self.depth_decay, self.mean_reversion_speed),
-                        pn.Row(self.shock_start_tick, self.shock_duration),
-                        pn.Row(
-                            self.suspended_weight,
-                            self.limit_up_weight,
-                            self.limit_down_weight,
-                        ),
-                        self.sequence_gap_probability,
+            pn.Card(
+                pn.Column(
+                    pn.Row(self.etf_spread, self.component_spread),
+                    pn.Row(self.depth_decay, self.mean_reversion_speed),
+                    pn.Row(self.shock_start_tick, self.shock_duration),
+                    pn.Row(
+                        self.suspended_weight,
+                        self.limit_up_weight,
+                        self.limit_down_weight,
                     ),
+                    self.sequence_gap_probability,
                 ),
-                active=[],
+                title="模拟行情高级参数",
+                collapsed=False,
+                collapsible=True,
                 sizing_mode="stretch_width",
             ),
             sizing_mode="stretch_width",
@@ -710,11 +726,28 @@ class PanelExecutableDashboard:
             simulation_controls,
             file_controls,
             redis_controls,
-            pn.Accordion(
-                ("执行参数", execution_controls),
-                ("账户与一级市场情景", account_controls),
-                ("数据质量阈值", quality_controls),
-                active=[0],
+            pn.Column(
+                pn.Card(
+                    execution_controls,
+                    title="执行参数",
+                    collapsed=False,
+                    collapsible=True,
+                    sizing_mode="stretch_width",
+                ),
+                pn.Card(
+                    account_controls,
+                    title="账户与一级市场情景",
+                    collapsed=False,
+                    collapsible=True,
+                    sizing_mode="stretch_width",
+                ),
+                pn.Card(
+                    quality_controls,
+                    title="数据质量阈值",
+                    collapsed=False,
+                    collapsible=True,
+                    sizing_mode="stretch_width",
+                ),
                 sizing_mode="stretch_width",
             ),
             sizing_mode="stretch_width",
@@ -808,7 +841,8 @@ class PanelExecutableDashboard:
             simulation=SimulationConfig(
                 scenario=self.scenario.value,
                 random_seed=int(self.random_seed.value),
-                use_redis_price_seed=bool(self.use_redis_price_seed.value),
+                price_seed_mode=self.price_seed_mode.value,
+                local_recording_path=self.local_recording_path.value.strip(),
                 redis_code_suffix=self.redis_seed_suffix.value.strip() or ".SZ",
                 tick_interval_ms=int(self.tick_ms.value),
                 total_ticks=int(self.total_ticks.value),
@@ -918,9 +952,42 @@ class PanelExecutableDashboard:
         self.pcf_document = pcf
         self.pcf_report = report
         self.engine = PaperArbitrageEngine(pcf, config)
+        self.local_price_seed = None
         self.redis_price_seed = None
         if config.data_source == DataSourceMode.SIMULATED:
-            if config.simulation.use_redis_price_seed:
+            seed_mode = config.simulation.price_seed_mode
+            local_path = _resolve_local_recording_path(
+                self.project_root,
+                pcf,
+                config.simulation.local_recording_path,
+            )
+            use_local = seed_mode in {
+                SimulationPriceSeedMode.AUTO_LOCAL,
+                SimulationPriceSeedMode.LOCAL_RECORDING,
+            }
+            if use_local and local_path.exists():
+                self.local_price_seed = load_recording_price_seed(local_path, pcf)
+                self.source = SimulatedMarketDataSource(
+                    pcf,
+                    config.simulation,
+                    initial_component_prices=dict(
+                        self.local_price_seed.component_prices
+                    ),
+                    initial_etf_price=self.local_price_seed.etf_price,
+                    price_seed_source="local_recording_latest",
+                )
+            elif seed_mode == SimulationPriceSeedMode.LOCAL_RECORDING:
+                raise ValueError(
+                    "未找到本地采集文件：{}".format(local_path)
+                )
+            elif (
+                seed_mode == SimulationPriceSeedMode.AUTO_LOCAL
+                and config.simulation.local_recording_path
+            ):
+                raise ValueError(
+                    "指定的本地采集文件不存在：{}".format(local_path)
+                )
+            elif seed_mode == SimulationPriceSeedMode.REDIS_LATEST:
                 self.redis_price_seed = _load_redis_price_seed(
                     pcf,
                     config.simulation.redis_code_suffix,
@@ -954,7 +1021,19 @@ class PanelExecutableDashboard:
             DataSourceMode.FILE_REPLAY: "历史行情回放",
             DataSourceMode.REDIS: "标准化Redis",
         }.get(config.data_source, str(config.data_source))
-        if self.redis_price_seed is not None:
+        if self.local_price_seed is not None:
+            seed_text = (
+                "价格基准：本地采集文件最后一条快照（{}），时间={}，ETF={:.4f}，"
+                "PCF实物成分股={}/{}，昨收回退={}；买卖盘深度与后续路径为模拟值。"
+            ).format(
+                self.local_price_seed.source_path,
+                self.local_price_seed.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                self.local_price_seed.etf_price,
+                self.local_price_seed.component_count,
+                self.local_price_seed.component_count,
+                self.local_price_seed.previous_close_fallback_count,
+            )
+        elif self.redis_price_seed is not None:
             seed_text = (
                 "价格基准：Redis最新成交价，ETF={:.4f}，"
                 "PCF实物成分股={}/{}；买卖盘深度与后续路径为模拟值。"
@@ -963,9 +1042,17 @@ class PanelExecutableDashboard:
                 self.redis_price_seed.component_count,
                 self.redis_price_seed.component_count,
             )
+        elif (
+            config.data_source == DataSourceMode.SIMULATED
+            and config.simulation.price_seed_mode
+            == SimulationPriceSeedMode.AUTO_LOCAL
+        ):
+            seed_text = (
+                "价格基准：未找到{}，已使用完全模拟。"
+            ).format(local_path)
         else:
             seed_text = "价格基准：完全模拟。"
-        self.redis_seed_message.object = (
+        self.price_seed_message.object = (
             '<div class="exec-status">{}</div>'.format(seed_text)
         )
         self._set_status(
@@ -1128,11 +1215,22 @@ class PanelExecutableDashboard:
         self.simulation_speed.visible = mode == DataSourceMode.SIMULATED
         self.total_ticks.visible = mode == DataSourceMode.SIMULATED
 
+    def _price_seed_mode_changed(self, _event) -> None:
+        mode = self.price_seed_mode.value
+        self.local_recording_path.visible = mode in {
+            SimulationPriceSeedMode.AUTO_LOCAL,
+            SimulationPriceSeedMode.LOCAL_RECORDING,
+        }
+        self.redis_seed_suffix.visible = (
+            mode == SimulationPriceSeedMode.REDIS_LATEST
+        )
+
     def _pcf_changed(self) -> None:
         self.stop_runtime()
         self.source = None
         self.engine = None
         self.config = None
+        self.local_price_seed = None
         self.redis_price_seed = None
         self._refresh_pcf_views()
         self._set_status("PCF选择已变化，请应用配置。", "ready")
@@ -1794,6 +1892,23 @@ def _book_rows(book) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _resolve_local_recording_path(
+    project_root: Path,
+    pcf,
+    configured_path: str,
+) -> Path:
+    if configured_path:
+        path = Path(configured_path).expanduser()
+        return path if path.is_absolute() else project_root / path
+    return (
+        project_root
+        / "tmp"
+        / "recordings"
+        / pcf.trading_day.strftime("%Y%m%d")
+        / "{}.jsonl".format(pcf.etf_code)
+    )
 
 
 def _load_redis_price_seed(pcf, redis_code_suffix: str):

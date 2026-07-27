@@ -25,7 +25,11 @@ from .pcf_repository import (
 )
 from .pcf_validation import PCFValidationReport, validate_executable_pcf
 from .replay import DataFrameReplayFeed
-from .recording import JsonlSnapshotStore
+from .recording import (
+    JsonlSnapshotStore,
+    RecordingPriceSeed,
+    load_recording_price_seed,
+)
 from .sz_redis import (
     QuotationSchemaError,
     RedisDependencyError,
@@ -47,6 +51,7 @@ __all__ = [
     "LimitStatus",
     "LiveDataFeed",
     "JsonlSnapshotStore",
+    "RecordingPriceSeed",
     "MarketSnapshot",
     "PCFComponent",
     "PCFDocument",
@@ -68,6 +73,7 @@ __all__ = [
     "SubstituteFlag",
     "load_pcf_source_templates",
     "load_pcf_price_seed",
+    "load_recording_price_seed",
     "PCFValidationReport",
     "validate_executable_pcf",
 ]

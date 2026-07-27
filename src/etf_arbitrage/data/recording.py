@@ -4,13 +4,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union
 
 import pandas as pd
 
 from .models import ETFQuote, LimitStatus, MarketSnapshot, StockQuote
+from .pcf import PCFDocument, SubstituteFlag
+
+
+@dataclass(frozen=True)
+class RecordingPriceSeed:
+    """Latest valid ETF and physical-component prices loaded from a recording."""
+
+    timestamp: datetime
+    etf_code: str
+    etf_price: float
+    component_prices: Mapping[str, float]
+    source_path: Path
+    previous_close_fallback_count: int = 0
+
+    @property
+    def component_count(self) -> int:
+        return len(self.component_prices)
 
 
 class JsonlSnapshotStore:
@@ -58,6 +77,20 @@ class JsonlSnapshotStore:
                             line_number, self.path
                         )
                     ) from exc
+
+    def latest_snapshot(self) -> MarketSnapshot:
+        """Read only the last complete non-empty JSONL record."""
+        if not self.path.exists():
+            raise FileNotFoundError("Snapshot recording does not exist: {}".format(self.path))
+        text = self._last_nonempty_line(self.path)
+        if text is None:
+            raise ValueError("Snapshot recording is empty: {}".format(self.path))
+        try:
+            return self._deserialize(json.loads(text))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Invalid last snapshot record in {}".format(self.path)
+            ) from exc
 
     def to_frames(self, etf_code: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         etf_rows = []
@@ -189,6 +222,29 @@ class JsonlSnapshotStore:
         return None if value is None else float(value)
 
     @staticmethod
+    def _last_nonempty_line(path: Path, chunk_size: int = 65_536) -> Optional[str]:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            position = handle.tell()
+            buffer = b""
+            while position > 0:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                handle.seek(position)
+                buffer = handle.read(read_size) + buffer
+                lines = buffer.splitlines()
+                if position > 0:
+                    if len(lines) <= 1:
+                        continue
+                    candidates = lines[1:]
+                else:
+                    candidates = lines
+                for line in reversed(candidates):
+                    if line.strip():
+                        return line.decode("utf-8")
+        return None
+
+    @staticmethod
     def _fingerprint(payload: Dict[str, Any]) -> str:
         market_payload = dict(payload)
         market_payload.pop("captured_at", None)
@@ -209,3 +265,73 @@ class JsonlSnapshotStore:
                 for code, quote in sorted(snapshot.stock_quotes.items())
             ),
         )
+
+
+def load_recording_price_seed(
+    path: Union[Path, str],
+    pcf: PCFDocument,
+) -> RecordingPriceSeed:
+    """Build a simulation price baseline from the last recorded market snapshot."""
+    source_path = Path(path)
+    snapshot = JsonlSnapshotStore(source_path).latest_snapshot()
+    if snapshot.etf_quote.etf_code != pcf.etf_code:
+        raise ValueError(
+            "Recording ETF code {} does not match PCF {}".format(
+                snapshot.etf_quote.etf_code,
+                pcf.etf_code,
+            )
+        )
+
+    etf_price = float(snapshot.etf_quote.last_price)
+    if not isfinite(etf_price) or etf_price <= 0:
+        raise ValueError("Recording ETF latest price must be positive and finite")
+
+    component_prices: Dict[str, float] = {}
+    missing_codes = []
+    fallback_count = 0
+    active_components = [
+        component
+        for component in pcf.components
+        if component.component_share > 0
+        and component.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    for component in active_components:
+        quote = snapshot.stock_quotes.get(component.stock_code)
+        price = quote.last_price if quote is not None else None
+        if not _positive_finite(price):
+            previous_close = quote.previous_close if quote is not None else None
+            if _positive_finite(previous_close):
+                price = previous_close
+                fallback_count += 1
+            else:
+                missing_codes.append(component.stock_code)
+                continue
+        component_prices[component.stock_code] = float(price)
+
+    if missing_codes:
+        preview = ", ".join(missing_codes[:10])
+        suffix = "..." if len(missing_codes) > 10 else ""
+        raise ValueError(
+            "Recording lacks valid prices for {} physical PCF components: {}{}".format(
+                len(missing_codes),
+                preview,
+                suffix,
+            )
+        )
+
+    return RecordingPriceSeed(
+        timestamp=snapshot.timestamp,
+        etf_code=pcf.etf_code,
+        etf_price=etf_price,
+        component_prices=component_prices,
+        source_path=source_path.resolve(),
+        previous_close_fallback_count=fallback_count,
+    )
+
+
+def _positive_finite(value: Any) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return isfinite(number) and number > 0

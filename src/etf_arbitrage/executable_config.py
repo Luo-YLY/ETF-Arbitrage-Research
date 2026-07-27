@@ -31,6 +31,13 @@ class SimulationScenario(str, Enum):
     PCF_INVALID = "PCF_INVALID"
 
 
+class SimulationPriceSeedMode(str, Enum):
+    AUTO_LOCAL = "AUTO_LOCAL"
+    LOCAL_RECORDING = "LOCAL_RECORDING"
+    SYNTHETIC = "SYNTHETIC"
+    REDIS_LATEST = "REDIS_LATEST"
+
+
 class ExecutionMode(str, Enum):
     INVENTORY_LOCKED = "INVENTORY_LOCKED"
     SEQUENTIAL_NO_BORROW = "SEQUENTIAL_NO_BORROW"
@@ -69,7 +76,8 @@ class RedisConfig:
 class SimulationConfig:
     scenario: SimulationScenario = SimulationScenario.NORMAL
     random_seed: int = 42
-    use_redis_price_seed: bool = False
+    price_seed_mode: SimulationPriceSeedMode = SimulationPriceSeedMode.AUTO_LOCAL
+    local_recording_path: str = ""
     redis_code_suffix: str = ".SZ"
     tick_interval_ms: int = 1_000
     total_ticks: int = 300

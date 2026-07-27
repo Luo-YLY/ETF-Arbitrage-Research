@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -6,15 +7,22 @@ import panel as pn
 import pytest
 
 import etf_arbitrage.dashboard_panel.executable as executable_module
-from etf_arbitrage.data import SZRedisPriceSeed, SubstituteFlag
+from etf_arbitrage.data import (
+    RecordingPriceSeed,
+    SZRedisPriceSeed,
+    SubstituteFlag,
+)
 from etf_arbitrage.dashboard_panel import (
     PanelConsoleDashboard,
     PanelExecutableDashboard,
     PanelReplayDashboard,
 )
 from etf_arbitrage.dashboard_panel.console import EXECUTABLE_PAGE, MEAN_PAGE
-from etf_arbitrage.executable_config import DataSourceMode
-from etf_arbitrage.executable_config import SimulationScenario
+from etf_arbitrage.executable_config import (
+    DataSourceMode,
+    SimulationPriceSeedMode,
+    SimulationScenario,
+)
 from etf_arbitrage.market_data import (
     FileReplayMarketDataSource,
     RedisMarketDataSource,
@@ -177,7 +185,7 @@ def test_executable_page_can_seed_simulation_from_sz_redis_latest_prices(
         fake_price_seed,
     )
     dashboard = PanelExecutableDashboard(PROJECT_ROOT)
-    dashboard.use_redis_price_seed.value = True
+    dashboard.price_seed_mode.value = SimulationPriceSeedMode.REDIS_LATEST
     dashboard.base_volatility.value = 0.0
 
     dashboard._ensure_runtime(force=True)
@@ -193,6 +201,61 @@ def test_executable_page_can_seed_simulation_from_sz_redis_latest_prices(
     )
     assert "Redis最新成交价" in dashboard.runtime_status.object
     assert "买卖盘深度与后续路径为模拟值" in dashboard.runtime_status.object
+
+
+def test_executable_page_can_seed_simulation_from_local_recording_without_redis(
+    monkeypatch,
+):
+    recording = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    recording.parent.mkdir(parents=True, exist_ok=True)
+    recording.write_text("{}\n", encoding="utf-8")
+
+    def fake_recording_seed(path, pcf):
+        active = [
+            item
+            for item in pcf.components
+            if item.component_share > 0
+            and item.substitute_flag != SubstituteFlag.MANDATORY
+        ]
+        prices = {
+            item.stock_code: 10.0 + index / 100.0
+            for index, item in enumerate(active)
+        }
+        return RecordingPriceSeed(
+            timestamp=datetime(2026, 7, 22, 15, 0),
+            etf_code=pcf.etf_code,
+            etf_price=1.234,
+            component_prices=prices,
+            source_path=Path(path).resolve(),
+            previous_close_fallback_count=2,
+        )
+
+    try:
+        monkeypatch.setattr(
+            executable_module,
+            "load_recording_price_seed",
+            fake_recording_seed,
+        )
+        monkeypatch.setattr(
+            executable_module,
+            "_load_redis_price_seed",
+            lambda *_args, **_kwargs: pytest.fail("Redis must not be accessed"),
+        )
+        dashboard = PanelExecutableDashboard(PROJECT_ROOT)
+        dashboard.price_seed_mode.value = SimulationPriceSeedMode.LOCAL_RECORDING
+        dashboard.local_recording_path.value = str(recording)
+        dashboard.base_volatility.value = 0.0
+
+        dashboard._ensure_runtime(force=True)
+        snapshot = dashboard.source.step()
+
+        assert dashboard.source.price_seed_source == "local_recording_latest"
+        assert dashboard.redis_price_seed is None
+        assert snapshot.etf_order_book.last_price == pytest.approx(1.234)
+        assert "本地采集文件最后一条快照" in dashboard.runtime_status.object
+        assert "昨收回退=2" in dashboard.runtime_status.object
+    finally:
+        recording.unlink(missing_ok=True)
 
 
 def test_executable_page_uploads_and_replays_market_file():
@@ -286,6 +349,23 @@ def test_executable_data_source_controls_are_independent():
     assert isinstance(dashboard.source, RedisMarketDataSource)
     dashboard.source.connect()
     assert dashboard.source.health().status == "DISABLED"
+
+
+def test_executable_parameter_sections_are_visible_collapsible_cards():
+    dashboard = PanelExecutableDashboard(PROJECT_ROOT)
+    configuration = dashboard._configuration_view()
+
+    cards = configuration.select(pn.Card)
+
+    assert [card.title for card in cards] == [
+        "模拟行情高级参数",
+        "执行参数",
+        "账户与一级市场情景",
+        "数据质量阈值",
+    ]
+    assert all(card.collapsible for card in cards)
+    assert all(not card.collapsed for card in cards)
+    assert not configuration.select(pn.Accordion)
 
 
 def test_pcf_source_controls_switch_without_mixing_modes():
