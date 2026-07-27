@@ -210,7 +210,8 @@ python -m streamlit run streamlit_app.py
 
 - `SIMULATED`：默认模式。根据PCF生成内部一致的成分股、IOPV和ETF多档盘口，可注入溢价、
   折价、深度不足、陈旧、缺失、停牌、涨跌停、解码错误和序号断档等场景；相同随机种子可复现。
-  “模拟价格基准”默认自动读取 `tmp/recordings/YYYYMMDD/ETF代码.jsonl` 的最后一条完整快照，
+  侧边栏“模拟价格来源”默认选择“本地历史Redis数据（自动读取）”，读取
+  `tmp/recordings/YYYYMMDD/ETF代码.jsonl` 的最后一条完整快照，
   无需连接Redis；也可手工指定采集文件、切换为完全模拟，或在内网环境显式读取Redis最新价。
   本地/Redis模式都只用ETF和PCF实物成分股最新价锚定首个快照，Bid/Ask、盘口深度、冲击和
   后续路径仍是模拟值。

@@ -168,9 +168,9 @@ class PanelExecutableDashboard:
         self.source_mode = pn.widgets.Select(
             label="行情数据源",
             options={
-                "模拟行情": DataSourceMode.SIMULATED,
+                "模拟行情（本地/合成）": DataSourceMode.SIMULATED,
                 "上传/读取历史行情": DataSourceMode.FILE_REPLAY,
-                "标准化Redis行情": DataSourceMode.REDIS,
+                "标准化Redis实时行情": DataSourceMode.REDIS,
             },
             value=DataSourceMode.SIMULATED,
         )
@@ -183,12 +183,16 @@ class PanelExecutableDashboard:
         )
         self.random_seed = _int_input("随机种子", 42, 0, 1_000_000, 1)
         self.price_seed_mode = pn.widgets.Select(
-            label="模拟价格基准",
+            label="模拟价格来源",
             options={
-                "自动（优先本地采集）": SimulationPriceSeedMode.AUTO_LOCAL,
-                "本地已采集快照": SimulationPriceSeedMode.LOCAL_RECORDING,
-                "完全模拟": SimulationPriceSeedMode.SYNTHETIC,
-                "内网Redis最新价": SimulationPriceSeedMode.REDIS_LATEST,
+                "本地历史Redis数据（自动读取）": (
+                    SimulationPriceSeedMode.AUTO_LOCAL
+                ),
+                "指定本地历史Redis文件": (
+                    SimulationPriceSeedMode.LOCAL_RECORDING
+                ),
+                "完全模拟数据": SimulationPriceSeedMode.SYNTHETIC,
+                "内网Redis实时最新价": SimulationPriceSeedMode.REDIS_LATEST,
             },
             value=SimulationPriceSeedMode.AUTO_LOCAL,
         )
@@ -594,6 +598,7 @@ class PanelExecutableDashboard:
         return pn.Column(
             pn.pane.Markdown("### 实盘套利模拟"),
             self.source_mode,
+            self.price_seed_mode,
             self.apply_button,
             pn.Row(self.start_button, self.pause_button),
             pn.Row(self.step_button, self.reset_button),
@@ -636,7 +641,7 @@ class PanelExecutableDashboard:
     def _configuration_view(self):
         simulation_controls = pn.Column(
             pn.Row(self.scenario, self.random_seed),
-            pn.Row(self.price_seed_mode, self.local_recording_path),
+            self.local_recording_path,
             self.redis_seed_suffix,
             self.price_seed_message,
             pn.Row(self.tick_ms, self.total_ticks, self.simulation_speed),
@@ -1205,15 +1210,17 @@ class PanelExecutableDashboard:
 
     def _source_mode_changed(self, _event) -> None:
         mode = self.source_mode.value
+        is_simulated = mode == DataSourceMode.SIMULATED
         if hasattr(self, "simulation_controls"):
-            self.simulation_controls.visible = mode == DataSourceMode.SIMULATED
+            self.simulation_controls.visible = is_simulated
         if hasattr(self, "file_controls"):
             self.file_controls.visible = mode == DataSourceMode.FILE_REPLAY
         if hasattr(self, "redis_controls"):
             self.redis_controls.visible = mode == DataSourceMode.REDIS
-        self.scenario.visible = mode == DataSourceMode.SIMULATED
-        self.simulation_speed.visible = mode == DataSourceMode.SIMULATED
-        self.total_ticks.visible = mode == DataSourceMode.SIMULATED
+        self.price_seed_mode.visible = is_simulated
+        self.scenario.visible = is_simulated
+        self.simulation_speed.visible = is_simulated
+        self.total_ticks.visible = is_simulated
 
     def _price_seed_mode_changed(self, _event) -> None:
         mode = self.price_seed_mode.value
@@ -1224,6 +1231,29 @@ class PanelExecutableDashboard:
         self.redis_seed_suffix.visible = (
             mode == SimulationPriceSeedMode.REDIS_LATEST
         )
+        message = {
+            SimulationPriceSeedMode.AUTO_LOCAL: (
+                "价格来源：本地历史Redis数据。自动读取PCF交易日与ETF代码对应的"
+                "tmp/recordings文件，不连接内网Redis。"
+            ),
+            SimulationPriceSeedMode.LOCAL_RECORDING: (
+                "价格来源：指定的本地历史Redis文件，不连接内网Redis。"
+            ),
+            SimulationPriceSeedMode.SYNTHETIC: (
+                "价格来源：完全模拟数据，不读取本地文件或内网Redis。"
+            ),
+            SimulationPriceSeedMode.REDIS_LATEST: (
+                "价格来源：内网Redis实时最新价，需要当前进程配置SZ_REDIS_HOST。"
+            ),
+        }[mode]
+        self.price_seed_message.object = (
+            '<div class="exec-status">{}</div>'.format(message)
+        )
+        if _event is not None:
+            self._set_status(
+                "{} 请点击“应用配置并重置”或直接开始。".format(message),
+                "ready",
+            )
 
     def _pcf_changed(self) -> None:
         self.stop_runtime()

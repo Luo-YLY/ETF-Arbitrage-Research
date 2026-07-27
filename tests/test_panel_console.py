@@ -48,6 +48,10 @@ def test_console_separates_mean_reversion_and_executable_pages():
     assert dashboard.executable_page is not None
     assert isinstance(dashboard.main.objects[0], pn.Column)
     assert dashboard.executable_page.source_mode in dashboard.sidebar.objects[-1]
+    assert (
+        dashboard.executable_page.price_seed_mode
+        in dashboard.sidebar.objects[-1]
+    )
 
     executable_main = dashboard.main.objects[0]
     dashboard.page_select.value = MEAN_PAGE
@@ -332,16 +336,19 @@ def test_executable_data_source_controls_are_independent():
     dashboard._configuration_view()
 
     assert dashboard.simulation_controls.visible
+    assert dashboard.price_seed_mode.visible
     assert not dashboard.file_controls.visible
     assert not dashboard.redis_controls.visible
 
     dashboard.source_mode.value = DataSourceMode.FILE_REPLAY
     assert not dashboard.simulation_controls.visible
+    assert not dashboard.price_seed_mode.visible
     assert dashboard.file_controls.visible
     assert not dashboard.redis_controls.visible
 
     dashboard.source_mode.value = DataSourceMode.REDIS
     assert not dashboard.simulation_controls.visible
+    assert not dashboard.price_seed_mode.visible
     assert not dashboard.file_controls.visible
     assert dashboard.redis_controls.visible
 
@@ -349,6 +356,27 @@ def test_executable_data_source_controls_are_independent():
     assert isinstance(dashboard.source, RedisMarketDataSource)
     dashboard.source.connect()
     assert dashboard.source.health().status == "DISABLED"
+
+
+def test_executable_sidebar_names_local_recording_without_implying_live_redis():
+    dashboard = PanelExecutableDashboard(PROJECT_ROOT)
+
+    assert dashboard.source_mode.options["模拟行情（本地/合成）"] == (
+        DataSourceMode.SIMULATED
+    )
+    assert dashboard.price_seed_mode.options[
+        "本地历史Redis数据（自动读取）"
+    ] == SimulationPriceSeedMode.AUTO_LOCAL
+    assert dashboard.price_seed_mode.value == SimulationPriceSeedMode.AUTO_LOCAL
+
+    dashboard.runtime_status.object = (
+        '<div class="exec-status">旧的Redis连接错误</div>'
+    )
+    dashboard.price_seed_mode.value = SimulationPriceSeedMode.SYNTHETIC
+    dashboard.price_seed_mode.value = SimulationPriceSeedMode.AUTO_LOCAL
+
+    assert "不连接内网Redis" in dashboard.runtime_status.object
+    assert "旧的Redis连接错误" not in dashboard.runtime_status.object
 
 
 def test_executable_parameter_sections_are_visible_collapsible_cards():
