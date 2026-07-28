@@ -53,6 +53,9 @@ class MarketMonitorJob:
     pcf_paths: Mapping[str, str]
     interval: float = 3.0
     redis_code_suffix: str = ".SZ"
+    auto_restart: bool = True
+    restart_delay: float = 5.0
+    max_restart_delay: float = 60.0
 
     def validate(self) -> None:
         datetime.strptime(self.trade_date, "%Y%m%d")
@@ -60,6 +63,10 @@ class MarketMonitorJob:
             raise ValueError("至少选择一只ETF")
         if self.interval <= 0:
             raise ValueError("采集间隔必须为正数")
+        if self.restart_delay <= 0:
+            raise ValueError("自动重启等待时间必须为正数")
+        if self.max_restart_delay < self.restart_delay:
+            raise ValueError("最大重启等待时间不得小于首次等待时间")
         missing = [code for code in self.etf_codes if code not in self.pcf_paths]
         if missing:
             raise ValueError("缺少PCF: {}".format(", ".join(missing)))
@@ -84,9 +91,12 @@ class MarketMonitorController:
     def start(self, job: MarketMonitorJob) -> int:
         job.validate()
         state = read_job_state(self.state_path(job.trade_date))
-        if state.get("status") in {"starting", "waiting", "running"} and _pid_exists(
-            state.get("pid")
-        ):
+        if state.get("status") in {
+            "starting",
+            "waiting",
+            "running",
+            "retry_wait",
+        } and _pid_exists(state.get("pid")):
             raise RuntimeError("采集任务已经在运行")
 
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -100,6 +110,9 @@ class MarketMonitorController:
                 "trade_date": job.trade_date,
                 "etf_codes": list(job.etf_codes),
                 "started_at": datetime.now().isoformat(),
+                "auto_restart": job.auto_restart,
+                "restart_delay": job.restart_delay,
+                "max_restart_delay": job.max_restart_delay,
             },
         )
 
@@ -154,9 +167,12 @@ def read_job_state(path: Union[Path, str]) -> Dict[str, Any]:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"status": "invalid_state"}
-    if payload.get("status") in {"starting", "waiting", "running"} and not _pid_exists(
-        payload.get("pid")
-    ):
+    if payload.get("status") in {
+        "starting",
+        "waiting",
+        "running",
+        "retry_wait",
+    } and not _pid_exists(payload.get("pid")):
         payload["status"] = "stopped"
     return payload
 

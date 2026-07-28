@@ -1,7 +1,10 @@
 from datetime import datetime
 from io import BytesIO
+import json
+import os
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 from uuid import uuid4
 from zipfile import ZipFile
 
@@ -13,8 +16,11 @@ from etf_arbitrage.operations import (
     MarketMonitorController,
     MarketMonitorJob,
     SZSEMarketSchedule,
+    read_job_state,
+    write_job_state,
 )
 from etf_arbitrage.dashboard.app import _resample_last
+from scripts import run_market_monitor
 
 
 PCF_SAMPLE = Path("data/pcf/20260722/pcf_159915_20260722.xml")
@@ -208,6 +214,9 @@ def test_monitor_job_validation_and_command() -> None:
     command = controller.build_command(Path("job.json"))
 
     assert job.redis_code_suffix == ".SZ"
+    assert job.auto_restart
+    assert job.restart_delay == 5.0
+    assert job.max_restart_delay == 60.0
     assert command[0]
     assert command[1].endswith("run_market_monitor.py")
     assert command[-2:] == ["--job", "job.json"]
@@ -222,6 +231,120 @@ def test_monitor_job_requires_every_selected_pcf() -> None:
 
     with pytest.raises(ValueError, match="159901"):
         job.validate()
+
+
+def test_monitor_job_validates_restart_delays() -> None:
+    with pytest.raises(ValueError, match="自动重启等待时间"):
+        MarketMonitorJob(
+            trade_date="20260722",
+            etf_codes=("159915",),
+            pcf_paths={"159915": "sample.xml"},
+            restart_delay=0,
+        ).validate()
+
+    with pytest.raises(ValueError, match="最大重启等待时间"):
+        MarketMonitorJob(
+            trade_date="20260722",
+            etf_codes=("159915",),
+            pcf_paths={"159915": "sample.xml"},
+            restart_delay=10,
+            max_restart_delay=5,
+        ).validate()
+
+
+def test_monitor_retry_delay_uses_capped_backoff() -> None:
+    job = MarketMonitorJob(
+        trade_date="20260722",
+        etf_codes=("159915",),
+        pcf_paths={"159915": "sample.xml"},
+        restart_delay=5,
+        max_restart_delay=20,
+    )
+
+    assert [run_market_monitor.retry_delay(job, attempt) for attempt in range(1, 6)] == [
+        5,
+        10,
+        20,
+        20,
+        20,
+    ]
+
+
+def test_monitor_worker_restarts_after_fatal_error(monkeypatch) -> None:
+    root = Path("tmp") / "tests" / uuid4().hex
+    job = MarketMonitorJob(
+        trade_date="20260722",
+        etf_codes=("159915",),
+        pcf_paths={"159915": "sample.xml"},
+        restart_delay=1,
+    )
+    args = SimpleNamespace(
+        job=root / "job.json",
+        ignore_session=True,
+        max_polls=None,
+    )
+    attempts = []
+
+    def fake_run_collection(
+        args,
+        job,
+        controller_state,
+        stop_path,
+        schedule,
+        restart_count,
+    ):
+        attempts.append(restart_count)
+        if len(attempts) == 1:
+            raise ConnectionError("temporary redis failure")
+        run_market_monitor.update_state(
+            controller_state,
+            "completed",
+            restart_count=restart_count,
+        )
+        return 0
+
+    monkeypatch.setattr(run_market_monitor, "ROOT", root)
+    monkeypatch.setattr(run_market_monitor, "parse_args", lambda: args)
+    monkeypatch.setattr(run_market_monitor, "load_job", lambda _path: job)
+    monkeypatch.setattr(run_market_monitor, "run_collection", fake_run_collection)
+    monkeypatch.setattr(
+        run_market_monitor,
+        "wait_for_restart",
+        lambda _stop_path, _delay: True,
+    )
+    try:
+        assert run_market_monitor.main() == 0
+        state = read_job_state(
+            root / "tmp" / "runtime" / "market_monitor_20260722.json"
+        )
+        assert attempts == [0, 1]
+        assert state["status"] == "completed"
+        assert state["restart_count"] == 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_retry_wait_is_treated_as_an_active_job() -> None:
+    root = Path("tmp") / "tests" / uuid4().hex
+    controller = MarketMonitorController(root)
+    job = MarketMonitorJob(
+        trade_date="20260722",
+        etf_codes=("159915",),
+        pcf_paths={"159915": "sample.xml"},
+    )
+    try:
+        write_job_state(
+            controller.state_path(job.trade_date),
+            {
+                "status": "retry_wait",
+                "pid": os.getpid(),
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="采集任务已经在运行"):
+            controller.start(job)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_monitor_worker_forces_utf8_output(monkeypatch) -> None:
@@ -251,5 +374,10 @@ def test_monitor_worker_forces_utf8_output(monkeypatch) -> None:
         assert environment["PYTHONUNBUFFERED"] == "1"
         assert environment["PYTHONIOENCODING"] == "utf-8"
         assert environment["PYTHONUTF8"] == "1"
+        job_path = root / "tmp" / "runtime" / "market_monitor_20260723_job.json"
+        payload = json.loads(job_path.read_text(encoding="utf-8"))
+        assert payload["auto_restart"] is True
+        assert payload["restart_delay"] == 5.0
+        assert payload["max_restart_delay"] == 60.0
     finally:
         shutil.rmtree(root, ignore_errors=True)

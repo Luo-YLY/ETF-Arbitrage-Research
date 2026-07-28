@@ -30,6 +30,17 @@ PHASE_LABELS = {
     "after_close": "已收盘",
 }
 
+STATUS_LABELS = {
+    "starting": "启动中",
+    "waiting": "等待开盘",
+    "running": "采集中",
+    "retry_wait": "异常后等待重启",
+    "stopped": "已停止",
+    "completed": "已完成",
+    "error": "错误终止",
+    "invalid_state": "状态文件异常",
+}
+
 
 class MeanReversionOperations:
     """Operational surface for the real-quote mean-reversion page."""
@@ -61,6 +72,18 @@ class MeanReversionOperations:
             end=30.0,
             step=1.0,
         )
+        self.auto_restart = pn.widgets.Toggle(
+            label="异常自动重启",
+            value=True,
+            icon="refresh",
+        )
+        self.restart_delay = pn.widgets.FloatInput(
+            label="首次重试等待（秒）",
+            value=5.0,
+            start=1.0,
+            end=60.0,
+            step=1.0,
+        )
         self.redis_suffix = pn.widgets.TextInput(
             label="Redis代码后缀",
             value=".SZ",
@@ -85,6 +108,7 @@ class MeanReversionOperations:
             icon="refresh",
         )
         self.message = pn.pane.HTML("", sizing_mode="stretch_width")
+        self.restart_status = pn.pane.HTML("", sizing_mode="stretch_width")
         self.status_table = pn.widgets.Tabulator(
             pd.DataFrame(),
             show_index=False,
@@ -148,7 +172,12 @@ class MeanReversionOperations:
                 (
                     "日内采集",
                     pn.Column(
-                        pn.Row(self.monitor_etfs, self.interval),
+                        pn.Row(
+                            self.monitor_etfs,
+                            self.interval,
+                            self.auto_restart,
+                            self.restart_delay,
+                        ),
                         self.redis_suffix,
                         pn.Row(
                             self.start_button,
@@ -158,6 +187,7 @@ class MeanReversionOperations:
                         ),
                         self.message,
                         self.status_table,
+                        self.restart_status,
                         pn.pane.Markdown("#### 最新采集状态"),
                         self.latest_table,
                         pn.pane.Markdown("#### 采集日志"),
@@ -199,7 +229,7 @@ class MeanReversionOperations:
 
         state = read_job_state(self.controller.state_path(self.trading_day))
         phase = self.schedule.phase(datetime.now())
-        status = state.get("status", "未启动")
+        status = state.get("status", "not_started")
         self.status_table.value = pd.DataFrame(
             [
                 {
@@ -208,13 +238,18 @@ class MeanReversionOperations:
                     "Redis配置": (
                         "已配置" if os.getenv("SZ_REDIS_HOST") else "未配置"
                     ),
-                    "任务状态": status,
+                    "任务状态": STATUS_LABELS.get(status, "未启动"),
                     "进程号": state.get("pid", ""),
                     "累计轮询": state.get("polls", 0),
+                    "自动重启": "已开启"
+                    if state.get("auto_restart", self.auto_restart.value)
+                    else "已关闭",
+                    "重启次数": state.get("restart_count", 0),
                     "监控ETF": ",".join(state.get("etf_codes", selected)),
                 }
             ]
         )
+        self._render_restart_status(state)
         latest = state.get("latest", {})
         self.latest_table.value = pd.DataFrame(
             [dict(ETF=code, **value) for code, value in latest.items()]
@@ -272,6 +307,8 @@ class MeanReversionOperations:
                     pcf_paths=paths,
                     interval=float(self.interval.value),
                     redis_code_suffix=self.redis_suffix.value.strip() or ".SZ",
+                    auto_restart=bool(self.auto_restart.value),
+                    restart_delay=float(self.restart_delay.value),
                 )
             )
             self._set_message(
@@ -285,7 +322,7 @@ class MeanReversionOperations:
     def _stop(self, _event) -> None:
         self.controller.request_stop(self.trading_day)
         self._set_message(
-            "已发送停止请求，采集器会在当前轮结束后退出。",
+            "已发送停止请求；若任务正在等待自动重启，本次重启也会被取消。",
             "warning",
         )
         self.refresh()
@@ -327,6 +364,36 @@ class MeanReversionOperations:
         }
         foreground, background = colors.get(kind, ("#374147", "#f4f7f7"))
         self.message.object = (
+            '<div style="border-left:3px solid {fg};background:{bg};'
+            'padding:8px 10px;color:{fg}">{text}</div>'
+        ).format(fg=foreground, bg=background, text=text)
+
+    def _render_restart_status(self, state) -> None:
+        restart_count = int(state.get("restart_count", 0) or 0)
+        last_error = state.get("last_error") or state.get("error")
+        next_retry_at = state.get("next_retry_at")
+        if state.get("status") == "retry_wait":
+            text = "采集任务发生异常，系统正在守护运行"
+            if next_retry_at:
+                text += "；下次尝试：{}".format(next_retry_at)
+            if last_error:
+                text += "；最近错误：{}".format(last_error)
+            kind = "warning"
+        elif restart_count and last_error:
+            text = "今日已自动重启 {} 次；最近错误：{}".format(
+                restart_count,
+                last_error,
+            )
+            kind = "warning"
+        else:
+            self.restart_status.object = ""
+            return
+        colors = {
+            "warning": ("#8B5E34", "#fff8ec"),
+            "error": ("#A33A2B", "#fff1ef"),
+        }
+        foreground, background = colors[kind]
+        self.restart_status.object = (
             '<div style="border-left:3px solid {fg};background:{bg};'
             'padding:8px 10px;color:{fg}">{text}</div>'
         ).format(fg=foreground, bg=background, text=text)
