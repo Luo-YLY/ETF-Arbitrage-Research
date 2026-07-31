@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "etf-arbitrage"
 version = "1.0.0"
-description = "Shenzhen ETF single-market arbitrage research prototype"
+description = "Shanghai and Shenzhen ETF arbitrage research prototype"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

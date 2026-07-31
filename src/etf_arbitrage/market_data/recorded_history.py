@@ -210,7 +210,7 @@ class RecordedHistoryMarketDataSource(MarketDataSource):
             component
             for component in self.pcf.components
             if component.component_share > 0
-            and component.substitute_flag != SubstituteFlag.MANDATORY
+            and not component.substitute_flag.requires_cash_substitution
         ]
         missing_prices = []
         for component in active:
@@ -247,6 +247,7 @@ class RecordedHistoryMarketDataSource(MarketDataSource):
             etf_depth = self.pcf.creation_redemption_unit * 0.05
         etf_book = self._simulator._book(
             self.pcf.etf_code,
+            self.pcf.etf_id.exchange.value,
             etf_mid,
             etf_depth,
             self.config.etf_spread_bps,
@@ -329,6 +330,7 @@ class RecordedHistoryMarketDataSource(MarketDataSource):
                 depth = max(1.0, component.component_share * 0.05)
             book = self._simulator._book(
                 component.stock_code,
+                component.instrument_id.exchange.value,
                 self._previous_prices[component.stock_code],
                 depth,
                 self.config.component_spread_bps,

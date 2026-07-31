@@ -300,7 +300,7 @@ def load_recording_price_seed(
         component
         for component in pcf.components
         if component.component_share > 0
-        and component.substitute_flag != SubstituteFlag.MANDATORY
+        and not component.substitute_flag.requires_cash_substitution
     ]
     for component in active_components:
         quote = snapshot.stock_quotes.get(component.stock_code)

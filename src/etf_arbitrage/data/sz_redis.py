@@ -11,6 +11,8 @@ from typing import Any, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from etf_arbitrage.domain import Exchange, InstrumentId, vendor_symbol
+
 from .feed import DataFeed
 from .models import (
     ComponentWeight,
@@ -223,18 +225,22 @@ def load_pcf_price_seed(
         item
         for item in pcf.components
         if item.component_share > 0
-        and item.substitute_flag != SubstituteFlag.MANDATORY
+        and not item.substitute_flag.requires_cash_substitution
     ]
     suffix = redis_code_suffix.strip()
 
-    def redis_code(code: str) -> str:
-        if not suffix or code.upper().endswith(suffix.upper()):
-            return code
-        return code + suffix
+    def redis_code(instrument_id: InstrumentId) -> str:
+        if instrument_id.exchange == Exchange.OTHER:
+            code = instrument_id.code
+            if not suffix or code.upper().endswith(suffix.upper()):
+                return code
+            return code + suffix
+        return vendor_symbol(instrument_id)
 
-    etf_redis_code = redis_code(pcf.etf_code)
+    etf_redis_code = redis_code(pcf.etf_id)
     component_redis_codes = {
-        item.stock_code: redis_code(item.stock_code) for item in active_components
+        item.stock_code: redis_code(item.instrument_id)
+        for item in active_components
     }
     requested = [etf_redis_code, *component_redis_codes.values()]
     resolved_trade_date = trade_date or pcf.trading_day
@@ -311,6 +317,8 @@ class SZRedisDataFeed(DataFeed):
         trade_date: Optional[Any] = None,
         redis_code_suffix: str = ".SZ",
         require_bid_ask: bool = True,
+        etf_id: Optional[InstrumentId] = None,
+        component_ids: Optional[Mapping[str, InstrumentId]] = None,
     ) -> None:
         self.client = client
         self._info = etf_info
@@ -319,6 +327,8 @@ class SZRedisDataFeed(DataFeed):
         self.trade_date = trade_date
         self.redis_code_suffix = redis_code_suffix
         self.require_bid_ask = require_bid_ask
+        self.etf_id = etf_id
+        self.component_ids = dict(component_ids or {})
 
     def get_etf_info(self, etf_code: str) -> ETFInfo:
         if etf_code != self._info.etf_code:
@@ -336,9 +346,17 @@ class SZRedisDataFeed(DataFeed):
         end: Optional[datetime] = None,
     ) -> Iterable[MarketSnapshot]:
         self.get_etf_info(etf_code)
-        redis_etf_code = self._redis_code(etf_code)
+        redis_etf_code = self._redis_code(
+            etf_code,
+            self.etf_id or self._info_instrument_id(),
+        )
         requested_codes = [redis_etf_code] + [
-            self._redis_code(component.stock_code) for component in self._weights
+            self._redis_code(
+                component.stock_code,
+                self.component_ids.get(component.stock_code)
+                or self._weight_instrument_id(component),
+            )
+            for component in self._weights
         ]
         frame = self.client.get_security_records(requested_codes, self.trade_date)
         if frame.empty:
@@ -357,7 +375,11 @@ class SZRedisDataFeed(DataFeed):
 
         stock_quotes = {}
         for component in self._weights:
-            redis_stock_code = self._redis_code(component.stock_code)
+            redis_stock_code = self._redis_code(
+                component.stock_code,
+                self.component_ids.get(component.stock_code)
+                or self._weight_instrument_id(component),
+            )
             if redis_stock_code not in frame.index:
                 continue
             row = frame.loc[redis_stock_code]
@@ -404,11 +426,42 @@ class SZRedisDataFeed(DataFeed):
             stock_quotes=stock_quotes,
         )
 
-    def _redis_code(self, canonical_code: str) -> str:
+    def _redis_code(
+        self,
+        canonical_code: str,
+        instrument_id: Optional[InstrumentId] = None,
+    ) -> str:
+        if instrument_id is not None and instrument_id.exchange != Exchange.OTHER:
+            return vendor_symbol(instrument_id)
         suffix = self.redis_code_suffix.strip()
         if not suffix or canonical_code.upper().endswith(suffix.upper()):
             return canonical_code
         return canonical_code + suffix
+
+    @staticmethod
+    def _weight_instrument_id(
+        component: ComponentWeight,
+    ) -> Optional[InstrumentId]:
+        if not component.exchange:
+            return None
+        try:
+            return InstrumentId(
+                Exchange(str(component.exchange).strip().upper()),
+                component.stock_code,
+            )
+        except ValueError:
+            return None
+
+    def _info_instrument_id(self) -> Optional[InstrumentId]:
+        if not self._info.exchange:
+            return None
+        try:
+            return InstrumentId(
+                Exchange(str(self._info.exchange).strip().upper()),
+                self._info.etf_code,
+            )
+        except ValueError:
+            return None
 
     def _timestamp(
         self,

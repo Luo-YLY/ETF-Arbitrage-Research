@@ -23,7 +23,6 @@ from etf_arbitrage.data import (
     SZRedisDataFeed,
     SZRedisQuotationClient,
     SZRedisSettings,
-    SZSEPCFParser,
 )
 from etf_arbitrage.operations import (
     MarketMonitorJob,
@@ -73,7 +72,6 @@ def load_job(path: Path) -> MarketMonitorJob:
 
 
 def build_trackers(job: MarketMonitorJob, client: SZRedisQuotationClient) -> list[Tracker]:
-    parser = SZSEPCFParser()
     repository = PCFRepository(ROOT / "data" / "pcf")
     trackers = []
     for code in job.etf_codes:
@@ -88,6 +86,11 @@ def build_trackers(job: MarketMonitorJob, client: SZRedisQuotationClient) -> lis
             trade_date=job.trade_date,
             redis_code_suffix=job.redis_code_suffix,
             require_bid_ask=False,
+            etf_id=pcf.etf_id,
+            component_ids={
+                item.stock_code: item.instrument_id
+                for item in pcf.components
+            },
         )
         trackers.append(
             Tracker(

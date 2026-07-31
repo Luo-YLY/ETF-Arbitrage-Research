@@ -138,7 +138,8 @@ class SimulatedMarketDataSource(MarketDataSource):
         active = [
             item
             for item in self.pcf.components
-            if item.component_share > 0 and item.substitute_flag != SubstituteFlag.MANDATORY
+            if item.component_share > 0
+            and not item.substitute_flag.requires_cash_substitution
         ]
         if initial_component_prices is not None:
             missing = [
@@ -164,7 +165,7 @@ class SimulatedMarketDataSource(MarketDataSource):
         fixed_cash = sum(
             item.creation_cash_substitute
             for item in self.pcf.components
-            if item.substitute_flag == SubstituteFlag.MANDATORY
+            if item.substitute_flag.requires_cash_substitution
         )
         target = max(
             1.0,
@@ -215,6 +216,7 @@ class SimulatedMarketDataSource(MarketDataSource):
             etf_depth = self.pcf.creation_redemption_unit * 0.05
         etf_book = self._book(
             self.pcf.etf_code,
+            self.pcf.etf_id.exchange.value,
             etf_mid,
             etf_depth,
             self.config.etf_spread_bps,
@@ -225,7 +227,8 @@ class SimulatedMarketDataSource(MarketDataSource):
         active = [
             item
             for item in self.pcf.components
-            if item.component_share > 0 and item.substitute_flag != SubstituteFlag.MANDATORY
+            if item.component_share > 0
+            and not item.substitute_flag.requires_cash_substitution
         ]
         missing_count = int(round(len(active) * self.config.missing_quote_ratio))
         stale_count = int(round(len(active) * self.config.stale_quote_ratio))
@@ -255,6 +258,7 @@ class SimulatedMarketDataSource(MarketDataSource):
                 depth = max(1.0, component.component_share * 0.05)
             book = self._book(
                 component.stock_code,
+                component.instrument_id.exchange.value,
                 self._prices[component.stock_code],
                 depth,
                 self.config.component_spread_bps,
@@ -300,6 +304,7 @@ class SimulatedMarketDataSource(MarketDataSource):
     def _book(
         self,
         symbol: str,
+        exchange: str,
         mid: float,
         base_depth: float,
         spread_bps: float,
@@ -316,7 +321,7 @@ class SimulatedMarketDataSource(MarketDataSource):
             asks.append(OrderBookLevel(mid + distance, quantity))
         return OrderBook(
             symbol=symbol,
-            exchange="SZSE",
+            exchange=exchange,
             exchange_timestamp=timestamp,
             receive_timestamp=timestamp + timedelta(milliseconds=self.config.quote_latency_ms),
             last_price=mid,
@@ -334,12 +339,13 @@ class SimulatedMarketDataSource(MarketDataSource):
         physical = sum(
             item.component_share * self._prices[item.stock_code]
             for item in self.pcf.components
-            if item.component_share > 0 and item.substitute_flag != SubstituteFlag.MANDATORY
+            if item.component_share > 0
+            and not item.substitute_flag.requires_cash_substitution
         )
         mandatory = sum(
             item.creation_cash_substitute
             for item in self.pcf.components
-            if item.substitute_flag == SubstituteFlag.MANDATORY
+            if item.substitute_flag.requires_cash_substitution
         )
         return (physical + mandatory + self.pcf.estimate_cash_component) / float(
             self.pcf.creation_redemption_unit

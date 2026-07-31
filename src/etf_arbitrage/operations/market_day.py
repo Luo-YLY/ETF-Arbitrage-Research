@@ -215,7 +215,61 @@ def _pid_exists(pid: Optional[Any]) -> bool:
     if not pid:
         return False
     try:
-        os.kill(int(pid), 0)
-    except (OSError, TypeError, ValueError):
+        process_id = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if process_id <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_pid_exists(process_id)
+    try:
+        os.kill(process_id, 0)
+    except PermissionError:
+        return True
+    except OSError:
         return False
     return True
+
+
+def _windows_pid_exists(process_id: int) -> bool:
+    """Check a Windows PID without sending it a signal.
+
+    ``os.kill(pid, 0)`` is a harmless existence probe on POSIX, but Python's
+    Windows implementation routes non-console signals through TerminateProcess.
+    Using a query-only process handle avoids terminating the monitored worker.
+    """
+
+    import ctypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [
+        ctypes.c_ulong,
+        ctypes.c_int,
+        ctypes.c_ulong,
+    ]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    handle = kernel32.OpenProcess(
+        process_query_limited_information,
+        False,
+        process_id,
+    )
+    if not handle:
+        # Access denied still proves that the PID exists.
+        return ctypes.get_last_error() == 5
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)

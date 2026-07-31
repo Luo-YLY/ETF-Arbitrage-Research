@@ -57,7 +57,7 @@ class ExecutableBasketPricer:
         physical = 0.0
         cash = self.pcf.estimate_cash_component
         for component in self.pcf.components:
-            if component.substitute_flag == SubstituteFlag.MANDATORY:
+            if component.substitute_flag.requires_cash_substitution:
                 cash += component.creation_cash_substitute
                 continue
             if component.component_share <= 0:
@@ -87,7 +87,7 @@ class ExecutableBasketPricer:
         side = SweepSide.BUY if direction == "CREATION" else SweepSide.SELL
         for component in self.pcf.components:
             book = books.get(component.stock_code)
-            use_cash = component.substitute_flag == SubstituteFlag.MANDATORY or (
+            use_cash = component.substitute_flag.requires_cash_substitution or (
                 self.optional_cash_substitution
                 and component.substitute_flag == SubstituteFlag.ALLOWED
             )

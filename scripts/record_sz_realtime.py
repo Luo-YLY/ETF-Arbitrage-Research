@@ -18,6 +18,7 @@ from etf_arbitrage.data import (
     ComponentWeight,
     ETFInfo,
     JsonlSnapshotStore,
+    SSEPCFParser,
     SZRedisDataFeed,
     SZRedisQuotationClient,
     SZRedisSettings,
@@ -63,7 +64,14 @@ def main() -> int:
     args = parse_args()
     if args.interval <= 0:
         raise ValueError("interval must be positive")
-    pcf = SZSEPCFParser().parse(args.pcf) if args.pcf else None
+    pcf = None
+    if args.pcf:
+        parser = (
+            SSEPCFParser()
+            if args.pcf.suffix.lower() == ".json"
+            else SZSEPCFParser()
+        )
+        pcf = parser.parse(args.pcf)
     etf_code = args.etf_code or (pcf.etf_code if pcf else "159915")
     if pcf is not None and etf_code != pcf.etf_code:
         raise ValueError("--etf-code does not match PCF SecurityID")
@@ -93,6 +101,15 @@ def main() -> int:
         trade_date=trade_date,
         redis_code_suffix=args.redis_code_suffix,
         require_bid_ask=args.require_bid_ask,
+        etf_id=pcf.etf_id if pcf else None,
+        component_ids=(
+            {
+                item.stock_code: item.instrument_id
+                for item in pcf.components
+            }
+            if pcf
+            else None
+        ),
     )
     store = JsonlSnapshotStore(output)
     calculator = PCFIOPVCalculator(pcf) if pcf else None
