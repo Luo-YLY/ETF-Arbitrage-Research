@@ -21,7 +21,11 @@ from bokeh.plotting import figure
 
 from etf_arbitrage.backtest import BacktestResult, PremiumBacktester
 from etf_arbitrage.config import BacktestConfig
-from etf_arbitrage.data import SZSE_ETFS
+from etf_arbitrage.data import (
+    etf_search_options,
+    extract_etf_code,
+    format_etf_search_option,
+)
 
 from .data import (
     ObservationDataset,
@@ -125,13 +129,18 @@ class PanelReplayDashboard:
             label="研究日期",
             value=date.today(),
         )
-        self.etf_select = pn.widgets.Select(
-            label="ETF",
-            options={
-                "{} {}".format(code, profile.name): code
-                for code, profile in SZSE_ETFS.items()
-            },
-            value="159915",
+        observed_codes = sorted(
+            {dataset.etf_code for dataset in self.datasets.values()}
+        )
+        self.etf_select = pn.widgets.AutocompleteInput(
+            label="ETF代码或名称",
+            options=etf_search_options(observed_codes),
+            value=format_etf_search_option("159915"),
+            placeholder="输入6位代码、名称，或从建议中选择",
+            restrict=False,
+            case_sensitive=False,
+            search_strategy="includes",
+            min_characters=1,
         )
         self.speed_select = pn.widgets.Select(
             label="回放速度",
@@ -347,6 +356,7 @@ class PanelReplayDashboard:
 
         self.day_select.param.watch(self._dataset_changed, "value")
         self.etf_select.param.watch(self._dataset_changed, "value")
+        self.etf_select.param.watch(self._etf_search_input_changed, "value_input")
         self.follow_latest.param.watch(self._follow_latest_changed, "value")
         self.backtest_chart_interval.param.watch(
             self._backtest_chart_interval_changed,
@@ -370,9 +380,19 @@ class PanelReplayDashboard:
 
     @property
     def dataset(self) -> Optional[ObservationDataset]:
+        code = self.selected_etf_code
+        if not code:
+            return None
         return self.datasets.get(
-            (self.selected_day, str(self.etf_select.value))
+            (self.selected_day, code)
         )
+
+    @property
+    def selected_etf_code(self) -> str:
+        try:
+            return extract_etf_code(str(self.etf_select.value))
+        except ValueError:
+            return ""
 
     @property
     def selected_day(self) -> str:
@@ -537,6 +557,14 @@ class PanelReplayDashboard:
             return
         self._load_selected_dataset()
 
+    def _etf_search_input_changed(self, event: Any) -> None:
+        try:
+            extract_etf_code(str(event.new))
+        except ValueError:
+            return
+        if self.etf_select.value != event.new:
+            self.etf_select.value = str(event.new)
+
     def refresh_datasets(self) -> None:
         datasets = discover_observation_datasets(self.project_root)
         if not datasets:
@@ -544,6 +572,9 @@ class PanelReplayDashboard:
             return
         self.datasets = datasets
         self.by_day = datasets_by_day(datasets)
+        self.etf_select.options = etf_search_options(
+            sorted({dataset.etf_code for dataset in datasets.values()})
+        )
         self._load_selected_dataset(skip_unchanged=True)
 
     def _refresh_data_clicked(self, _event: Any) -> None:
@@ -578,7 +609,7 @@ class PanelReplayDashboard:
             self._set_dataset_hint(
                 "{} / {} 尚无行情记录，等待采集或导入。".format(
                     self.selected_day,
-                    self.etf_select.value,
+                    self.selected_etf_code or self.etf_select.value,
                 ),
                 "waiting",
             )
@@ -975,7 +1006,7 @@ class PanelReplayDashboard:
                     {
                         "状态": "尚未发现行情记录",
                         "交易日": self.day_select.value,
-                        "ETF": self.etf_select.value,
+                        "ETF": self.selected_etf_code or self.etf_select.value,
                     }
                 ]
             )

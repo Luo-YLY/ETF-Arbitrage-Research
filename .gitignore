@@ -16,3 +16,4 @@ config/pcf_sources.local.json
 outputs/
 tmp/
 data/runs/
+data/events/

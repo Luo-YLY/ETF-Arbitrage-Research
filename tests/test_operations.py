@@ -19,6 +19,7 @@ from etf_arbitrage.operations import (
     read_job_state,
     write_job_state,
 )
+from etf_arbitrage.operations.market_day import _pid_exists
 from etf_arbitrage.dashboard.app import _resample_last
 from scripts import run_market_monitor
 
@@ -345,6 +346,17 @@ def test_retry_wait_is_treated_as_an_active_job() -> None:
             controller.start(job)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pid_probe_never_signals_current_process_on_windows(monkeypatch) -> None:
+    if os.name == "nt":
+        monkeypatch.setattr(
+            os,
+            "kill",
+            lambda *_args: pytest.fail("Windows PID probe must not call os.kill"),
+        )
+
+    assert _pid_exists(os.getpid())
 
 
 def test_monitor_worker_forces_utf8_output(monkeypatch) -> None:

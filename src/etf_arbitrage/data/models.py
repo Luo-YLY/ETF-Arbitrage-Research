@@ -85,6 +85,7 @@ class ComponentWeight:
     etf_code: str
     stock_code: str
     weight: float
+    exchange: str = ""
 
 
 @dataclass(frozen=True)

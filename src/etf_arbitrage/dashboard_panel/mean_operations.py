@@ -10,7 +10,12 @@ from typing import Callable, Optional, Union
 import pandas as pd
 import panel as pn
 
-from etf_arbitrage.data import SZSE_ETFS
+from etf_arbitrage.data import (
+    ETF_PROFILES,
+    etf_profile,
+    etf_search_options,
+    extract_etf_code,
+)
 from etf_arbitrage.operations import (
     MarketMonitorController,
     MarketMonitorJob,
@@ -62,8 +67,24 @@ class MeanReversionOperations:
         )
         self.monitor_etfs = pn.widgets.MultiChoice(
             label="监控ETF",
-            options=list(SZSE_ETFS),
+            options=list(ETF_PROFILES),
             value=["159915"],
+            placeholder="已加入的监控标的",
+        )
+        self.monitor_search = pn.widgets.AutocompleteInput(
+            label="添加ETF代码或名称",
+            options=etf_search_options(),
+            value="",
+            placeholder="可输入任意6位ETF代码",
+            restrict=False,
+            case_sensitive=False,
+            search_strategy="includes",
+            min_characters=1,
+        )
+        self.add_monitor_button = pn.widgets.Button(
+            label="加入监控",
+            icon="plus",
+            color="primary",
         )
         self.interval = pn.widgets.FloatInput(
             label="采集间隔（秒）",
@@ -85,7 +106,7 @@ class MeanReversionOperations:
             step=1.0,
         )
         self.redis_suffix = pn.widgets.TextInput(
-            label="Redis代码后缀",
+            label="未知交易所的默认Redis后缀",
             value=".SZ",
         )
         self.start_button = pn.widgets.Button(
@@ -145,6 +166,7 @@ class MeanReversionOperations:
         )
 
         self.monitor_etfs.param.watch(self._monitor_selection_changed, "value")
+        self.add_monitor_button.on_click(self._add_monitor_etf)
         self.pcf.on_change(self.refresh)
         self.start_button.on_click(self._start)
         self.stop_button.on_click(self._stop)
@@ -172,6 +194,10 @@ class MeanReversionOperations:
                 (
                     "日内采集",
                     pn.Column(
+                        pn.Row(
+                            self.monitor_search,
+                            self.add_monitor_button,
+                        ),
                         pn.Row(
                             self.monitor_etfs,
                             self.interval,
@@ -209,7 +235,7 @@ class MeanReversionOperations:
                 rows.append(
                     {
                         "ETF": code,
-                        "名称": SZSE_ETFS[code].name,
+                        "名称": etf_profile(code).name,
                         "状态": "已校验" if path is not None else "缺失",
                         "本地文件": str(path.relative_to(self.project_root))
                         if path is not None
@@ -220,7 +246,7 @@ class MeanReversionOperations:
                 rows.append(
                     {
                         "ETF": code,
-                        "名称": SZSE_ETFS[code].name,
+                        "名称": etf_profile(code).name,
                         "状态": "校验失败",
                         "错误": str(exc),
                     }
@@ -334,6 +360,26 @@ class MeanReversionOperations:
 
     def _monitor_selection_changed(self, _event) -> None:
         self.refresh()
+
+    def _add_monitor_etf(self, _event) -> None:
+        try:
+            code = extract_etf_code(
+                self.monitor_search.value_input
+                or self.monitor_search.value
+            )
+        except ValueError as exc:
+            self._set_message(str(exc), "warning")
+            return
+        options = list(self.monitor_etfs.options)
+        if code not in options:
+            options.append(code)
+            self.monitor_etfs.options = options
+        selected = list(self.monitor_etfs.value)
+        if code not in selected:
+            selected.append(code)
+            self.monitor_etfs.value = selected
+        self.monitor_search.value = ""
+        self._set_message("已将{}加入监控列表。".format(code), "success")
 
     def _auto_refresh_changed(self, event) -> None:
         if event.new:

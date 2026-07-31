@@ -72,7 +72,7 @@ class PCFIOPVCalculator:
         if any(suspended for _, _, _, suspended in resolved):
             flags.append("suspended_component")
         if any(
-            item.substitute_flag == SubstituteFlag.MANDATORY
+            item.substitute_flag.requires_cash_substitution
             for item in self.pcf.components
         ):
             flags.append("mandatory_cash_substitution")

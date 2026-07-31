@@ -12,11 +12,15 @@ import pandas as pd
 import panel as pn
 
 from etf_arbitrage.data import (
+    ETF_PROFILES,
     PCFRepository,
-    SZSE_ETFS,
+    etf_search_options,
+    extract_etf_code,
+    format_etf_search_option,
     load_pcf_source_templates,
     validate_executable_pcf,
 )
+from etf_arbitrage.domain import Exchange, infer_etf_exchange
 
 
 class PanelPCFControls:
@@ -39,14 +43,15 @@ class PanelPCFControls:
         self._callbacks: list[Callable[[], None]] = []
         self._custom_path: Optional[Path] = None
 
-        labels = {
-            "{} {}".format(code, profile.name): code
-            for code, profile in SZSE_ETFS.items()
-        }
-        self.etf_select = pn.widgets.Select(
-            label="ETF",
-            options=labels,
-            value=default_etf,
+        self.etf_select = pn.widgets.AutocompleteInput(
+            label="ETF代码或名称",
+            options=etf_search_options(self._local_etf_codes()),
+            value=format_etf_search_option(default_etf),
+            placeholder="输入6位代码、名称，或从建议中选择",
+            restrict=False,
+            case_sensitive=False,
+            search_strategy="includes",
+            min_characters=1,
         )
         self.date_picker = pn.widgets.DatePicker(
             label="交易日",
@@ -70,8 +75,8 @@ class PanelPCFControls:
             placeholder="选择本地文件时可手工指定路径",
         )
         self.upload = pn.widgets.FileInput(
-            label="上传PCF XML或ZIP",
-            accept=".xml,.zip",
+            label="上传PCF XML、JSON或ZIP",
+            accept=".xml,.json,.zip",
             multiple=False,
         )
         self.download_button = pn.widgets.Button(
@@ -125,6 +130,10 @@ class PanelPCFControls:
         )
 
         self.etf_select.param.watch(self._selection_changed, "value")
+        self.etf_select.param.watch(
+            self._search_input_changed,
+            "value_input",
+        )
         self.date_picker.param.watch(self._selection_changed, "value")
         self.source_mode.param.watch(self._source_mode_changed, "value")
         self.download_button.on_click(self._download)
@@ -137,7 +146,7 @@ class PanelPCFControls:
 
     @property
     def etf_code(self) -> str:
-        return str(self.etf_select.value)
+        return extract_etf_code(str(self.etf_select.value))
 
     @property
     def trading_date(self) -> date:
@@ -184,8 +193,28 @@ class PanelPCFControls:
         )
 
     def refresh(self) -> None:
+        try:
+            etf_code = self.etf_code
+        except ValueError as exc:
+            self.status_table.value = pd.DataFrame(
+                [{"状态": "等待输入", "提示": str(exc)}]
+            )
+            self.local_path_input.value = ""
+            return
+        self.etf_select.options = etf_search_options(self._local_etf_codes())
         templates = self._source_templates()
-        self.url_input.value = templates.get(self.etf_code, "")
+        self.url_input.value = templates.get(etf_code, "")
+        is_sse = infer_etf_exchange(etf_code) == Exchange.SSE
+        if is_sse and not self.url_input.value:
+            self.url_input.placeholder = (
+                "沪市无需填写：直接使用上交所官方PCF查询接口"
+            )
+            self.save_url_button.disabled = True
+        else:
+            self.url_input.placeholder = (
+                "深交所下载页、XML直链或带日期占位符的模板"
+            )
+            self.save_url_button.disabled = False
         path = self.selected_path
         self.local_path_input.value = str(path) if path is not None else ""
         rows = []
@@ -235,6 +264,14 @@ class PanelPCFControls:
         self.refresh()
         self._notify_callbacks()
 
+    def _search_input_changed(self, event) -> None:
+        try:
+            extract_etf_code(str(event.new))
+        except ValueError:
+            return
+        if self.etf_select.value != event.new:
+            self.etf_select.value = str(event.new)
+
     def _source_mode_changed(self, _event) -> None:
         mode = self.source_mode.value
         self.local_controls.visible = mode == "LOCAL_FILE"
@@ -283,7 +320,7 @@ class PanelPCFControls:
 
     def _import_upload(self, _event) -> None:
         if not self.upload.value:
-            self._set_message("请先选择PCF XML或ZIP文件。", "warning")
+            self._set_message("请先选择PCF XML、JSON或ZIP文件。", "warning")
             return
         try:
             path = self.repository.save(
@@ -344,7 +381,7 @@ class PanelPCFControls:
                         if url
                     }
                 )
-        for code in SZSE_ETFS:
+        for code in ETF_PROFILES:
             value = os.getenv("ETF_PCF_URL_{}".format(code), "").strip()
             if value:
                 values[code] = value
@@ -352,9 +389,14 @@ class PanelPCFControls:
 
     def _latest_local_day(self, etf_code: str) -> date:
         paths = sorted(
-            (self.project_root / "data" / "pcf").glob(
-                "*/pcf_{}_*.xml".format(etf_code)
-            ),
+            [
+                *(self.project_root / "data" / "pcf").glob(
+                    "*/pcf_{}_*.xml".format(etf_code)
+                ),
+                *(self.project_root / "data" / "pcf").glob(
+                    "*/pcf_{}_*.json".format(etf_code)
+                ),
+            ],
             reverse=True,
         )
         for path in paths:
@@ -363,6 +405,15 @@ class PanelPCFControls:
             except ValueError:
                 continue
         return date.today()
+
+    def _local_etf_codes(self) -> list[str]:
+        codes = []
+        root = self.project_root / "data" / "pcf"
+        for path in [*root.glob("*/*.xml"), *root.glob("*/*.json")]:
+            parts = path.stem.split("_")
+            if len(parts) >= 3 and len(parts[1]) == 6 and parts[1].isdigit():
+                codes.append(parts[1])
+        return sorted(set(codes))
 
     def _notify_callbacks(self) -> None:
         for callback in self._callbacks:

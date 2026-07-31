@@ -86,7 +86,8 @@ class DataQualityChecker:
         active = [
             item
             for item in pcf.components
-            if item.component_share > 0 and item.substitute_flag != SubstituteFlag.MANDATORY
+            if item.component_share > 0
+            and not item.substitute_flag.requires_cash_substitution
         ]
         total_quantity = sum(item.component_share for item in active) or 1.0
         missing = stale = suspended = limit_up = limit_down = 0.0

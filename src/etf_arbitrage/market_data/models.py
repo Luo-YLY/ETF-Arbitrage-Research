@@ -75,12 +75,22 @@ class MarketSnapshot:
     snapshot_timestamp: datetime
     etf_order_book: OrderBook
     component_order_books: Dict[str, OrderBook] = field(default_factory=dict)
+    qualified_component_order_books: Dict[str, OrderBook] = field(
+        default_factory=dict
+    )
     official_iopv: Optional[float] = None
     internal_iopv: Optional[float] = None
     data_quality_status: DataQualityStatus = DataQualityStatus.GOOD
     source_mode: str = "SIMULATED"
     sequence_gap: bool = False
     decode_error: Optional[str] = None
+    etf_instrument_id: Optional[str] = None
+    pcf_version: Optional[str] = None
+    pcf_hash: Optional[str] = None
+    trigger_event_id: Optional[str] = None
+    event_watermark: Optional[datetime] = None
+    trace_event_ids: Tuple[str, ...] = ()
+    assembly_blockers: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

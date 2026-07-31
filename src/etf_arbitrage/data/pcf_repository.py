@@ -8,28 +8,114 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Union
+import re
+from typing import Dict, Iterable, List, Mapping, Optional, Union
 from urllib.parse import parse_qs, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
+from etf_arbitrage.domain import Exchange, infer_etf_exchange
+
 from .pcf import PCFDocument, PCFParseError, SZSEPCFParser
+from .sse_pcf import SSEPCFFetcher, SSEPCFParser
 
 
 @dataclass(frozen=True)
-class SZSEETFProfile:
+class ETFProfile:
     etf_code: str
     name: str
     manager: str
     tracking_index: str
+    exchange: Exchange = Exchange.SZSE
 
 
-SZSE_ETFS: Mapping[str, SZSEETFProfile] = {
-    "159915": SZSEETFProfile("159915", "创业板ETF易方达", "易方达基金", "399006 创业板指"),
-    "159901": SZSEETFProfile("159901", "深证100ETF易方达", "易方达基金", "399330 深证100"),
-    "159949": SZSEETFProfile("159949", "创业板50ETF华安", "华安基金", "399673 创业板50"),
-    "159903": SZSEETFProfile("159903", "深成ETF南方", "南方基金", "399001 深证成指"),
+SZSEETFProfile = ETFProfile
+
+ETF_PROFILES: Mapping[str, ETFProfile] = {
+    "159915": ETFProfile("159915", "创业板ETF易方达", "易方达基金", "399006 创业板指"),
+    "159901": ETFProfile("159901", "深证100ETF易方达", "易方达基金", "399330 深证100"),
+    "159949": ETFProfile("159949", "创业板50ETF华安", "华安基金", "399673 创业板50"),
+    "159903": ETFProfile("159903", "深成ETF南方", "南方基金", "399001 深证成指"),
+    "159919": ETFProfile("159919", "沪深300ETF嘉实", "嘉实基金", "000300 沪深300"),
+    "510300": ETFProfile(
+        "510300",
+        "沪深300ETF华泰柏瑞",
+        "华泰柏瑞基金",
+        "000300 沪深300",
+        Exchange.SSE,
+    ),
+    "510050": ETFProfile(
+        "510050",
+        "上证50ETF华夏",
+        "华夏基金",
+        "000016 上证50",
+        Exchange.SSE,
+    ),
 }
+
+SZSE_ETFS: Mapping[str, ETFProfile] = {
+    code: profile
+    for code, profile in ETF_PROFILES.items()
+    if profile.exchange == Exchange.SZSE
+}
+
+
+def extract_etf_code(value: str) -> str:
+    """Extract a six-digit ETF code from a code, suffix, or search label."""
+
+    text = str(value).strip()
+    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    if match:
+        return match.group(1)
+    lowered = text.casefold()
+    exact = [
+        code
+        for code, profile in ETF_PROFILES.items()
+        if lowered in {profile.name.casefold(), profile.etf_code.casefold()}
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    raise ValueError("请输入6位ETF代码，或从搜索建议中选择一只ETF")
+
+
+def etf_profile(etf_code: str) -> ETFProfile:
+    """Return catalog metadata or a safe dynamic profile for an unknown ETF."""
+
+    code = extract_etf_code(etf_code)
+    profile = ETF_PROFILES.get(code)
+    if profile is not None:
+        return profile
+    return ETFProfile(
+        etf_code=code,
+        name=code,
+        manager="",
+        tracking_index="",
+        exchange=infer_etf_exchange(code),
+    )
+
+
+def format_etf_search_option(etf_code: str) -> str:
+    profile = etf_profile(etf_code)
+    suffix = {
+        Exchange.SSE: "SH",
+        Exchange.SZSE: "SZ",
+        Exchange.BSE: "BJ",
+        Exchange.HKEX: "HK",
+    }.get(profile.exchange, profile.exchange.value)
+    return "{} {} [{}]".format(profile.etf_code, profile.name, suffix)
+
+
+def etf_search_options(extra_codes: Iterable[str] = ()) -> List[str]:
+    codes = list(ETF_PROFILES)
+    for value in extra_codes:
+        try:
+            code = extract_etf_code(value)
+        except ValueError:
+            continue
+        if code not in codes:
+            codes.append(code)
+    return [format_etf_search_option(code) for code in codes]
+
 
 SZSE_REPORT_DOCUMENT_HOSTS = (
     "reportdocs.static.szse.cn",
@@ -46,11 +132,17 @@ class PCFRepository:
 
     def __init__(self, root: Union[Path, str]) -> None:
         self.root = Path(root)
-        self.parser = SZSEPCFParser()
+        self.szse_parser = SZSEPCFParser()
+        self.sse_parser = SSEPCFParser()
+        self.sse_fetcher = SSEPCFFetcher()
 
     def path_for(self, etf_code: str, trading_day: Union[date, str]) -> Path:
         day = self._day_text(trading_day)
-        return self.root / day / "pcf_{}_{}.xml".format(etf_code, day)
+        code = extract_etf_code(etf_code)
+        extension = (
+            ".json" if infer_etf_exchange(code) == Exchange.SSE else ".xml"
+        )
+        return self.root / day / "pcf_{}_{}{}".format(code, day, extension)
 
     def find(self, etf_code: str, trading_day: Union[date, str]) -> Optional[Path]:
         expected = self.path_for(etf_code, trading_day)
@@ -61,7 +153,9 @@ class PCFRepository:
         folder = self.root / day
         if not folder.exists():
             return None
-        for candidate in sorted(folder.glob("*.xml")):
+        for candidate in sorted(
+            [*folder.glob("*.xml"), *folder.glob("*.json")]
+        ):
             try:
                 self.validate(candidate, etf_code, trading_day)
             except (PCFParseError, PCFValidationError):
@@ -70,11 +164,17 @@ class PCFRepository:
         return None
 
     def save(self, content: bytes, etf_code: str, trading_day: Union[date, str]) -> Path:
-        xml = self._extract_xml(content, etf_code)
+        code = extract_etf_code(etf_code)
+        exchange = infer_etf_exchange(code)
+        payload = (
+            self._extract_json(content)
+            if exchange == Exchange.SSE
+            else self._extract_xml(content, code)
+        )
         destination = self.path_for(etf_code, trading_day)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_suffix(".xml.tmp")
-        temporary.write_bytes(xml)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_bytes(payload)
         try:
             self.validate(temporary, etf_code, trading_day)
             temporary.replace(destination)
@@ -90,7 +190,11 @@ class PCFRepository:
         trading_day: Union[date, str],
         timeout: float = 20.0,
     ) -> Path:
-        url = self.render_url(url_template, etf_code, trading_day)
+        code = extract_etf_code(etf_code)
+        if infer_etf_exchange(code) == Exchange.SSE and not url_template.strip():
+            content = self.sse_fetcher.fetch_bytes(code, timeout=timeout)
+            return self.save(content, code, trading_day)
+        url = self.render_url(url_template, code, trading_day)
         errors = []
         for candidate in self.download_candidates(url, etf_code, trading_day):
             request = Request(
@@ -172,11 +276,22 @@ class PCFRepository:
         etf_code: str,
         trading_day: Union[date, str],
     ) -> PCFDocument:
-        document = self.parser.parse(path)
+        source = Path(path)
+        prefix = source.read_bytes().lstrip()[:1]
+        parser = (
+            self.sse_parser
+            if source.suffix.lower() == ".json" or prefix == b"{"
+            else self.szse_parser
+        )
+        document = parser.parse(source)
         expected_day = datetime.strptime(self._day_text(trading_day), "%Y%m%d").date()
-        if document.etf_code != etf_code:
+        expected_code = extract_etf_code(etf_code)
+        if document.etf_code != expected_code:
             raise PCFValidationError(
-                "PCF证券代码为{}，与所选{}不一致".format(document.etf_code, etf_code)
+                "PCF证券代码为{}，与所选{}不一致".format(
+                    document.etf_code,
+                    expected_code,
+                )
             )
         if document.trading_day != expected_day:
             raise PCFValidationError(
@@ -222,6 +337,37 @@ class PCFRepository:
             raise PCFValidationError("PCF压缩包损坏") from exc
 
     @staticmethod
+    def _extract_json(content: bytes) -> bytes:
+        if content[:2] == b"PK":
+            try:
+                with ZipFile(BytesIO(content)) as archive:
+                    names = [
+                        name
+                        for name in archive.namelist()
+                        if name.lower().endswith(".json")
+                    ]
+                    if len(names) != 1:
+                        raise PCFValidationError(
+                            "压缩包内无法唯一识别沪市PCF JSON"
+                        )
+                    content = archive.read(names[0])
+            except BadZipFile as exc:
+                raise PCFValidationError("PCF压缩包损坏") from exc
+        try:
+            payload = json.loads(content.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PCFValidationError(
+                "沪市PCF需要上交所官方查询JSON或其ZIP文件"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise PCFValidationError("沪市PCF JSON根节点必须是对象")
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+
+    @staticmethod
     def _day_text(value: Union[date, str]) -> str:
         text = value.strftime("%Y%m%d") if isinstance(value, date) else str(value)
         try:
@@ -240,7 +386,7 @@ def load_pcf_source_templates(path: Union[Path, str]) -> Dict[str, str]:
         if not isinstance(payload, dict):
             raise ValueError("PCF source configuration must be a JSON object")
         values.update({str(code): str(url) for code, url in payload.items() if url})
-    for code in SZSE_ETFS:
+    for code in ETF_PROFILES:
         environment_value = os.getenv("ETF_PCF_URL_{}".format(code), "").strip()
         if environment_value:
             values[code] = environment_value
