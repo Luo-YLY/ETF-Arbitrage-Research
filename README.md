@@ -1,9 +1,14 @@
-# 沪深 ETF 套利研究系统
+# 沪深港 ETF 套利研究系统
 
 ETF Arbitrage v1.0 是一个面向研究的 Python 原型，用统一数据接口完成 ETF 理论价值计算、
 折溢价监控、机会识别、风险阻断、历史回放和价差头寸回测。深交所 XML PCF 与上交所公开
 PCF 查询 JSON 已统一映射到同一模型；Panel 控制台可以按代码或名称搜索，也允许直接输入
 新的六位 ETF 代码。沪市账户、申赎、结算和生产行情规则仍属于待接入边界。
+跨境ETF使用独立 Panel 入口；当前主线是 159920 这类境内上市、港股作为底层篮子的ETF，
+直接复用深交所官方PCF自动下载器。境内ETF和港股成分的最新行情统一从内网Redis读取，
+历史研究只回放由Redis采集生成的本地观察文件；公共第三方行情下载不属于项目数据链路。
+当前研究口径已限定为港股通可覆盖/可对冲篮子，但逐成分官方资格和HKD/CNY字段仍待内网
+验收。2800/82800不再作为主策略标的，仅保留历史对照；QDII申赎结算仍是后续边界。
 
 ## 核心口径
 
@@ -44,7 +49,8 @@ ETF_Arbitrage_Project/
 ├── scripts/           # 命令行演示
 ├── tests/             # 基础与集成测试
 ├── streamlit_app.py   # Streamlit 看板入口
-└── panel_app.py       # Panel 双页面控制台入口
+├── panel_app.py       # 沪深 Panel 双页面控制台入口
+└── panel_hk_app.py    # 独立港股 PCF 与行情接口控制台入口
 ```
 
 采用 `src/etf_arbitrage/signal` 命名空间而非项目根目录的 `signal` 包，是为了避免覆盖 Python
@@ -71,6 +77,7 @@ conda activate etf-arbitrage-py314
 python scripts/run_demo.py
 python -m streamlit run streamlit_app.py
 python -m panel serve panel_app.py --address 127.0.0.1 --port 8505
+python -m panel serve panel_hk_app.py --address 127.0.0.1 --port 8506
 ```
 
 当前工作区也可将环境直接创建在 `.conda/py314`，通过
@@ -84,6 +91,19 @@ Panel 控制台打开地址为 `http://127.0.0.1:8505/panel_app`，直接进入�
 均复用持久化 Bokeh 数据源进行增量刷新，切页时会停止隐藏页面的定时任务。均值回复页默认
 选择当天并允许通过日历选择任意日期；页面和标签内容按需加载，不再一次创建全部隐藏组件。
 
+跨境ETF控制台独立运行于 `http://127.0.0.1:8506/panel_hk_app`，默认选择 159920。它从
+深交所公开文件域名自动下载当日XML PCF并保存到
+`data/pcf/YYYYMMDD/pcf_159920_YYYYMMDD.xml`。控制台将 159900“申赎现金”识别为清算用
+虚拟证券，只展示申购预收现金，不把它与93只港股成分重复计入IOPV。
+
+跨境入口与沪深控制台一致拆为“均值回复监控”和“实盘套利模拟”两个页面。均值回复页读取
+内网Redis采集生成的分钟观察文件，复用原控制台的实时观察、收盘回测、成本敏感性和交易
+明细展示；页面本身不再联网下载历史行情。模拟页可读取Redis最新价、本地采集记录或完全
+模拟数据，再生成ETF/成分多档盘口、纸面订单、申赎与损益。申购方向按“港股卖一×FX卖价”
+复算，赎回方向按“港股买一×FX买价”复算；港股通资格、代理买卖、现金替代多退少补和T+
+交收完成建模前，结果固定为 `INDICATIVE_PAPER`。直接打开模拟页可使用
+`http://127.0.0.1:8506/panel_hk_app?page=executable`。
+
 ## 数据接入
 
 实时或历史供应商只需实现 `DataFeed` 的三个方法：基金主数据、成分权重和按时间排序的行情
@@ -92,18 +112,20 @@ Panel 控制台打开地址为 `http://127.0.0.1:8505/panel_app`，直接进入�
 推荐的正式接入顺序：交易所 PCF 和基金主数据，ETF/成分股实时行情，停复牌与涨跌停状态，
 盘口深度和费率，最后再接申赎执行与券源约束。
 
-### 深市 Redis 行情入口
+### 内网 Redis 行情入口
 
 项目已提供只读的 `SZRedisQuotationClient` 和 `SZRedisDataFeed`。Redis 连接信息通过
 `SZ_REDIS_HOST`、`SZ_REDIS_PORT`、`SZ_REDIS_DB`、`SZ_REDIS_PASSWORD` 和
 `SZ_REDIS_TIMEOUT` 环境变量配置，仓库不保存内网地址或凭据。
 
-首次连接内网后，先安装可选依赖并探测 159915 的真实字段：
+首次连接内网后，先安装可选依赖并探测标的的真实字段。跨境ETF还应逐一抽查PCF中的
+`.HK` 成分代码：
 
 ```powershell
 python -m pip install -e ".[redis]"
 $env:SZ_REDIS_HOST="内网地址"
-python scripts/probe_sz_quotation.py --code 159915.SZ
+python scripts/probe_sz_quotation.py --code 159920.SZ
+python scripts/probe_sz_quotation.py --code 00700.HK
 ```
 
 适配器每轮只批量读取 ETF 和目标成分股，避免重复拉取整个市场。它能从 `cdate` 和 `ctime`

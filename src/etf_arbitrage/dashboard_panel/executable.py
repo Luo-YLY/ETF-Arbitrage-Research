@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import timedelta
 from io import BytesIO
 import json
@@ -54,6 +54,7 @@ from etf_arbitrage.market_data import (
     RecordedHistoryMarketDataSource,
     RedisMarketDataSource,
     SimulatedMarketDataSource,
+    cross_border_hk_components,
 )
 from etf_arbitrage.reporting import RunRecorder
 
@@ -145,10 +146,20 @@ EXECUTABLE_CSS = """
 class PanelExecutableDashboard:
     """Session-local executable-arbitrage simulator and replay controller."""
 
-    def __init__(self, project_root: Union[Path, str]) -> None:
+    def __init__(
+        self,
+        project_root: Union[Path, str],
+        default_etf: str = "159915",
+        cross_border: bool = False,
+    ) -> None:
         self.project_root = Path(project_root).resolve()
         self.run_root = self.project_root / "data" / "runs"
-        self.pcf = PanelPCFControls(self.project_root)
+        self.default_etf = str(default_etf).zfill(6)
+        self.cross_border = bool(cross_border)
+        self.pcf = PanelPCFControls(
+            self.project_root,
+            default_etf=self.default_etf,
+        )
         self.source: Optional[MarketDataSource] = None
         self.file_source: Optional[FileReplayMarketDataSource] = None
         self.file_summary = None
@@ -170,6 +181,11 @@ class PanelExecutableDashboard:
         self._wire_events()
         self._source_mode_changed(None)
         self._price_seed_mode_changed(None)
+        if self.cross_border:
+            self.scenario.value = SimulationScenario.MEAN_REVERSION
+            self.optional_cash.value = False
+            self.optional_cash.disabled = True
+            self.optional_cash.name = "跨境代理篮子使用方向性模拟盘口（固定）"
         self._refresh_pcf_views()
         self._update_views()
 
@@ -191,18 +207,19 @@ class PanelExecutableDashboard:
             value=SimulationScenario.NORMAL,
         )
         self.random_seed = _int_input("随机种子", 42, 0, 1_000_000, 1)
+        price_seed_options = {
+            "本地历史数据（逐条回放）": (
+                SimulationPriceSeedMode.AUTO_LOCAL
+            ),
+            "指定本地历史文件": (
+                SimulationPriceSeedMode.LOCAL_RECORDING
+            ),
+            "完全模拟数据": SimulationPriceSeedMode.SYNTHETIC,
+            "内网Redis实时最新价": SimulationPriceSeedMode.REDIS_LATEST,
+        }
         self.price_seed_mode = pn.widgets.Select(
             label="模拟价格来源",
-            options={
-                "本地历史数据（逐条回放）": (
-                    SimulationPriceSeedMode.AUTO_LOCAL
-                ),
-                "指定本地历史文件": (
-                    SimulationPriceSeedMode.LOCAL_RECORDING
-                ),
-                "完全模拟数据": SimulationPriceSeedMode.SYNTHETIC,
-                "内网Redis实时最新价": SimulationPriceSeedMode.REDIS_LATEST,
-            },
+            options=price_seed_options,
             value=SimulationPriceSeedMode.AUTO_LOCAL,
         )
         self.local_recording_path = pn.widgets.TextInput(
@@ -632,7 +649,20 @@ class PanelExecutableDashboard:
             pn.pane.Bokeh(self.edge_figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
+        boundary = []
+        if self.cross_border:
+            boundary.append(
+                pn.pane.HTML(
+                    '<div class="exec-status"><b>跨境纸面实验：</b>'
+                    '价格基准来自内网Redis、本地Redis采集记录或完全模拟；港股成分'
+                    '多档深度、代理买卖、申赎确认和现金退补仍为模拟。引擎使用人民币折算后的'
+                    '代理篮子估值，所有结果固定为INDICATIVE_PAPER，不连接交易柜台。</div>',
+                    sizing_mode="stretch_width",
+                    stylesheets=[EXECUTABLE_CSS],
+                )
+            )
         return pn.Column(
+            *boundary,
             pn.Tabs(
                 ("实时总览", runtime),
                 ("数据与配置", self._configuration_view()),
@@ -959,6 +989,9 @@ class PanelExecutableDashboard:
         )
         if not report.valid:
             raise ValueError("PCF校验未通过：{}".format(", ".join(report.errors)))
+        runtime_pcf = (
+            _cross_border_proxy_pcf(pcf) if self.cross_border else pcf
+        )
         config = self._build_config()
         signature = json.dumps(config.to_dict(), sort_keys=True, ensure_ascii=True)
         current_signature = (
@@ -976,7 +1009,7 @@ class PanelExecutableDashboard:
         self.config = config
         self.pcf_document = pcf
         self.pcf_report = report
-        self.engine = PaperArbitrageEngine(pcf, config)
+        self.engine = PaperArbitrageEngine(runtime_pcf, config)
         self.redis_price_seed = None
         if config.data_source == DataSourceMode.SIMULATED:
             seed_mode = config.simulation.price_seed_mode
@@ -992,7 +1025,7 @@ class PanelExecutableDashboard:
             if use_local and local_path.exists():
                 self.source = RecordedHistoryMarketDataSource(
                     local_path,
-                    pcf,
+                    runtime_pcf,
                     config.simulation,
                 )
                 self.source.prime()
@@ -1013,7 +1046,7 @@ class PanelExecutableDashboard:
                     config.simulation.redis_code_suffix,
                 )
                 self.source = SimulatedMarketDataSource(
-                    pcf,
+                    runtime_pcf,
                     config.simulation,
                     initial_component_prices=(
                         self.redis_price_seed.component_prices
@@ -1022,7 +1055,10 @@ class PanelExecutableDashboard:
                     price_seed_source="sz_redis_latest_trade",
                 )
             else:
-                self.source = SimulatedMarketDataSource(pcf, config.simulation)
+                self.source = SimulatedMarketDataSource(
+                    runtime_pcf,
+                    config.simulation,
+                )
         elif config.data_source == DataSourceMode.FILE_REPLAY:
             if self.file_source is None:
                 raise ValueError("请先上传或读取历史行情")
@@ -1922,6 +1958,24 @@ return ((tick / reference - 1) * 10000).toFixed(1)
 
 def _new_history() -> Dict[str, list[dict]]:
     return {name: [] for name in HISTORY_TABLES}
+
+
+def _cross_border_proxy_pcf(pcf):
+    """Remove the virtual subscription-cash record from proxy valuation.
+
+    The 159900 row is a settlement prepayment record, not an investable basket
+    constituent.  Keeping it in the generic simulator would add it to NAV a
+    second time and materially overstate the synthetic IOPV.
+    """
+
+    components = tuple(cross_border_hk_components(pcf))
+    if not components:
+        raise ValueError("跨境纸面模拟未识别到HKEX参考成分")
+    return replace(
+        pcf,
+        components=components,
+        total_record_num=len(components),
+    )
 
 
 def _snapshot_record(snapshot, evaluation) -> dict:

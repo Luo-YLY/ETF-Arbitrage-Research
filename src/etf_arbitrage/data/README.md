@@ -3,7 +3,7 @@
 `models.py` 定义统一的 ETF 行情、股票行情、基金主数据和成分权重结构。
 
 `DataFeed` 是供应商无关接口。`DataFrameReplayFeed` 用于 CSV/DataFrame 历史回放，
-`SyntheticDataFeed` 提供可重复的研究样例。接入 Wind、Tushare、AKShare 或券商接口时，
+`SyntheticDataFeed` 提供可重复的研究样例。接入 Wind、Tushare、内网Redis或券商接口时，
 新增 `DataFeed` 实现即可，不需要修改估值、信号和回测模块。
 
 `sz_redis.py` 将原有深市 Redis 行情脚本拆分为两个部分：
