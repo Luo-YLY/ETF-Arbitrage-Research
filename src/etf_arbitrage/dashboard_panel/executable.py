@@ -7,6 +7,7 @@ from datetime import timedelta
 from io import BytesIO
 import json
 from math import isfinite
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -231,6 +232,20 @@ class PanelExecutableDashboard:
             label="Redis代码后缀",
             value=".SZ",
             placeholder=".SZ",
+        )
+        self.redis_hkd_cny_code = pn.widgets.TextInput(
+            label="Redis HKD/CNY代码（可选）",
+            value=os.getenv("SZ_REDIS_HKD_CNY_CODE", ""),
+            placeholder="留空时使用下方模拟汇率",
+        )
+        self.hkd_cny_mid = _float_input(
+            "模拟HKD/CNY中间价", 0.92, 0.01, 5.0, 0.0001
+        )
+        self.hkd_cny_spread_bps = _float_input(
+            "模拟汇率价差（bp）", 2.0, 0.0, 1000.0, 0.1
+        )
+        self.hkd_cny_volatility = _float_input(
+            "模拟汇率单Tick波动率", 0.0, 0.0, 0.02, 0.00001
         )
         self.price_seed_message = pn.pane.HTML(
             '<div class="exec-status">价格基准：自动优先读取PCF交易日对应的本地采集文件；不存在时使用完全模拟。买卖盘深度与后续路径仍由模拟器生成。</div>',
@@ -686,11 +701,31 @@ class PanelExecutableDashboard:
             self.source.stop()
 
     def _configuration_view(self):
+        fx_controls = (
+            pn.Card(
+                pn.Column(
+                    pn.Row(self.hkd_cny_mid, self.hkd_cny_spread_bps),
+                    self.hkd_cny_volatility,
+                    pn.pane.Markdown(
+                        "模拟/本地历史回放使用这里的双边汇率；Redis最新价模式改用"
+                        "指定Redis记录的买一/卖一。申购按汇率卖价，赎回按汇率买价。"
+                    ),
+                ),
+                title="HKD/CNY快照参数",
+                collapsed=False,
+                collapsible=True,
+                sizing_mode="stretch_width",
+            )
+            if self.cross_border
+            else pn.Spacer(height=0)
+        )
+        self.fx_controls = fx_controls
         simulation_controls = pn.Column(
             pn.Row(self.scenario, self.random_seed),
             self.local_recording_path,
-            self.redis_seed_suffix,
+            pn.Row(self.redis_seed_suffix, self.redis_hkd_cny_code),
             self.price_seed_message,
+            fx_controls,
             pn.Row(self.tick_ms, self.total_ticks, self.simulation_speed),
             pn.Row(self.premium_shock, self.base_volatility),
             pn.Row(self.book_levels, self.depth_per_level, self.quote_latency),
@@ -896,6 +931,12 @@ class PanelExecutableDashboard:
                 price_seed_mode=self.price_seed_mode.value,
                 local_recording_path=self.local_recording_path.value.strip(),
                 redis_code_suffix=self.redis_seed_suffix.value.strip() or ".SZ",
+                redis_hkd_cny_code=(
+                    self.redis_hkd_cny_code.value.strip()
+                ),
+                hkd_cny_mid=float(self.hkd_cny_mid.value),
+                hkd_cny_spread_bps=float(self.hkd_cny_spread_bps.value),
+                hkd_cny_volatility=float(self.hkd_cny_volatility.value),
                 tick_interval_ms=int(self.tick_ms.value),
                 total_ticks=int(self.total_ticks.value),
                 simulation_speed=float(self.simulation_speed.value),
@@ -1044,6 +1085,7 @@ class PanelExecutableDashboard:
                 self.redis_price_seed = _load_redis_price_seed(
                     pcf,
                     config.simulation.redis_code_suffix,
+                    config.simulation.redis_hkd_cny_code,
                 )
                 self.source = SimulatedMarketDataSource(
                     runtime_pcf,
@@ -1052,6 +1094,8 @@ class PanelExecutableDashboard:
                         self.redis_price_seed.component_prices
                     ),
                     initial_etf_price=self.redis_price_seed.etf_price,
+                    initial_hkd_cny_bid=self.redis_price_seed.hkd_cny_bid,
+                    initial_hkd_cny_ask=self.redis_price_seed.hkd_cny_ask,
                     price_seed_source="sz_redis_latest_trade",
                 )
             else:
@@ -1082,20 +1126,38 @@ class PanelExecutableDashboard:
             source_label = "本地历史数据（真实价格轨迹+合成盘口）"
             seed_text = (
                 "逐条回放本地历史数据（{}），记录数={}，首条有效时间={}；"
-                "ETF与成分股Last沿用历史轨迹，Bid/Ask与多档深度为模拟值。"
+                "ETF与成分股Last沿用历史轨迹，Bid/Ask与多档深度为模拟值。{}"
             ).format(
                 self.source.path,
                 self.source.total_records,
                 first_snapshot.snapshot_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                (
+                    " HKD/CNY为显式模拟双边快照：{:.6f}/{:.6f}。".format(
+                        first_snapshot.hkd_cny_quote.bid,
+                        first_snapshot.hkd_cny_quote.ask,
+                    )
+                    if first_snapshot.hkd_cny_quote
+                    else ""
+                ),
             )
         elif self.redis_price_seed is not None:
             seed_text = (
                 "价格基准：Redis最新成交价，ETF={:.4f}，"
-                "PCF实物成分股={}/{}；买卖盘深度与后续路径为模拟值。"
+                "PCF实物成分股={}/{}；{}买卖盘深度与后续路径为模拟值。"
             ).format(
                 self.redis_price_seed.etf_price,
                 self.redis_price_seed.component_count,
                 self.redis_price_seed.component_count,
+                (
+                    "HKD/CNY({})={:.6f}/{:.6f}；".format(
+                        self.redis_price_seed.hkd_cny_code,
+                        self.redis_price_seed.hkd_cny_bid,
+                        self.redis_price_seed.hkd_cny_ask,
+                    )
+                    if self.redis_price_seed.hkd_cny_bid is not None
+                    and self.redis_price_seed.hkd_cny_ask is not None
+                    else ""
+                ),
             )
         elif (
             config.data_source == DataSourceMode.SIMULATED
@@ -1283,6 +1345,10 @@ class PanelExecutableDashboard:
         self.redis_seed_suffix.visible = (
             mode == SimulationPriceSeedMode.REDIS_LATEST
         )
+        self.redis_hkd_cny_code.visible = (
+            self.cross_border
+            and mode == SimulationPriceSeedMode.REDIS_LATEST
+        )
         message = {
             SimulationPriceSeedMode.AUTO_LOCAL: (
                 "价格来源：本地历史数据。自动读取PCF交易日与ETF代码对应的"
@@ -1298,6 +1364,8 @@ class PanelExecutableDashboard:
             ),
             SimulationPriceSeedMode.REDIS_LATEST: (
                 "价格来源：内网Redis实时最新价，需要当前进程配置SZ_REDIS_HOST。"
+                "跨境模式允许汇率代码留空；此时ETF与成分股使用Redis最新价，"
+                "纸面模拟汇率使用上方参数。"
             ),
         }[mode]
         self.price_seed_message.object = (
@@ -1589,14 +1657,18 @@ return ((tick / reference - 1) * 10000).toFixed(1)
                 ]
             )
             self.secondary_metrics.object = _metric_strip(
-                [
+                ([
                     ("官方IOPV", "--", NEGATIVE),
                     ("内部IOPV", "--", IOPV_COLOR),
                     ("套利下界", "--", "#8B5E34"),
                     ("套利上界", "--", "#8B5E34"),
                     ("申购净利润", "--", POSITIVE),
                     ("赎回净利润", "--", NEGATIVE),
-                ]
+                ] + (
+                    [("HKD/CNY Bid", "--", BID_COLOR), ("HKD/CNY Ask", "--", ASK_COLOR)]
+                    if self.cross_border
+                    else []
+                ))
             )
             return
         evaluation = self.result.decision_evaluation
@@ -1625,8 +1697,9 @@ return ((tick / reference - 1) * 10000).toFixed(1)
                 ("ETF Ask", _price(etf.best_ask), ASK_COLOR),
             ]
         )
+        fx_quote = self.snapshot.hkd_cny_quote
         self.secondary_metrics.object = _metric_strip(
-            [
+            ([
                 ("官方IOPV", _price(evaluation.official_iopv), NEGATIVE),
                 ("内部IOPV", _price(evaluation.internal_iopv), IOPV_COLOR),
                 ("套利下界", _price(evaluation.lower_bound), "#8B5E34"),
@@ -1641,7 +1714,14 @@ return ((tick / reference - 1) * 10000).toFixed(1)
                     "{:,.2f}".format(evaluation.redemption.net_profit),
                     NEGATIVE,
                 ),
-            ]
+            ] + (
+                [
+                    ("HKD/CNY Bid", _fx_price(fx_quote.bid if fx_quote else None), BID_COLOR),
+                    ("HKD/CNY Ask", _fx_price(fx_quote.ask if fx_quote else None), ASK_COLOR),
+                ]
+                if self.cross_border
+                else []
+            ))
         )
 
     def _update_runtime_status(self) -> None:
@@ -1988,6 +2068,7 @@ def _snapshot_record(snapshot, evaluation) -> dict:
         }
         for symbol, book in snapshot.component_order_books.items()
     }
+    fx_quote = snapshot.hkd_cny_quote
     return {
         "timestamp": snapshot.snapshot_timestamp.isoformat(),
         "source_mode": snapshot.source_mode,
@@ -1997,6 +2078,19 @@ def _snapshot_record(snapshot, evaluation) -> dict:
         "etf_ask": snapshot.etf_order_book.best_ask,
         "official_iopv": snapshot.official_iopv,
         "internal_iopv": evaluation.internal_iopv,
+        "hkd_cny_bid": fx_quote.bid if fx_quote else None,
+        "hkd_cny_ask": fx_quote.ask if fx_quote else None,
+        "hkd_cny_exchange_timestamp": (
+            fx_quote.exchange_timestamp.isoformat()
+            if fx_quote and fx_quote.exchange_timestamp
+            else None
+        ),
+        "hkd_cny_receive_timestamp": (
+            fx_quote.receive_timestamp.isoformat()
+            if fx_quote and fx_quote.receive_timestamp
+            else None
+        ),
+        "hkd_cny_source": fx_quote.source if fx_quote else None,
         "sequence_gap": snapshot.sequence_gap,
         "decode_error": snapshot.decode_error,
         "component_books_json": json.dumps(
@@ -2130,7 +2224,11 @@ def _resolve_local_recording_path(
     )
 
 
-def _load_redis_price_seed(pcf, redis_code_suffix: str):
+def _load_redis_price_seed(
+    pcf,
+    redis_code_suffix: str,
+    hkd_cny_code: str,
+):
     try:
         settings = SZRedisSettings.from_env()
     except ValueError as exc:
@@ -2146,6 +2244,7 @@ def _load_redis_price_seed(pcf, redis_code_suffix: str):
             pcf,
             trade_date=pcf.trading_day,
             redis_code_suffix=redis_code_suffix,
+            hkd_cny_code=hkd_cny_code,
         )
     finally:
         connection = getattr(client, "_redis_client", None)
@@ -2159,6 +2258,7 @@ def _component_book_rows(snapshot) -> pd.DataFrame:
         [
             {
                 "证券代码": symbol,
+                "币种": "HKD" if str(book.exchange).upper() == "HKEX" else "CNY",
                 "状态": book.trading_status.value,
                 "最新价": book.last_price,
                 "买一": book.best_bid,
@@ -2233,6 +2333,12 @@ def _price(value: Optional[float]) -> str:
     if value is None or pd.isna(value):
         return "--"
     return "{:.4f}".format(float(value))
+
+
+def _fx_price(value: Optional[float]) -> str:
+    if value is None or pd.isna(value):
+        return "--"
+    return "{:.6f}".format(float(value))
 
 
 def _is_valid_price(value: Optional[float]) -> bool:

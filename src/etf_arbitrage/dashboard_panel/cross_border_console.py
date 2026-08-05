@@ -7,9 +7,9 @@ from typing import Optional, Union
 
 import panel as pn
 
-from .app import PanelReplayDashboard
 from .cross_border import CrossBorderPanelDashboard
 from .executable import PanelExecutableDashboard
+from .mean_operations import MeanReversionOperations
 
 
 CROSS_BORDER_MEAN_PAGE = "均值回复监控"
@@ -21,7 +21,7 @@ class CrossBorderPanelConsoleDashboard:
 
     def __init__(self, project_root: Union[Path, str]) -> None:
         self.project_root = Path(project_root).resolve()
-        self.mean_page: Optional[PanelReplayDashboard] = None
+        self.mean_page: Optional[MeanReversionOperations] = None
         self.research_page: Optional[CrossBorderPanelDashboard] = None
         self.executable_page: Optional[PanelExecutableDashboard] = None
         initial_page = self._initial_page()
@@ -68,31 +68,15 @@ class CrossBorderPanelConsoleDashboard:
             self.sidebar.objects = [
                 self.page_select,
                 pn.layout.Divider(),
-                self.mean_page.sidebar_controls(),
+                self.research_page.sidebar_controls(),
             ]
-            cross_border_preparation = pn.Row(
-                pn.Column(
-                    self.research_page.sidebar_controls(),
-                    width=360,
-                    sizing_mode="fixed",
-                ),
-                pn.Tabs(
-                    ("研究边界", self.research_page.scope_view()),
-                    ("官方PCF", self.research_page.pcf_view()),
-                    ("跨境快照", self.research_page.market_interface_view()),
-                    ("IOPV参考", self.research_page.research_view()),
-                    ("审计", self.research_page.audit_view()),
-                    dynamic=True,
-                    sizing_mode="stretch_width",
-                ),
-                sizing_mode="stretch_width",
-            )
             self.main.objects = [
                 pn.Tabs(
-                    ("均值回复监控", self.mean_page.replay_view()),
-                    ("收盘回测", self.mean_page.backtest_view()),
-                    ("数据状态", self.mean_page.quality_view()),
-                    ("PCF与跨境快照", cross_border_preparation),
+                    ("最新价监控", self.mean_page.view()),
+                    ("官方PCF", self.research_page.pcf_view()),
+                    ("采集接口", self.research_page.market_interface_view()),
+                    ("汇率回填", self.research_page.research_view()),
+                    ("审计", self.research_page.audit_view()),
                     dynamic=True,
                     sizing_mode="stretch_width",
                 )
@@ -110,11 +94,13 @@ class CrossBorderPanelConsoleDashboard:
     def _ensure_mean_page(self) -> None:
         if self.mean_page is not None:
             return
-        self.mean_page = PanelReplayDashboard(
-            self.project_root,
-            default_etf="159920",
-        )
         self.research_page = CrossBorderPanelDashboard(self.project_root)
+        self.mean_page = MeanReversionOperations(
+            self.project_root,
+            pcf_controls=self.research_page.pcf_controls,
+            default_etfs=("159920",),
+            capture_only=True,
+        )
 
     def _ensure_executable_page(self) -> None:
         if self.executable_page is None:

@@ -5,9 +5,18 @@ from uuid import uuid4
 
 import pytest
 
+from etf_arbitrage.arbitrage import ExecutableArbitrageDetector
 from etf_arbitrage.data import PCFComponent, PCFDocument, SubstituteFlag
-from etf_arbitrage.dashboard_panel import CrossBorderPanelDashboard
+from etf_arbitrage.dashboard_panel import (
+    CrossBorderPanelConsoleDashboard,
+    CrossBorderPanelDashboard,
+)
 from etf_arbitrage.dashboard_panel.executable import _cross_border_proxy_pcf
+from etf_arbitrage.executable_config import (
+    CostConfig,
+    ExecutionConfig,
+    ExecutionScenario,
+)
 from etf_arbitrage.market_data import (
     CrossBorderSnapshotInterface,
     CrossBorderSnapshotSourceMode,
@@ -17,6 +26,7 @@ from etf_arbitrage.market_data import (
     OrderBook,
     OrderBookLevel,
     PendingCrossBorderMarketDataSource,
+    FXQuote,
     calculate_cross_border_indicative_metrics,
     cross_border_hk_components,
     virtual_subscription_cash_component,
@@ -139,6 +149,83 @@ def test_directional_iopv_uses_redis_books_and_excludes_virtual_cash() -> None:
     assert "STOCK_CONNECT_ELIGIBILITY_NOT_VALIDATED" in metrics.blockers
 
 
+def test_executable_engine_prices_hk_basket_with_directional_snapshot_fx() -> None:
+    pcf = _cross_border_proxy_pcf(_sample_pcf())
+    timestamp = datetime(2026, 8, 4, 10, 0)
+    fx_quote = FXQuote(
+        bid=0.86,
+        ask=0.87,
+        exchange_timestamp=timestamp,
+        receive_timestamp=timestamp,
+        source="INTRANET_REDIS",
+    )
+    snapshot = MarketSnapshot(
+        snapshot_timestamp=timestamp,
+        etf_order_book=_book("159920", "SZSE", 0.99, 1.00),
+        component_order_books={"00001": _book("00001", "HKEX", 10.0, 10.1)},
+        fx_quotes={"HKD/CNY": fx_quote},
+        source_mode="INTRANET_REDIS",
+    )
+    detector = ExecutableArbitrageDetector(
+        pcf,
+        ExecutionConfig(
+            scenario=ExecutionScenario.OPTIMISTIC,
+            safety_buffer_bps=0.0,
+            minimum_profit_bps=0.0,
+            minimum_profit_amount=0.0,
+            depth_haircut=1.0,
+        ),
+        CostConfig(secondary_market_bps=0.0),
+    )
+
+    evaluation = detector.evaluate(snapshot)
+
+    assert evaluation.internal_iopv == pytest.approx(
+        (100.0 + 100.0 * 10.05 * 0.865) / 1_000.0
+    )
+    assert evaluation.creation.basket.physical_value == pytest.approx(
+        100.0 * 10.1 * 0.87
+    )
+    assert evaluation.redemption.basket.physical_value == pytest.approx(
+        100.0 * 10.0 * 0.86
+    )
+    assert "MISSING_HKD_CNY_QUOTE" not in evaluation.quality.blockers
+
+
+def test_missing_snapshot_fx_blocks_cross_border_execution() -> None:
+    pcf = _cross_border_proxy_pcf(_sample_pcf())
+    timestamp = datetime(2026, 8, 4, 10, 0)
+    snapshot = MarketSnapshot(
+        snapshot_timestamp=timestamp,
+        etf_order_book=_book("159920", "SZSE", 0.99, 1.00),
+        component_order_books={"00001": _book("00001", "HKEX", 10.0, 10.1)},
+    )
+
+    evaluation = ExecutableArbitrageDetector(pcf).evaluate(snapshot)
+
+    assert "MISSING_HKD_CNY_QUOTE" in evaluation.quality.blockers
+    assert not evaluation.creation.executable
+    assert not evaluation.redemption.executable
+
+
+def test_fx_without_timestamps_is_not_execution_eligible() -> None:
+    pcf = _cross_border_proxy_pcf(_sample_pcf())
+    timestamp = datetime(2026, 8, 4, 10, 0)
+    snapshot = MarketSnapshot(
+        snapshot_timestamp=timestamp,
+        etf_order_book=_book("159920", "SZSE", 0.99, 1.00),
+        component_order_books={"00001": _book("00001", "HKEX", 10.0, 10.1)},
+        fx_quotes={"HKD/CNY": FXQuote(bid=0.86, ask=0.87)},
+    )
+
+    evaluation = ExecutableArbitrageDetector(pcf).evaluate(snapshot)
+
+    assert "MISSING_HKD_CNY_TIMESTAMP" in evaluation.quality.blockers
+    assert "MISSING_HKD_CNY_RECEIVE_TIMESTAMP" in evaluation.quality.blockers
+    assert not evaluation.creation.executable
+    assert not evaluation.redemption.executable
+
+
 def test_cross_border_dashboard_is_redis_first() -> None:
     root = Path("tmp") / "tests" / uuid4().hex
     root.mkdir(parents=True)
@@ -163,4 +250,20 @@ def test_cross_border_dashboard_is_redis_first() -> None:
         )
         assert "Redis已设为唯一实时主路径" in dashboard.market_status.object
     finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_cross_border_console_uses_latest_price_capture_without_live_iopv() -> None:
+    root = Path("tmp") / "tests" / uuid4().hex
+    root.mkdir(parents=True)
+    try:
+        dashboard = CrossBorderPanelConsoleDashboard(root)
+
+        assert dashboard.mean_page is not None
+        assert dashboard.mean_page.capture_only is True
+        assert dashboard.mean_page.monitor_etfs.value == ["159920"]
+        assert dashboard.mean_page.pcf is dashboard.research_page.pcf_controls
+        assert dashboard.mean_page.latest_quotes_table is not None
+    finally:
+        dashboard.mean_page.stop_runtime()
         shutil.rmtree(root, ignore_errors=True)

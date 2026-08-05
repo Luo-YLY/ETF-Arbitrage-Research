@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from math import isfinite
 from typing import Dict, Optional, Tuple
 
 
@@ -71,10 +72,41 @@ class OrderBook:
 
 
 @dataclass(frozen=True)
+class FXQuote:
+    """Two-sided foreign-exchange quote carried inside a market snapshot."""
+
+    bid: float
+    ask: float
+    exchange_timestamp: Optional[datetime] = None
+    receive_timestamp: Optional[datetime] = None
+    pair: str = "HKD/CNY"
+    source: str = "unknown"
+
+    def __post_init__(self) -> None:
+        pair = str(self.pair).strip().upper().replace(" ", "")
+        if pair != "HKD/CNY":
+            raise ValueError("Only HKD/CNY is supported by the cross-border model")
+        if (
+            not isfinite(self.bid)
+            or not isfinite(self.ask)
+            or self.bid <= 0
+            or self.ask <= 0
+            or self.bid > self.ask
+        ):
+            raise ValueError("FX bid and ask must be positive with bid <= ask")
+        object.__setattr__(self, "pair", pair)
+
+    @property
+    def mid(self) -> float:
+        return (self.bid + self.ask) / 2.0
+
+
+@dataclass(frozen=True)
 class MarketSnapshot:
     snapshot_timestamp: datetime
     etf_order_book: OrderBook
     component_order_books: Dict[str, OrderBook] = field(default_factory=dict)
+    fx_quotes: Dict[str, FXQuote] = field(default_factory=dict)
     qualified_component_order_books: Dict[str, OrderBook] = field(
         default_factory=dict
     )
@@ -91,6 +123,10 @@ class MarketSnapshot:
     event_watermark: Optional[datetime] = None
     trace_event_ids: Tuple[str, ...] = ()
     assembly_blockers: Tuple[str, ...] = ()
+
+    @property
+    def hkd_cny_quote(self) -> Optional[FXQuote]:
+        return self.fx_quotes.get("HKD/CNY")
 
 
 @dataclass(frozen=True)

@@ -7,8 +7,10 @@ PCF 查询 JSON 已统一映射到同一模型；Panel 控制台可以按代码�
 跨境ETF使用独立 Panel 入口；当前主线是 159920 这类境内上市、港股作为底层篮子的ETF，
 直接复用深交所官方PCF自动下载器。境内ETF和港股成分的最新行情统一从内网Redis读取，
 历史研究只回放由Redis采集生成的本地观察文件；公共第三方行情下载不属于项目数据链路。
-当前研究口径已限定为港股通可覆盖/可对冲篮子，但逐成分官方资格和HKD/CNY字段仍待内网
-验收。2800/82800不再作为主策略标的，仅保留历史对照；QDII申赎结算仍是后续边界。
+当前研究口径已限定为港股通可覆盖/可对冲篮子。港股通盘中监控暂时只保存ETF和PCF成分
+最新价，不要求Redis提供Bid/Ask或HKD/CNY，也不在盘中计算IOPV、Premium或套利信号。
+HKD/CNY通过收盘后文件按时间戳回填，生成独立模型估值文件。2800/82800不再作为主策略
+标的，仅保留历史对照；QDII申赎结算仍是后续边界。
 
 ## 核心口径
 
@@ -96,9 +98,9 @@ Panel 控制台打开地址为 `http://127.0.0.1:8505/panel_app`，直接进入�
 `data/pcf/YYYYMMDD/pcf_159920_YYYYMMDD.xml`。控制台将 159900“申赎现金”识别为清算用
 虚拟证券，只展示申购预收现金，不把它与93只港股成分重复计入IOPV。
 
-跨境入口与沪深控制台一致拆为“均值回复监控”和“实盘套利模拟”两个页面。均值回复页读取
-内网Redis采集生成的分钟观察文件，复用原控制台的实时观察、收盘回测、成本敏感性和交易
-明细展示；页面本身不再联网下载历史行情。模拟页可读取Redis最新价、本地采集记录或完全
+跨境入口仍拆为“均值回复监控”和“实盘套利模拟”两个页面。当前均值回复页先作为最新价
+采集台：展示159920.SZ与PCF中大写`.HK`成分的最新价和时间戳，盘中不展示IOPV或Premium；
+页面本身不再联网下载历史行情。模拟页可读取Redis最新价、本地采集记录或完全
 模拟数据，再生成ETF/成分多档盘口、纸面订单、申赎与损益。申购方向按“港股卖一×FX卖价”
 复算，赎回方向按“港股买一×FX买价”复算；港股通资格、代理买卖、现金替代多退少补和T+
 交收完成建模前，结果固定为 `INDICATIVE_PAPER`。直接打开模拟页可使用
@@ -131,8 +133,38 @@ python scripts/probe_sz_quotation.py --code 00700.HK
 适配器每轮只批量读取 ETF 和目标成分股，避免重复拉取整个市场。它能从 `cdate` 和 `ctime`
 解析供应商时间，并优先按 PCF 挂牌市场映射 Redis 代码：上交所 `.SH`、深交所 `.SZ`、
 北交所 `.BJ`、港交所 `.HK`。`--redis-code-suffix` 仅在交易所无法识别时作为兼容兜底。
-Redis 只提供最新价时，应使用指示性模式：系统可以记录行情和计算最新价 Premium，但不会
-生成可执行套利信号。
+Redis 只提供最新价时，沪深标的仍按原指示性研究口径运行；港股通入口只记录原始最新价，
+估值状态保持`PENDING_FX`，不在盘中计算Premium或生成套利信号。
+
+### 港股通盘中采集与收盘后汇率回填
+
+跨境控制台在开始采集前联网下载并校验当日官方PCF，PCF文件属于设备当日运行数据，不要求
+通过Git同步。进入内网后点击“启动当日采集”，后台只读取`159920.SZ`及PCF中全部大写
+`.HK`成分的`closepx/cdate/ctime`，原始记录写入：
+
+```text
+tmp/recordings/YYYYMMDD/159920.jsonl
+```
+
+盘中不创建159920的IOPV/Premium观察文件。收盘后准备带时间戳的HKD/CNY文件，至少包含：
+
+```csv
+timestamp,hkd_cny_mid
+2026-08-05 09:30:00,0.9201
+```
+
+再执行：
+
+```powershell
+python scripts/backfill_cross_border_fx.py `
+  --pcf data/pcf/YYYYMMDD/pcf_159920_YYYYMMDD.xml `
+  --fx-file data/reference/fx/hkd_cny_YYYYMMDD.csv
+```
+
+程序只使用`fx_timestamp <= 行情timestamp`的最近汇率，默认最大时滞60秒；原始快照不会被
+覆盖，派生结果默认写入
+`outputs/cross_border_backfill/YYYYMMDD/159920/observations.csv`。该结果标记为
+`MODEL_IOPV_POST_CLOSE`，不是交易所官方IOPV。
 
 ### 沪市 PCF 入口
 

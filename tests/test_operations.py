@@ -218,6 +218,7 @@ def test_monitor_job_validation_and_command() -> None:
     assert job.auto_restart
     assert job.restart_delay == 5.0
     assert job.max_restart_delay == 60.0
+    assert not job.capture_only
     assert command[0]
     assert command[1].endswith("run_market_monitor.py")
     assert command[-2:] == ["--job", "job.json"]
@@ -232,6 +233,21 @@ def test_monitor_job_requires_every_selected_pcf() -> None:
 
     with pytest.raises(ValueError, match="159901"):
         job.validate()
+
+
+def test_capture_only_monitor_does_not_build_live_iopv_replay() -> None:
+    job = MarketMonitorJob(
+        trade_date="20260722",
+        etf_codes=("159915",),
+        pcf_paths={"159915": str(PCF_SAMPLE)},
+        capture_only=True,
+    )
+
+    trackers = run_market_monitor.build_trackers(job, object())
+
+    assert len(trackers) == 1
+    assert trackers[0].research is None
+    assert trackers[0].expected_component_count == 98
 
 
 def test_monitor_job_validates_restart_delays() -> None:
@@ -391,5 +407,6 @@ def test_monitor_worker_forces_utf8_output(monkeypatch) -> None:
         assert payload["auto_restart"] is True
         assert payload["restart_delay"] == 5.0
         assert payload["max_restart_delay"] == 60.0
+        assert payload["capture_only"] is False
     finally:
         shutil.rmtree(root, ignore_errors=True)

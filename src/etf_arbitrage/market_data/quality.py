@@ -8,6 +8,7 @@ from typing import Dict, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from etf_arbitrage.data.pcf import PCFDocument, SubstituteFlag
+from etf_arbitrage.domain import Exchange
 from etf_arbitrage.executable_config import DataQualityConfig
 
 from .models import DataQualityStatus, MarketSnapshot, OrderBook, TradingStatus
@@ -112,6 +113,33 @@ class DataQualityChecker:
             if book.trading_status == TradingStatus.LIMIT_DOWN and not book.bids:
                 limit_down += weight
             self._check_book(book, critical, component.stock_code)
+
+        if any(
+            component.instrument_id.exchange == Exchange.HKEX
+            for component in active
+        ):
+            fx_quote = snapshot.hkd_cny_quote
+            if fx_quote is None:
+                blockers.append("MISSING_HKD_CNY_QUOTE")
+            elif fx_quote.exchange_timestamp is None:
+                blockers.append("MISSING_HKD_CNY_TIMESTAMP")
+            else:
+                fx_age = self._age_ms(
+                    snapshot.snapshot_timestamp, fx_quote.exchange_timestamp
+                )
+                fx_skew = abs(
+                    (
+                        etf.exchange_timestamp - fx_quote.exchange_timestamp
+                    ).total_seconds()
+                ) * 1_000.0
+                max_age = max(max_age, fx_age)
+                max_skew = max(max_skew, fx_skew)
+                if fx_age > self.config.max_quote_age_ms:
+                    blockers.append("STALE_HKD_CNY_QUOTE")
+                if fx_skew > self.config.max_cross_section_skew_ms:
+                    blockers.append("HKD_CNY_TIME_SKEW")
+            if fx_quote is not None and fx_quote.receive_timestamp is None:
+                blockers.append("MISSING_HKD_CNY_RECEIVE_TIMESTAMP")
 
         if missing > self.config.maximum_missing_weight:
             blockers.append("MISSING_COMPONENT_QUOTES")

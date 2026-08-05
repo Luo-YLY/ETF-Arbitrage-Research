@@ -13,7 +13,14 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 import pandas as pd
 
-from .models import DataSourceHealth, MarketSnapshot, OrderBook, OrderBookLevel, TradingStatus
+from .models import (
+    DataSourceHealth,
+    FXQuote,
+    MarketSnapshot,
+    OrderBook,
+    OrderBookLevel,
+    TradingStatus,
+)
 from .source import MarketDataSource
 
 
@@ -101,11 +108,13 @@ class DynamicMarketDataLoader:
                 for row in group[~group["is_etf"].map(self._truthy)].itertuples(index=False)
             }
             first = etf_rows.iloc[0]
+            fx_quote = self._fx_quote(first, timestamp.to_pydatetime())
             snapshots.append(
                 MarketSnapshot(
                     snapshot_timestamp=timestamp.to_pydatetime(),
                     etf_order_book=etf_book,
                     component_order_books=components,
+                    fx_quotes={"HKD/CNY": fx_quote} if fx_quote else {},
                     official_iopv=self._optional(first.get("official_iopv")),
                     internal_iopv=self._optional(first.get("internal_iopv")),
                     source_mode="FILE_REPLAY",
@@ -114,6 +123,35 @@ class DynamicMarketDataLoader:
                 )
             )
         return snapshots, set()
+
+    @classmethod
+    def _fx_quote(cls, row, fallback_timestamp: datetime) -> Optional[FXQuote]:
+        bid = cls._optional(row.get("hkd_cny_bid"))
+        ask = cls._optional(row.get("hkd_cny_ask"))
+        if bid is None or ask is None:
+            return None
+        exchange_value = row.get("hkd_cny_exchange_timestamp")
+        receive_value = row.get("hkd_cny_receive_timestamp")
+        exchange_timestamp = pd.to_datetime(
+            exchange_value
+            if exchange_value is not None and not pd.isna(exchange_value)
+            else fallback_timestamp,
+            utc=True,
+        ).to_pydatetime()
+        receive_timestamp = pd.to_datetime(
+            receive_value
+            if receive_value is not None and not pd.isna(receive_value)
+            else fallback_timestamp,
+            utc=True,
+        ).to_pydatetime()
+        source_value = row.get("hkd_cny_source", "file")
+        return FXQuote(
+            bid=bid,
+            ask=ask,
+            exchange_timestamp=exchange_timestamp,
+            receive_timestamp=receive_timestamp,
+            source=str(source_value or "file"),
+        )
 
     @staticmethod
     def _resolve(pattern: str) -> List[Path]:

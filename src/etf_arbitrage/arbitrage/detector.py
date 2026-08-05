@@ -43,10 +43,13 @@ class ExecutableArbitrageDetector:
         count = cu_count or self.execution.cu_count
         if count <= 0:
             raise ValueError("cu_count must be positive")
-        internal_iopv = self.pricer.internal_iopv(snapshot.component_order_books)
+        fx_quote = snapshot.hkd_cny_quote
+        internal_iopv = self.pricer.internal_iopv(
+            snapshot.component_order_books, fx_quote
+        )
         quality = self.quality_checker.evaluate(snapshot, self.pcf, internal_iopv)
-        creation = self._creation(snapshot, count, quality.blockers)
-        redemption = self._redemption(snapshot, count, quality.blockers)
+        creation = self._creation(snapshot, count, quality.blockers, fx_quote)
+        redemption = self._redemption(snapshot, count, quality.blockers, fx_quote)
         unit_shares = self.pcf.creation_redemption_unit * count
         etf = snapshot.etf_order_book
         last = etf.last_price or etf.mid_price or float("nan")
@@ -129,12 +132,15 @@ class ExecutableArbitrageDetector:
             marginal_profits=tuple(marginal),
         )
 
-    def _creation(self, snapshot: MarketSnapshot, count: int, quality_blockers) -> DirectionEvaluation:
+    def _creation(
+        self, snapshot: MarketSnapshot, count: int, quality_blockers, fx_quote
+    ) -> DirectionEvaluation:
         basket = self.pricer.creation_cost(
             snapshot.component_order_books,
             count,
             self.execution.depth_haircut,
             self._slippage_bps(),
+            fx_quote,
         )
         quantity = self.pcf.creation_redemption_unit * count
         etf_sweep = sweep_depth(
@@ -179,12 +185,15 @@ class ExecutableArbitrageDetector:
             etf_sweep=etf_sweep,
         )
 
-    def _redemption(self, snapshot: MarketSnapshot, count: int, quality_blockers) -> DirectionEvaluation:
+    def _redemption(
+        self, snapshot: MarketSnapshot, count: int, quality_blockers, fx_quote
+    ) -> DirectionEvaluation:
         basket = self.pricer.redemption_proceeds(
             snapshot.component_order_books,
             count,
             self.execution.depth_haircut,
             self._slippage_bps(),
+            fx_quote,
         )
         quantity = self.pcf.creation_redemption_unit * count
         etf_sweep = sweep_depth(

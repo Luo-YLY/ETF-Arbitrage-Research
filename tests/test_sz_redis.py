@@ -1,11 +1,13 @@
 import json
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
 from etf_arbitrage.data import (
     ComponentWeight,
     ETFInfo,
+    PCFComponent,
+    PCFDocument,
     QuotationSchemaError,
     SZRedisDataFeed,
     SZRedisQuotationClient,
@@ -52,6 +54,46 @@ def records():
         "000001.SZ": {"code": "000001.SZ", "closepx": 1.0, **common},
         "300750.SZ": {"code": "300750.SZ", "closepx": 1.4, **common},
     }
+
+
+def cross_border_pcf() -> PCFDocument:
+    return PCFDocument(
+        version="1.0",
+        etf_code="159920",
+        security_id_source="102",
+        symbol="恒生ETF华夏",
+        fund_management_company="华夏基金",
+        underlying_index="HSI",
+        underlying_security_id_source="103",
+        creation_redemption_unit=1_000,
+        estimate_cash_component=100.0,
+        max_cash_ratio=1.0,
+        publish=True,
+        creation_allowed=True,
+        redemption_allowed=True,
+        record_num=1,
+        total_record_num=1,
+        trading_day=date(2026, 7, 20),
+        previous_trading_day=date(2026, 7, 17),
+        cash_component=90.0,
+        nav_per_creation_unit=1_000.0,
+        nav=1.0,
+        components=(
+            PCFComponent(
+                stock_code="00001",
+                security_id_source="103",
+                symbol="长和",
+                component_share=100.0,
+                substitute_flag=SubstituteFlag.ALLOWED,
+                premium_ratio=0.0,
+                creation_cash_substitute=0.0,
+                redemption_cash_substitute=0.0,
+                exchange="HKEX",
+            ),
+        ),
+        listing_exchange="SZSE",
+        file_hash="test-cross-border-pcf",
+    )
 
 
 def client():
@@ -228,3 +270,54 @@ def test_price_seed_rejects_missing_physical_component() -> None:
             pcf,
             trade_date="20260720",
         )
+
+
+def test_cross_border_price_seed_optionally_reads_two_sided_hkd_cny() -> None:
+    pcf = cross_border_pcf()
+    active = [
+        item
+        for item in pcf.components
+        if item.component_share > 0
+        and item.substitute_flag != SubstituteFlag.MANDATORY
+    ]
+    raw = {
+        "159920.SZ": {"code": "159920.SZ", "closepx": 1.50},
+        **{
+            item.stock_code + ".HK": {
+                "code": item.stock_code + ".HK",
+                "closepx": 10.0,
+            }
+            for item in active
+        },
+        "HKDCNY.FX": {
+            "code": "HKDCNY.FX",
+            "closepx": 0.865,
+            "bidpx1": 0.86,
+            "askpx1": 0.87,
+        },
+    }
+    quotation_client = SZRedisQuotationClient(
+        SZRedisSettings(host="example.invalid"),
+        redis_client=FakeRedis(raw),
+    )
+
+    seed = load_pcf_price_seed(
+        quotation_client,
+        pcf,
+        trade_date="20260720",
+        hkd_cny_code="HKDCNY.FX",
+    )
+
+    assert seed.component_count == len(active)
+    assert seed.hkd_cny_bid == pytest.approx(0.86)
+    assert seed.hkd_cny_ask == pytest.approx(0.87)
+    assert seed.hkd_cny_code == "HKDCNY.FX"
+
+    seed_without_fx = load_pcf_price_seed(
+        quotation_client,
+        pcf,
+        trade_date="20260720",
+    )
+    assert seed_without_fx.hkd_cny_bid is None
+    assert seed_without_fx.hkd_cny_ask is None
+    assert seed_without_fx.hkd_cny_code is None

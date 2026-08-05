@@ -13,9 +13,7 @@ import panel as pn
 
 from etf_arbitrage.data import PCFDocument, SubstituteFlag
 from etf_arbitrage.market_data import (
-    CrossBorderSnapshotInterface,
     CrossBorderSnapshotSourceMode,
-    PendingCrossBorderMarketDataSource,
     cross_border_hk_components,
     virtual_subscription_cash_component,
 )
@@ -70,8 +68,8 @@ class CrossBorderPanelDashboard:
             value=CrossBorderSnapshotSourceMode.REDIS,
         )
         self.snapshot_path = pn.widgets.TextInput(
-            label="标准化观察文件",
-            value="tmp/recorded/{trade_date}/{etf_code}_observations.jsonl",
+            label="原始最新价快照",
+            value="tmp/recordings/{trade_date}/{etf_code}.jsonl",
             disabled=True,
         )
         self.redis_contract = pn.widgets.TextInput(
@@ -172,7 +170,7 @@ class CrossBorderPanelDashboard:
 
     def market_interface_view(self):
         return pn.Column(
-            pn.pane.Markdown("## 境内ETF + 港股篮子 + HKD/CNY"),
+            pn.pane.Markdown("## 境内ETF与港股篮子最新价采集"),
             self.market_status,
             pn.Row(self.redis_contract, self.snapshot_path),
             self.contract_table,
@@ -182,9 +180,15 @@ class CrossBorderPanelDashboard:
     def research_view(self):
         return pn.Column(
             pn.pane.Markdown(
-                "## IOPV与折溢价研究口径\n\n"
-                "申购方向使用港股成分卖一与HKD/CNY卖价，和159920买一比较；"
-                "赎回方向使用港股成分买一与HKD/CNY买价，和159920卖一比较。"
+                "## 收盘后HKD/CNY回填\n\n"
+                "盘中原始快照不包含汇率，也不生成IOPV或Premium。收盘后将带时间戳的"
+                "HKD/CNY历史文件导入独立程序；程序只使用不晚于行情快照的最近汇率，"
+                "并把派生结果写入新文件，不覆盖盘中原始记录。\n\n"
+                "```powershell\n"
+                "python scripts/backfill_cross_border_fx.py `\n"
+                "  --pcf data/pcf/YYYYMMDD/pcf_159920_YYYYMMDD.xml `\n"
+                "  --fx-file data/reference/fx/hkd_cny_YYYYMMDD.csv\n"
+                "```"
             ),
             self.research_status,
             sizing_mode="stretch_width",
@@ -227,22 +231,22 @@ class CrossBorderPanelDashboard:
         )
         self.scope_status.object = _message_box(
             "主交易腿是深交所上市ETF，价值腿由官方PCF中的港股成分构成。"
-            "行情统一改由内网Redis提供；当前设备不再尝试公共第三方下载。",
+            "盘中内网Redis只采集最新价；PCF可在采集前联网下载，汇率在收盘后另行回填。",
             "info",
         )
         self.scope_table.value = pd.DataFrame(
             [
-                {"模块": "二级市场交易腿", "对象": "159920.SZ及同类ETF", "输入": "Redis Bid/Ask与成交"},
+                {"模块": "二级市场交易腿", "对象": "159920.SZ及同类ETF", "输入": "Redis最新价"},
                 {"模块": "一级市场规则", "对象": "深交所/基金管理人官方PCF", "输入": "申赎单位、现金替代与开放状态"},
-                {"模块": "境外价值腿", "对象": "PCF中的HKEX成分", "输入": "Redis港股Bid/Ask"},
-                {"模块": "汇率腿", "对象": "HKD/CNY", "输入": "内网行情或正式授权源"},
-                {"模块": "研究边界", "对象": "只识别/纸面模拟", "输入": "完整时钟与数据质量阻断"},
+                {"模块": "境外价值腿", "对象": "PCF中的HKEX成分", "输入": "Redis最新价"},
+                {"模块": "汇率腿", "对象": "HKD/CNY", "输入": "收盘后带时间戳文件"},
+                {"模块": "研究边界", "对象": "盘中仅行情监控", "输入": "不计算IOPV/Premium"},
             ]
         )
         self.roadmap_table.value = pd.DataFrame(
             [
-                {"阶段": "L1 当前", "范围": "159920 + 官方PCF + Redis最新价", "交付": "字段核验、连续记录、均值回复"},
-                {"阶段": "L2", "范围": "港股通资格 + 双边盘口 + HKD/CNY", "交付": "方向性IOPV与可交易覆盖率"},
+                {"阶段": "L1 当前", "范围": "159920 + 官方PCF + Redis最新价", "交付": "ETF与大写.HK成分连续记录"},
+                {"阶段": "L2", "范围": "收盘后分钟HKD/CNY", "交付": "回填模型IOPV与Premium研究序列"},
                 {"阶段": "L3", "范围": "沪深港通同类ETF", "交付": "横截面对比和统一成本模型"},
                 {"阶段": "L4", "范围": "QDII现金申赎状态机", "交付": "可执行性漏斗与纸面套利"},
             ]
@@ -307,40 +311,37 @@ class CrossBorderPanelDashboard:
         mode = self.snapshot_source_mode.value
         if not isinstance(mode, CrossBorderSnapshotSourceMode):
             mode = CrossBorderSnapshotSourceMode(str(mode))
-        interface = CrossBorderSnapshotInterface(etf_code=self.pcf_controls.etf_code)
-        source = PendingCrossBorderMarketDataSource(interface, mode)
-        health = source.health()
         redis_configured = bool(os.getenv("SZ_REDIS_HOST"))
         if mode == CrossBorderSnapshotSourceMode.REDIS:
             text = (
                 "Redis已设为唯一实时主路径。当前进程{}SZ_REDIS_HOST；"
-                "正式计算前还需在内网设备验证港股代码后缀、Bid/Ask、时间戳和HKD/CNY字段。"
+                "盘中只读取ETF与PCF成分的closepx和时间戳，不要求Bid/Ask或HKD/CNY。"
             ).format("已配置" if redis_configured else "未配置")
         else:
-            text = "JSONL只回放由内网Redis采集生成的标准化分钟观察，不负责联网下载。"
+            text = "JSONL只回放由内网Redis采集生成的原始最新价快照，不包含盘中估值。"
         self.market_status.object = _message_box(text, "warning")
         self.contract_table.value = pd.DataFrame(
             [
-                {"项目": "实时行情", "约定": "Redis Hash=YYYYMMDD", "状态": health.status},
-                {"项目": "境内ETF", "约定": "159920.SZ", "状态": "待内网字段核验"},
-                {"项目": "港股成分", "约定": "PCF代码 + .HK", "状态": "待内网字段核验"},
-                {"项目": "必要行情字段", "约定": "closepx / bidpx1 / askpx1 / cdate / ctime", "状态": "缺一则INDICATIVE"},
-                {"项目": "汇率", "约定": "HKD/CNY bid / ask / timestamp", "状态": "待确认Redis键"},
-                {"项目": "历史研究", "约定": interface.jsonl_path_template, "状态": "由Redis采集器生成"},
+                {"项目": "实时行情", "约定": "Redis Hash=YYYYMMDD", "状态": "LATEST_PRICE_ONLY"},
+                {"项目": "境内ETF", "约定": "159920.SZ", "状态": "采集最新价"},
+                {"项目": "港股成分", "约定": "PCF代码 + 大写.HK", "状态": "采集最新价"},
+                {"项目": "必要行情字段", "约定": "closepx / cdate / ctime", "状态": "不要求Bid/Ask"},
+                {"项目": "汇率", "约定": "收盘后按timestamp向后匹配", "状态": "PENDING_FX"},
+                {"项目": "原始记录", "约定": "tmp/recordings/YYYYMMDD/159920.jsonl", "状态": "只追加、不覆盖"},
             ]
         )
         self.research_status.object = _message_box(
-            "在ETF、全部港股成分、HKD/CNY和官方PCF完成同一时钟对齐前，"
-            "结果保持INDICATIVE；缺少完整双边盘口时不宣称可执行套利。",
+            "汇率回填输出属于收盘后模型重建。只有带时间戳的盘中历史汇率才能生成"
+            "分钟级模型IOPV；每日单点汇率只能标记为日度近似。",
             "warning",
         )
         self.audit_table.value = pd.DataFrame(
             [
                 {"数据/规则": "159920申购赎回清单", "来源": "深交所官方PCF", "状态": "已校验" if self.document else "待下载"},
-                {"数据/规则": "境内ETF最新价/盘口", "来源": "内网Redis", "状态": "主路径，待设备验证"},
-                {"数据/规则": "港股成分最新价/盘口", "来源": "内网Redis", "状态": "已确认有数据，待字段验收"},
-                {"数据/规则": "HKD/CNY", "来源": "内网Redis或正式授权源", "状态": "键与字段待确认"},
-                {"数据/规则": "历史观察", "来源": "Redis采集后的本地JSONL", "状态": "不再使用公共下载接口"},
+                {"数据/规则": "境内ETF最新价", "来源": "内网Redis", "状态": "盘中主路径"},
+                {"数据/规则": "港股成分最新价", "来源": "内网Redis", "状态": "大写.HK代码"},
+                {"数据/规则": "HKD/CNY", "来源": "收盘后导入文件", "状态": "不作为盘中启动条件"},
+                {"数据/规则": "原始行情", "来源": "Redis采集后的本地JSONL", "状态": "不含IOPV/Premium"},
                 {"数据/规则": "港股通资格", "来源": "交易所官方名单", "状态": "接口待接入"},
             ]
         )

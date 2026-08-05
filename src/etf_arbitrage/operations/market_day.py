@@ -56,6 +56,7 @@ class MarketMonitorJob:
     auto_restart: bool = True
     restart_delay: float = 5.0
     max_restart_delay: float = 60.0
+    capture_only: bool = False
 
     def validate(self) -> None:
         datetime.strptime(self.trade_date, "%Y%m%d")

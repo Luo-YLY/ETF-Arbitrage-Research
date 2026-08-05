@@ -16,6 +16,7 @@ from .file_replay import DynamicMarketDataLoader, FileReplayMarketDataSource, Lo
 from .models import (
     DataQualityStatus,
     DataSourceHealth,
+    FXQuote,
     MarketSnapshot,
     OrderBook,
     OrderBookLevel,
@@ -42,6 +43,7 @@ __all__ = [
     "DataSourceHealth",
     "DynamicMarketDataLoader",
     "FileReplayMarketDataSource",
+    "FXQuote",
     "LoadSummary",
     "MarketDataSource",
     "MarketSnapshot",

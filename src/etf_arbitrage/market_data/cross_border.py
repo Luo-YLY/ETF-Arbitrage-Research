@@ -14,7 +14,7 @@ from typing import Iterable, Optional, Tuple
 from etf_arbitrage.data.pcf import PCFComponent, PCFDocument, SubstituteFlag
 from etf_arbitrage.domain import Exchange, InstrumentId
 
-from .models import DataSourceHealth, MarketSnapshot
+from .models import DataSourceHealth, FXQuote, MarketSnapshot
 from .source import MarketDataSource
 
 
@@ -30,8 +30,10 @@ CROSS_BORDER_SNAPSHOT_REQUIRED_FIELDS = (
     "snapshot_timestamp",
     "etf_order_book (SZSE/SSE)",
     "component_order_books (HKEX)",
-    "hkd_cny_bid",
-    "hkd_cny_ask",
+    "fx_quotes.HKD/CNY.bid",
+    "fx_quotes.HKD/CNY.ask",
+    "fx_quotes.HKD/CNY.exchange_timestamp",
+    "fx_quotes.HKD/CNY.receive_timestamp",
     "official_iopv (optional)",
     "pcf_version",
     "data_quality_status",
@@ -58,21 +60,7 @@ class CrossBorderSnapshotInterface:
         return InstrumentId(self.etf_exchange, self.etf_code)
 
 
-@dataclass(frozen=True)
-class HKDCNYQuote:
-    """Directional HKD/CNY quote supplied by the intranet adapter."""
-
-    bid: float
-    ask: float
-    source: str = "INTRANET_REDIS"
-
-    def __post_init__(self) -> None:
-        if self.bid <= 0 or self.ask <= 0 or self.bid > self.ask:
-            raise ValueError("HKD/CNY bid and ask must be positive with bid <= ask")
-
-    @property
-    def mid(self) -> float:
-        return (self.bid + self.ask) / 2.0
+HKDCNYQuote = FXQuote
 
 
 @dataclass(frozen=True)
@@ -173,7 +161,7 @@ def is_virtual_subscription_cash(component: PCFComponent) -> bool:
 def calculate_cross_border_indicative_metrics(
     snapshot: MarketSnapshot,
     pcf: PCFDocument,
-    fx_quote: HKDCNYQuote,
+    fx_quote: Optional[FXQuote] = None,
 ) -> CrossBorderIndicativeMetrics:
     """Calculate conservative directional IOPV references in CNY.
 
@@ -181,6 +169,7 @@ def calculate_cross_border_indicative_metrics(
     settlement helper rather than a portfolio security.
     """
 
+    resolved_fx = fx_quote or snapshot.hkd_cny_quote
     components = cross_border_hk_components(pcf)
     total = len(components) or 1
     creation_value_cny = pcf.estimate_cash_component
@@ -189,14 +178,22 @@ def calculate_cross_border_indicative_metrics(
     bid_count = 0
     for component in components:
         book = snapshot.component_order_books.get(component.stock_code)
-        if book is not None and book.best_ask is not None:
+        if (
+            resolved_fx is not None
+            and book is not None
+            and book.best_ask is not None
+        ):
             creation_value_cny += (
-                component.component_share * book.best_ask * fx_quote.ask
+                component.component_share * book.best_ask * resolved_fx.ask
             )
             ask_count += 1
-        if book is not None and book.best_bid is not None:
+        if (
+            resolved_fx is not None
+            and book is not None
+            and book.best_bid is not None
+        ):
             redemption_value_cny += (
-                component.component_share * book.best_bid * fx_quote.bid
+                component.component_share * book.best_bid * resolved_fx.bid
             )
             bid_count += 1
 
@@ -244,6 +241,8 @@ def calculate_cross_border_indicative_metrics(
         else None
     )
     blockers = list(snapshot.assembly_blockers)
+    if resolved_fx is None:
+        blockers.append("MISSING_HKD_CNY_QUOTE")
     if ask_count < len(components):
         blockers.append("INCOMPLETE_COMPONENT_ASK_COVERAGE")
     if bid_count < len(components):
@@ -262,8 +261,8 @@ def calculate_cross_border_indicative_metrics(
         etf_ask_cny=etf_ask,
         creation_reference_basis_bps=creation_basis,
         redemption_reference_basis_bps=redemption_basis,
-        hkd_cny_bid=fx_quote.bid,
-        hkd_cny_ask=fx_quote.ask,
+        hkd_cny_bid=resolved_fx.bid if resolved_fx is not None else None,
+        hkd_cny_ask=resolved_fx.ask if resolved_fx is not None else None,
         component_ask_coverage=ask_coverage,
         component_bid_coverage=bid_coverage,
         blockers=tuple(dict.fromkeys(blockers)),

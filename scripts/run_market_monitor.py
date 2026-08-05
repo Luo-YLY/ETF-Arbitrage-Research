@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,9 +41,10 @@ class Tracker:
     feed: SZRedisDataFeed
     store: JsonlSnapshotStore
     observation_path: Path
-    research: ResearchReplay
+    research: Optional[ResearchReplay]
     info: Any
     weights: Any
+    expected_component_count: int
     stored_count: int = 0
 
 
@@ -66,6 +67,7 @@ def load_job(path: Path) -> MarketMonitorJob:
         auto_restart=bool(payload.get("auto_restart", True)),
         restart_delay=float(payload.get("restart_delay", 5.0)),
         max_restart_delay=float(payload.get("max_restart_delay", 60.0)),
+        capture_only=bool(payload.get("capture_only", False)),
     )
     job.validate()
     return job
@@ -103,9 +105,18 @@ def build_trackers(job: MarketMonitorJob, client: SZRedisQuotationClient) -> lis
                 observation_path=(
                     ROOT / "tmp" / "observations" / job.trade_date / "{}.jsonl".format(code)
                 ),
-                research=ResearchReplay(feed, calculator=PCFIOPVCalculator(pcf)),
+                research=(
+                    None
+                    if job.capture_only
+                    else ResearchReplay(feed, calculator=PCFIOPVCalculator(pcf))
+                ),
                 info=info,
                 weights=weights,
+                expected_component_count=sum(
+                    1
+                    for item in pcf.components
+                    if item.component_share > 0
+                ),
             )
         )
     return trackers
@@ -212,30 +223,52 @@ def run_collection(
                         "timestamp": snapshot.timestamp.isoformat(),
                     }
                     continue
-                row = tracker.research.process_snapshot(
-                    snapshot, tracker.info, tracker.weights
-                )
-                append_observation(tracker.observation_path, row)
                 tracker.stored_count += 1
-                latest[tracker.etf_code] = {
-                    "status": "stored",
-                    "timestamp": snapshot.timestamp.isoformat(),
-                    "price": row["etf_price"],
-                    "iopv": row["iopv"],
-                    "premium": row["premium"],
-                    "valuation_quality": row["valuation_quality"],
-                }
+                if job.capture_only:
+                    latest[tracker.etf_code] = {
+                        "status": "stored",
+                        "timestamp": snapshot.timestamp.isoformat(),
+                        "price": snapshot.etf_quote.last_price,
+                        "component_quotes": len(snapshot.stock_quotes),
+                        "expected_components": tracker.expected_component_count,
+                        "valuation_status": "PENDING_FX",
+                    }
+                    print(
+                        "{} {} price={:.4f} components={}/{} raw_snapshot=stored "
+                        "valuation=PENDING_FX".format(
+                            snapshot.timestamp,
+                            tracker.etf_code,
+                            snapshot.etf_quote.last_price,
+                            len(snapshot.stock_quotes),
+                            tracker.expected_component_count,
+                        ),
+                        flush=True,
+                    )
+                else:
+                    assert tracker.research is not None
+                    row = tracker.research.process_snapshot(
+                        snapshot, tracker.info, tracker.weights
+                    )
+                    append_observation(tracker.observation_path, row)
+                    latest[tracker.etf_code] = {
+                        "status": "stored",
+                        "timestamp": snapshot.timestamp.isoformat(),
+                        "price": row["etf_price"],
+                        "iopv": row["iopv"],
+                        "premium": row["premium"],
+                        "valuation_quality": row["valuation_quality"],
+                    }
+                    print(
+                        "{} {} price={:.4f} iopv={:.4f} premium={:.4%}".format(
+                            snapshot.timestamp,
+                            tracker.etf_code,
+                            row["etf_price"],
+                            row["iopv"],
+                            row["premium"],
+                        ),
+                        flush=True,
+                    )
                 errors.pop(tracker.etf_code, None)
-                print(
-                    "{} {} price={:.4f} iopv={:.4f} premium={:.4%}".format(
-                        snapshot.timestamp,
-                        tracker.etf_code,
-                        row["etf_price"],
-                        row["iopv"],
-                        row["premium"],
-                    ),
-                    flush=True,
-                )
             except Exception as exc:
                 errors[tracker.etf_code] = "{}: {}".format(type(exc).__name__, exc)
                 latest[tracker.etf_code] = {

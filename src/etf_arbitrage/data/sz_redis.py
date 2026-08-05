@@ -207,6 +207,9 @@ class SZRedisPriceSeed:
     etf_code: str
     etf_price: float
     component_prices: Mapping[str, float]
+    hkd_cny_bid: Optional[float] = None
+    hkd_cny_ask: Optional[float] = None
+    hkd_cny_code: Optional[str] = None
 
     @property
     def component_count(self) -> int:
@@ -219,6 +222,7 @@ def load_pcf_price_seed(
     trade_date: Optional[Any] = None,
     redis_code_suffix: str = ".SZ",
     field_map: SZRedisFieldMap = SZRedisFieldMap(),
+    hkd_cny_code: Optional[str] = None,
 ) -> SZRedisPriceSeed:
     """Load positive latest prices for the ETF and all physical PCF components."""
     active_components = [
@@ -242,7 +246,14 @@ def load_pcf_price_seed(
         item.stock_code: redis_code(item.instrument_id)
         for item in active_components
     }
+    requires_hkd_cny = any(
+        item.instrument_id.exchange == Exchange.HKEX
+        for item in active_components
+    )
+    resolved_hkd_cny_code = str(hkd_cny_code or "").strip()
     requested = [etf_redis_code, *component_redis_codes.values()]
+    if resolved_hkd_cny_code:
+        requested.append(resolved_hkd_cny_code)
     resolved_trade_date = trade_date or pcf.trading_day
     frame = client.get_security_records(requested, resolved_trade_date)
     if frame.empty:
@@ -279,11 +290,31 @@ def load_pcf_price_seed(
         raise QuotationSchemaError(
             "Redis行情缺少PCF实物成分股：{}".format(preview)
         )
+    hkd_cny_bid = hkd_cny_ask = None
+    if requires_hkd_cny and resolved_hkd_cny_code:
+        if resolved_hkd_cny_code not in frame.index:
+            raise QuotationSchemaError(
+                "Redis行情缺少HKD/CNY：{}".format(resolved_hkd_cny_code)
+            )
+        if not field_map.bid_price or not field_map.ask_price:
+            raise QuotationSchemaError("HKD/CNY需要买一和卖一字段映射")
+        fx_row = frame.loc[resolved_hkd_cny_code]
+        hkd_cny_bid = _positive_price(
+            fx_row, field_map.bid_price, resolved_hkd_cny_code
+        )
+        hkd_cny_ask = _positive_price(
+            fx_row, field_map.ask_price, resolved_hkd_cny_code
+        )
+        if hkd_cny_bid > hkd_cny_ask:
+            raise QuotationSchemaError("HKD/CNY买价不能高于卖价")
     return SZRedisPriceSeed(
         trade_date=SZRedisQuotationClient._trade_date_key(resolved_trade_date),
         etf_code=pcf.etf_code,
         etf_price=etf_price,
         component_prices=component_prices,
+        hkd_cny_bid=hkd_cny_bid,
+        hkd_cny_ask=hkd_cny_ask,
+        hkd_cny_code=resolved_hkd_cny_code or None,
     )
 
 

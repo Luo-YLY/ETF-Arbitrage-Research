@@ -79,6 +79,10 @@ class SimulationConfig:
     price_seed_mode: SimulationPriceSeedMode = SimulationPriceSeedMode.AUTO_LOCAL
     local_recording_path: str = ""
     redis_code_suffix: str = ".SZ"
+    redis_hkd_cny_code: str = ""
+    hkd_cny_mid: float = 0.92
+    hkd_cny_spread_bps: float = 2.0
+    hkd_cny_volatility: float = 0.0
     tick_interval_ms: int = 1_000
     total_ticks: int = 300
     simulation_speed: float = 1.0

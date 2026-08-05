@@ -216,6 +216,49 @@ def test_file_replay_never_returns_future_snapshot():
     assert source.snapshot_at_or_after(decision_time).etf_order_book.last_price == 1.1
 
 
+def test_file_replay_carries_hkd_cny_inside_each_snapshot():
+    timestamp = "2026-08-04T02:00:00Z"
+    frame = pd.DataFrame(
+        [
+            {
+                "timestamp": timestamp,
+                "symbol": "159920",
+                "is_etf": True,
+                "exchange": "SZSE",
+                "last_price": 1.0,
+                "bid1_price": 0.999,
+                "bid1_quantity": 1_000,
+                "ask1_price": 1.001,
+                "ask1_quantity": 1_000,
+                "hkd_cny_bid": 0.86,
+                "hkd_cny_ask": 0.87,
+                "hkd_cny_exchange_timestamp": timestamp,
+                "hkd_cny_receive_timestamp": timestamp,
+                "hkd_cny_source": "INTRANET_REDIS",
+            },
+            {
+                "timestamp": timestamp,
+                "symbol": "00001",
+                "is_etf": False,
+                "exchange": "HKEX",
+                "last_price": 10.05,
+                "bid1_price": 10.0,
+                "bid1_quantity": 1_000,
+                "ask1_price": 10.1,
+                "ask1_quantity": 1_000,
+            },
+        ]
+    )
+
+    snapshots, _ = DynamicMarketDataLoader().from_frame(frame)
+
+    assert len(snapshots) == 1
+    assert snapshots[0].hkd_cny_quote is not None
+    assert snapshots[0].hkd_cny_quote.bid == pytest.approx(0.86)
+    assert snapshots[0].hkd_cny_quote.ask == pytest.approx(0.87)
+    assert snapshots[0].hkd_cny_quote.source == "INTRANET_REDIS"
+
+
 def test_redis_disabled_does_not_import_or_connect():
     source = RedisMarketDataSource(RedisConfig(enabled=False), "159915")
     source.connect()
