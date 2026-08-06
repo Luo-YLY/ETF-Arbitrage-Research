@@ -6,7 +6,12 @@ from uuid import uuid4
 import pytest
 
 from etf_arbitrage.arbitrage import ExecutableArbitrageDetector
-from etf_arbitrage.data import PCFComponent, PCFDocument, SubstituteFlag
+from etf_arbitrage.data import (
+    ETF_PROFILES,
+    PCFComponent,
+    PCFDocument,
+    SubstituteFlag,
+)
 from etf_arbitrage.dashboard_panel import (
     CrossBorderPanelConsoleDashboard,
     CrossBorderPanelDashboard,
@@ -264,6 +269,11 @@ def test_cross_border_console_uses_latest_price_capture_without_live_iopv() -> N
         assert dashboard.mean_page.monitor_etfs.value == ["159920"]
         assert dashboard.mean_page.pcf is dashboard.research_page.pcf_controls
         assert dashboard.mean_page.latest_quotes_table is not None
+        assert {"513660", "513600"}.issubset(
+            set(dashboard.mean_page.monitor_etfs.options)
+        )
+        assert ETF_PROFILES["513660"].exchange.value == "SSE"
+        assert ETF_PROFILES["513600"].exchange.value == "SSE"
     finally:
         dashboard.mean_page.stop_runtime()
         shutil.rmtree(root, ignore_errors=True)

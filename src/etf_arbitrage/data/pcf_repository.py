@@ -52,6 +52,20 @@ ETF_PROFILES: Mapping[str, ETFProfile] = {
         "000016 上证50",
         Exchange.SSE,
     ),
+    "513660": ETFProfile(
+        "513660",
+        "恒生ETF",
+        "华夏基金",
+        "恒生指数（估值汇率调整）",
+        Exchange.SSE,
+    ),
+    "513600": ETFProfile(
+        "513600",
+        "恒生指数ETF",
+        "南方基金",
+        "恒生指数（估值汇率调整）",
+        Exchange.SSE,
+    ),
 }
 
 SZSE_ETFS: Mapping[str, ETFProfile] = {
