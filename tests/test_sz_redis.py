@@ -44,8 +44,8 @@ class FakeRedis:
 def records():
     common = {
         "timestamp": "2026-07-20 10:30:00",
-        "bidpx1": 1.204,
-        "askpx1": 1.206,
+        "bidPrice1": 1.204,
+        "offerPrice1": 1.206,
         "volume": 2_000_000,
         "amount": 20_000_000,
     }
@@ -139,7 +139,7 @@ def test_maps_redis_snapshot_to_common_data_feed() -> None:
 
 def test_rejects_snapshot_without_executable_etf_quote_fields() -> None:
     broken_records = records()
-    del broken_records["159915.SZ"]["bidpx1"]
+    del broken_records["159915.SZ"]["bidPrice1"]
     quotation_client = SZRedisQuotationClient(
         SZRedisSettings(host="example.invalid"),
         redis_client=FakeRedis(broken_records),
@@ -152,8 +152,31 @@ def test_rejects_snapshot_without_executable_etf_quote_fields() -> None:
         trade_date="20260720",
     )
 
-    with pytest.raises(QuotationSchemaError, match="bidpx1"):
+    with pytest.raises(QuotationSchemaError, match="bidPrice1"):
         list(feed.snapshots("159915"))
+
+
+def test_keeps_legacy_level_one_field_aliases() -> None:
+    raw = records()
+    for record in raw.values():
+        record["bidpx1"] = record.pop("bidPrice1")
+        record["askpx1"] = record.pop("offerPrice1")
+    quotation_client = SZRedisQuotationClient(
+        SZRedisSettings(host="example.invalid"),
+        redis_client=FakeRedis(raw),
+    )
+    info = ETFInfo("159915", "创业板ETF", "SZSE", "创业板指", 1, 1)
+    feed = SZRedisDataFeed(
+        quotation_client,
+        info,
+        [ComponentWeight("159915", "000001", 1.0)],
+        trade_date="20260720",
+    )
+
+    snapshot = list(feed.snapshots("159915"))[0]
+
+    assert snapshot.etf_quote.bid_price == pytest.approx(1.204)
+    assert snapshot.etf_quote.ask_price == pytest.approx(1.206)
 
 
 def test_maps_real_last_price_fields_in_indicative_mode() -> None:

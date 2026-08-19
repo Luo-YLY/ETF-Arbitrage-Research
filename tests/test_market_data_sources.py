@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,14 +10,24 @@ from etf_arbitrage.data import (
     ETFQuote,
     JsonlSnapshotStore,
     MarketSnapshot as RecordedMarketSnapshot,
+    PCFComponent,
+    PCFDocument,
     SZSEPCFParser,
     StockQuote,
     SubstituteFlag,
 )
-from etf_arbitrage.executable_config import RedisConfig, SimulationConfig, SimulationScenario
+from etf_arbitrage.executable_config import (
+    PaperArbitrageConfig,
+    RedisConfig,
+    RedisSnapshotFormat,
+    SimulationConfig,
+    SimulationScenario,
+)
 from etf_arbitrage.market_data import (
+    DataQualityChecker,
     DynamicMarketDataLoader,
     FileReplayMarketDataSource,
+    NoNewSnapshotError,
     RecordedHistoryMarketDataSource,
     RedisMarketDataSource,
     SimulatedMarketDataSource,
@@ -264,3 +275,234 @@ def test_redis_disabled_does_not_import_or_connect():
     source.connect()
     assert source.health().status == "DISABLED"
     assert not source.health().connected
+
+
+def test_paper_config_redacts_redis_password_from_exports():
+    config = PaperArbitrageConfig(
+        redis=RedisConfig(password="do-not-export")
+    )
+
+    assert config.to_dict()["redis"]["password"] == "***"
+    assert (
+        config.to_dict(include_secrets=True)["redis"]["password"]
+        == "do-not-export"
+    )
+
+
+class RawHashRedis:
+    def __init__(self, records):
+        self.records = {
+            code: json.dumps(record, ensure_ascii=False)
+            for code, record in records.items()
+        }
+
+    def ping(self):
+        return True
+
+    def hmget(self, key, codes):
+        assert key == "20260720"
+        return [self.records.get(code) for code in codes]
+
+    def close(self):
+        return None
+
+
+def _raw_book(code: str, market: str, middle: float) -> dict:
+    record = {
+        "code": code,
+        "market": market,
+        "status": "E0",
+        "cdate": "20260720",
+        "ctime": "103000",
+        "closepx": middle,
+    }
+    for level in range(1, 6):
+        record["bidPrice{}".format(level)] = middle - level * 0.001
+        record["bidVolume{}".format(level)] = 100_000 * level
+        record["offerPrice{}".format(level)] = middle + level * 0.001
+        record["offerVolume{}".format(level)] = 120_000 * level
+    return record
+
+
+def _small_pcf(exchange: str = "SZSE") -> PCFDocument:
+    if exchange == "HKEX":
+        etf_code = "159920"
+        etf_source = "102"
+        listing_exchange = "SZSE"
+        component_source = "103"
+        component_code = "00001"
+    elif exchange == "SSE":
+        etf_code = "510300"
+        etf_source = "101"
+        listing_exchange = "SSE"
+        component_source = "101"
+        component_code = "600000"
+    else:
+        etf_code = "159915"
+        etf_source = "102"
+        listing_exchange = "SZSE"
+        component_source = "102"
+        component_code = "000001"
+    return PCFDocument(
+        version="1.0",
+        etf_code=etf_code,
+        security_id_source=etf_source,
+        symbol="test",
+        fund_management_company="test",
+        underlying_index="test",
+        underlying_security_id_source=component_source,
+        creation_redemption_unit=1_000,
+        estimate_cash_component=0.0,
+        max_cash_ratio=1.0,
+        publish=True,
+        creation_allowed=True,
+        redemption_allowed=True,
+        record_num=1,
+        total_record_num=1,
+        trading_day=datetime(2026, 7, 20).date(),
+        previous_trading_day=datetime(2026, 7, 17).date(),
+        cash_component=0.0,
+        nav_per_creation_unit=1_000.0,
+        nav=1.0,
+        components=(
+            PCFComponent(
+                stock_code=component_code,
+                security_id_source=component_source,
+                symbol="component",
+                component_share=100.0,
+                substitute_flag=SubstituteFlag.ALLOWED,
+                premium_ratio=0.0,
+                creation_cash_substitute=0.0,
+                redemption_cash_substitute=0.0,
+                exchange=exchange,
+            ),
+        ),
+        listing_exchange=listing_exchange,
+        file_hash="raw-five-level-test",
+    )
+
+
+def test_raw_date_hash_maps_five_levels_records_and_deduplicates():
+    pcf = _small_pcf()
+    path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    records = {
+        "159915.SZ": _raw_book("159915.SZ", "SZ", 1.205),
+        "000001.SZ": _raw_book("000001.SZ", "SZ", 10.0),
+    }
+    source = RedisMarketDataSource(
+        RedisConfig(
+            enabled=True,
+            snapshot_format=RedisSnapshotFormat.DATE_HASH,
+            trade_date_key="20260720",
+            number_of_book_levels=5,
+            recording_path=str(path),
+        ),
+        "159915",
+        pcf,
+        redis_client=RawHashRedis(records),
+        clock=lambda: datetime(2026, 7, 20, 10, 30, 0, 200_000),
+    )
+    try:
+        snapshot = source.step()
+
+        assert snapshot.source_mode == "REDIS_DATE_HASH"
+        assert len(snapshot.etf_order_book.bids) == 5
+        assert len(snapshot.etf_order_book.asks) == 5
+        assert snapshot.etf_order_book.best_bid == pytest.approx(1.204)
+        assert snapshot.etf_order_book.bids[0].quantity == pytest.approx(100_000)
+        assert len(snapshot.component_order_books["000001"].asks) == 5
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["etf_order_book"]["bids"][0][0] == pytest.approx(1.204)
+        assert payload["etf_order_book"]["bids"][0][1] == pytest.approx(100_000)
+        assert "bidPrice5" in payload["raw_records"]["159915.SZ"]
+        with pytest.raises(NoNewSnapshotError):
+            source.step()
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+    finally:
+        source.disconnect()
+        path.unlink(missing_ok=True)
+
+
+def test_raw_cross_border_hash_can_carry_hkd_cny_quote():
+    pcf = _small_pcf("HKEX")
+    records = {
+        "159920.SZ": _raw_book("159920.SZ", "SZ", 1.5),
+        "00001.HK": _raw_book("00001.HK", "HK", 10.0),
+        "HKDCNY.FX": _raw_book("HKDCNY.FX", "FX", 0.865),
+    }
+    source = RedisMarketDataSource(
+        RedisConfig(
+            enabled=True,
+            snapshot_format=RedisSnapshotFormat.DATE_HASH,
+            trade_date_key="20260720",
+            hkd_cny_code="HKDCNY.FX",
+        ),
+        "159920",
+        pcf,
+        redis_client=RawHashRedis(records),
+        clock=lambda: datetime(2026, 7, 20, 10, 30, 0, 200_000),
+    )
+
+    snapshot = source.step()
+
+    assert snapshot.hkd_cny_quote is not None
+    assert snapshot.hkd_cny_quote.bid == pytest.approx(0.864)
+    assert snapshot.hkd_cny_quote.ask == pytest.approx(0.866)
+    assert snapshot.component_order_books["00001"].exchange == "HKEX"
+
+
+def test_raw_component_without_two_sided_depth_is_counted_as_missing():
+    pcf = _small_pcf()
+    component = _raw_book("000001.SZ", "SZ", 10.0)
+    for level in range(1, 6):
+        component.pop("offerPrice{}".format(level))
+        component.pop("offerVolume{}".format(level))
+    source = RedisMarketDataSource(
+        RedisConfig(
+            enabled=True,
+            snapshot_format=RedisSnapshotFormat.DATE_HASH,
+            trade_date_key="20260720",
+        ),
+        "159915",
+        pcf,
+        redis_client=RawHashRedis(
+            {
+                "159915.SZ": _raw_book("159915.SZ", "SZ", 1.205),
+                "000001.SZ": component,
+            }
+        ),
+        clock=lambda: datetime(2026, 7, 20, 10, 30, 0, 200_000),
+    )
+
+    report = DataQualityChecker().evaluate(source.step(), pcf)
+
+    assert report.missing_weight == pytest.approx(1.0)
+    assert "MISSING_COMPONENT_QUOTES" in report.blockers
+    assert "MISSING_COMPONENT_TWO_SIDED_BOOK" in report.blockers
+
+
+def test_raw_date_hash_maps_sse_etf_and_component_vendor_symbols():
+    pcf = _small_pcf("SSE")
+    source = RedisMarketDataSource(
+        RedisConfig(
+            enabled=True,
+            snapshot_format=RedisSnapshotFormat.DATE_HASH,
+            trade_date_key="20260720",
+        ),
+        "510300",
+        pcf,
+        redis_client=RawHashRedis(
+            {
+                "510300.SH": _raw_book("510300.SH", "SH", 4.2),
+                "600000.SH": _raw_book("600000.SH", "SH", 10.0),
+            }
+        ),
+        clock=lambda: datetime(2026, 7, 20, 10, 30, 0, 200_000),
+    )
+
+    snapshot = source.step()
+
+    assert snapshot.etf_order_book.exchange == "SSE"
+    assert snapshot.etf_order_book.symbol == "510300"
+    assert snapshot.component_order_books["600000"].exchange == "SSE"
+    assert snapshot.component_order_books["600000"].has_two_sided_book

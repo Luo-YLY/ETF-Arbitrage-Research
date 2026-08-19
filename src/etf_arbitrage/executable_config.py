@@ -13,6 +13,11 @@ class DataSourceMode(str, Enum):
     REDIS = "REDIS"
 
 
+class RedisSnapshotFormat(str, Enum):
+    NORMALIZED_JSON = "NORMALIZED_JSON"
+    DATE_HASH = "DATE_HASH"
+
+
 class SimulationScenario(str, Enum):
     NORMAL = "NORMAL"
     PREMIUM_SHOCK = "PREMIUM_SHOCK"
@@ -67,6 +72,12 @@ class RedisConfig:
     port: int = 6379
     db: int = 0
     password: str | None = None
+    snapshot_format: RedisSnapshotFormat = RedisSnapshotFormat.NORMALIZED_JSON
+    trade_date_key: str = ""
+    hkd_cny_code: str = ""
+    number_of_book_levels: int = 5
+    poll_interval_ms: int = 3_000
+    recording_path: str = ""
     key_prefix: str = "etf_arbitrage"
     channel_pattern: str = "market:*"
     socket_timeout_seconds: float = 2.0
@@ -185,7 +196,7 @@ class PaperArbitrageConfig:
     primary_market: PrimaryMarketConfig = field(default_factory=PrimaryMarketConfig)
     save_run_data: bool = True
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
         def convert(value: Any) -> Any:
             if isinstance(value, Enum):
                 return value.value
@@ -195,4 +206,7 @@ class PaperArbitrageConfig:
                 return [convert(item) for item in value]
             return value
 
-        return convert(asdict(self))
+        payload = convert(asdict(self))
+        if not include_secrets and payload["redis"].get("password"):
+            payload["redis"]["password"] = "***"
+        return payload

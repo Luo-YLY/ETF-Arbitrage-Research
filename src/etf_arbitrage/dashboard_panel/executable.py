@@ -44,6 +44,7 @@ from etf_arbitrage.executable_config import (
     PaperArbitrageConfig,
     PrimaryMarketConfig,
     RedisConfig,
+    RedisSnapshotFormat,
     SimulationConfig,
     SimulationPriceSeedMode,
     SimulationScenario,
@@ -52,6 +53,7 @@ from etf_arbitrage.market_data import (
     DynamicMarketDataLoader,
     FileReplayMarketDataSource,
     MarketDataSource,
+    NoNewSnapshotError,
     RecordedHistoryMarketDataSource,
     RedisMarketDataSource,
     SimulatedMarketDataSource,
@@ -196,7 +198,7 @@ class PanelExecutableDashboard:
             options={
                 "模拟行情（本地/合成）": DataSourceMode.SIMULATED,
                 "上传/读取历史行情": DataSourceMode.FILE_REPLAY,
-                "标准化Redis实时行情": DataSourceMode.REDIS,
+                "Redis实时行情（原始/标准化）": DataSourceMode.REDIS,
             },
             value=DataSourceMode.SIMULATED,
         )
@@ -351,10 +353,42 @@ class PanelExecutableDashboard:
             label="启用Redis",
             value=False,
         )
-        self.redis_host = pn.widgets.TextInput(label="Host", value="localhost")
-        self.redis_port = _int_input("Port", 6379, 1, 65535, 1)
-        self.redis_db = _int_input("DB", 0, 0, 100, 1)
+        self.redis_snapshot_format = pn.widgets.Select(
+            label="Redis快照格式",
+            options={
+                "沪深交易日Hash原始五档": RedisSnapshotFormat.DATE_HASH,
+                "标准化JSON快照": RedisSnapshotFormat.NORMALIZED_JSON,
+            },
+            value=RedisSnapshotFormat.DATE_HASH,
+        )
+        self.redis_host = pn.widgets.TextInput(
+            label="Host",
+            value=os.getenv("SZ_REDIS_HOST", "localhost"),
+        )
+        self.redis_port = _int_input(
+            "Port", int(os.getenv("SZ_REDIS_PORT", "6379")), 1, 65535, 1
+        )
+        self.redis_db = _int_input(
+            "DB", int(os.getenv("SZ_REDIS_DB", "0")), 0, 100, 1
+        )
         self.redis_password = pn.widgets.PasswordInput(label="Password")
+        self.redis_live_hkd_cny_code = pn.widgets.TextInput(
+            label="Redis HKD/CNY代码（跨境可选）",
+            value=os.getenv("SZ_REDIS_HKD_CNY_CODE", ""),
+            placeholder="缺失时跨境可执行性会被质量门禁阻断",
+        )
+        self.redis_poll_interval = _int_input(
+            "采集间隔（毫秒）", 3_000, 250, 60_000, 250
+        )
+        self.redis_record_snapshots = pn.widgets.Toggle(
+            label="自动记录完整五档快照",
+            value=True,
+        )
+        self.redis_recording_path = pn.widgets.TextInput(
+            label="五档快照文件（可选）",
+            value="",
+            placeholder="留空自动写入 tmp/executable_recordings/交易日/ETF.jsonl",
+        )
         self.redis_key_prefix = pn.widgets.TextInput(
             label="Key prefix",
             value="etf_arbitrage",
@@ -633,6 +667,14 @@ class PanelExecutableDashboard:
     def _wire_events(self) -> None:
         self.source_mode.param.watch(self._source_mode_changed, "value")
         self.price_seed_mode.param.watch(self._price_seed_mode_changed, "value")
+        self.redis_snapshot_format.param.watch(
+            self._redis_format_changed,
+            "value",
+        )
+        self.redis_record_snapshots.param.watch(
+            self._redis_format_changed,
+            "value",
+        )
         self.load_market_button.on_click(self._load_market_data)
         self.apply_button.on_click(self._apply_config)
         self.start_button.on_click(self._start)
@@ -763,14 +805,19 @@ class PanelExecutableDashboard:
         self.file_controls = file_controls
         redis_controls = pn.Column(
             self.redis_enabled,
+            self.redis_snapshot_format,
             pn.Row(self.redis_host, self.redis_port, self.redis_db),
             self.redis_password,
+            self.redis_live_hkd_cny_code,
+            pn.Row(self.redis_poll_interval, self.redis_record_snapshots),
+            self.redis_recording_path,
             pn.Row(self.redis_key_prefix, self.redis_channel_pattern),
             self.redis_timeout,
             sizing_mode="stretch_width",
         )
         self.redis_controls = redis_controls
         self._source_mode_changed(None)
+        self._redis_format_changed(None)
 
         execution_controls = pn.Column(
             pn.Row(self.direction, self.execution_mode, self.execution_scenario),
@@ -912,6 +959,17 @@ class PanelExecutableDashboard:
         )
 
     def _build_config(self) -> PaperArbitrageConfig:
+        recording_path = self.redis_recording_path.value.strip()
+        if self.redis_record_snapshots.value and not recording_path:
+            recording_path = str(
+                self.project_root
+                / "tmp"
+                / "executable_recordings"
+                / self.pcf.trading_date.strftime("%Y%m%d")
+                / "{}.jsonl".format(self.pcf.etf_code)
+            )
+        if not self.redis_record_snapshots.value:
+            recording_path = ""
         return PaperArbitrageConfig(
             etf_code=self.pcf.etf_code,
             data_source=self.source_mode.value,
@@ -920,7 +978,17 @@ class PanelExecutableDashboard:
                 host=self.redis_host.value.strip() or "localhost",
                 port=int(self.redis_port.value),
                 db=int(self.redis_db.value),
-                password=self.redis_password.value or None,
+                password=(
+                    self.redis_password.value
+                    or os.getenv("SZ_REDIS_PASSWORD")
+                    or None
+                ),
+                snapshot_format=self.redis_snapshot_format.value,
+                trade_date_key=self.pcf.trading_date.strftime("%Y%m%d"),
+                hkd_cny_code=self.redis_live_hkd_cny_code.value.strip(),
+                number_of_book_levels=5,
+                poll_interval_ms=int(self.redis_poll_interval.value),
+                recording_path=recording_path,
                 key_prefix=self.redis_key_prefix.value.strip() or "etf_arbitrage",
                 channel_pattern=self.redis_channel_pattern.value.strip() or "market:*",
                 socket_timeout_seconds=float(self.redis_timeout.value),
@@ -1034,9 +1102,17 @@ class PanelExecutableDashboard:
             _cross_border_proxy_pcf(pcf) if self.cross_border else pcf
         )
         config = self._build_config()
-        signature = json.dumps(config.to_dict(), sort_keys=True, ensure_ascii=True)
+        signature = json.dumps(
+            config.to_dict(include_secrets=True),
+            sort_keys=True,
+            ensure_ascii=True,
+        )
         current_signature = (
-            json.dumps(self.config.to_dict(), sort_keys=True, ensure_ascii=True)
+            json.dumps(
+                self.config.to_dict(include_secrets=True),
+                sort_keys=True,
+                ensure_ascii=True,
+            )
             if self.config is not None
             else None
         )
@@ -1045,7 +1121,10 @@ class PanelExecutableDashboard:
 
         previous_source = self.source
         self.stop_runtime()
-        if isinstance(previous_source, RecordedHistoryMarketDataSource):
+        if isinstance(
+            previous_source,
+            (RecordedHistoryMarketDataSource, RedisMarketDataSource),
+        ):
             previous_source.disconnect()
         self.config = config
         self.pcf_document = pcf
@@ -1109,7 +1188,11 @@ class PanelExecutableDashboard:
             self.file_source.reset()
             self.source = self.file_source
         else:
-            self.source = RedisMarketDataSource(config.redis, config.etf_code)
+            self.source = RedisMarketDataSource(
+                config.redis,
+                config.etf_code,
+                runtime_pcf,
+            )
         self.snapshot = None
         self.result = None
         self.history = _new_history()
@@ -1119,7 +1202,11 @@ class PanelExecutableDashboard:
         source_label = {
             DataSourceMode.SIMULATED: "模拟行情",
             DataSourceMode.FILE_REPLAY: "历史行情回放",
-            DataSourceMode.REDIS: "标准化Redis",
+            DataSourceMode.REDIS: (
+                "交易日Hash原始五档Redis"
+                if config.redis.snapshot_format == RedisSnapshotFormat.DATE_HASH
+                else "标准化Redis"
+            ),
         }.get(config.data_source, str(config.data_source))
         if isinstance(self.source, RecordedHistoryMarketDataSource):
             first_snapshot = self.source.prime()
@@ -1167,6 +1254,22 @@ class PanelExecutableDashboard:
             seed_text = (
                 "价格基准：未找到{}，已使用完全模拟。"
             ).format(local_path)
+        elif config.data_source == DataSourceMode.REDIS:
+            if config.redis.snapshot_format == RedisSnapshotFormat.DATE_HASH:
+                seed_text = (
+                    "实时读取Redis交易日Hash中的ETF与PCF成分五档盘口；采集间隔={}毫秒；"
+                    "完整快照写入{}。{}"
+                ).format(
+                    config.redis.poll_interval_ms,
+                    config.redis.recording_path or "已关闭",
+                    (
+                        "跨境模式未配置HKD/CNY代码，系统仍采集盘口，但会阻断可执行结论。"
+                        if self.cross_border and not config.redis.hkd_cny_code
+                        else ""
+                    ),
+                )
+            else:
+                seed_text = "实时读取标准化Redis JSON快照，不使用交易日Hash字段映射。"
         else:
             seed_text = "价格基准：完全模拟。"
         self.price_seed_message.object = (
@@ -1215,15 +1318,21 @@ class PanelExecutableDashboard:
         try:
             self._ensure_runtime()
             self.source.start()
+            callback_period = (
+                int(self.config.redis.poll_interval_ms)
+                if self.config.data_source == DataSourceMode.REDIS
+                else 250
+            )
             if self.callback is None:
                 self.callback = pn.state.add_periodic_callback(
                     self._tick,
-                    period=250,
+                    period=callback_period,
                     start=True,
                 )
             elif not self.callback.running:
+                self.callback.period = callback_period
                 self.callback.start()
-            self._set_status("连续模拟/回放中。", "running")
+            self._set_status("连续采集/模拟/回放中。", "running")
         except Exception as exc:
             self._set_status("启动失败：{}".format(exc), "error")
 
@@ -1241,6 +1350,8 @@ class PanelExecutableDashboard:
             self._set_status("已推进一个快照。", "paused")
         except StopIteration:
             self._set_status("模拟/回放已结束。", "completed")
+        except NoNewSnapshotError:
+            self._set_status("Redis快照尚未更新。", "paused")
         except Exception as exc:
             self._set_status("单步失败：{}".format(exc), "error")
 
@@ -1265,6 +1376,8 @@ class PanelExecutableDashboard:
             if self.callback is not None and self.callback.running:
                 self.callback.stop()
             self._set_status("模拟/回放已结束。", "completed")
+        except NoNewSnapshotError:
+            return
         except Exception as exc:
             self.source.stop()
             if self.callback is not None and self.callback.running:
@@ -1272,6 +1385,8 @@ class PanelExecutableDashboard:
             self._set_status("连续运行已停止：{}".format(exc), "error")
 
     def _steps_per_refresh(self) -> int:
+        if self.source_mode.value == DataSourceMode.REDIS:
+            return 1
         if self.source_mode.value == DataSourceMode.SIMULATED:
             tick_ms = int(self.tick_ms.value)
             speed = float(self.simulation_speed.value)
@@ -1335,6 +1450,21 @@ class PanelExecutableDashboard:
         self.total_ticks.visible = (
             is_simulated and not self._uses_local_history()
         )
+        self._redis_format_changed(None)
+
+    def _redis_format_changed(self, _event) -> None:
+        if not hasattr(self, "redis_snapshot_format"):
+            return
+        raw = self.redis_snapshot_format.value == RedisSnapshotFormat.DATE_HASH
+        active = self.source_mode.value == DataSourceMode.REDIS
+        self.redis_live_hkd_cny_code.visible = active and raw and self.cross_border
+        self.redis_poll_interval.visible = active
+        self.redis_record_snapshots.visible = active and raw
+        self.redis_recording_path.visible = (
+            active and raw and bool(self.redis_record_snapshots.value)
+        )
+        self.redis_key_prefix.visible = active and not raw
+        self.redis_channel_pattern.visible = active and not raw
 
     def _price_seed_mode_changed(self, _event) -> None:
         mode = self.price_seed_mode.value
@@ -1730,7 +1860,7 @@ return ((tick / reference - 1) * 10000).toFixed(1)
         source_label = {
             DataSourceMode.SIMULATED: "模拟行情",
             DataSourceMode.FILE_REPLAY: "历史行情回放",
-            DataSourceMode.REDIS: "标准化Redis",
+            DataSourceMode.REDIS: "Redis实时五档行情",
         }.get(self.source_mode.value, str(self.source_mode.value))
         if isinstance(self.source, RecordedHistoryMarketDataSource):
             source_label = "本地历史数据（真实Last+模拟盘口）"
@@ -2059,6 +2189,18 @@ def _cross_border_proxy_pcf(pcf):
 
 
 def _snapshot_record(snapshot, evaluation) -> dict:
+    etf_payload = {
+        "timestamp": snapshot.etf_order_book.exchange_timestamp.isoformat(),
+        "status": snapshot.etf_order_book.trading_status.value,
+        "bids": [
+            [level.price, level.quantity]
+            for level in snapshot.etf_order_book.bids
+        ],
+        "asks": [
+            [level.price, level.quantity]
+            for level in snapshot.etf_order_book.asks
+        ],
+    }
     component_payload = {
         symbol: {
             "timestamp": book.exchange_timestamp.isoformat(),
@@ -2076,6 +2218,7 @@ def _snapshot_record(snapshot, evaluation) -> dict:
         "etf_last": snapshot.etf_order_book.last_price,
         "etf_bid": snapshot.etf_order_book.best_bid,
         "etf_ask": snapshot.etf_order_book.best_ask,
+        "etf_book_json": json.dumps(etf_payload, ensure_ascii=False),
         "official_iopv": snapshot.official_iopv,
         "internal_iopv": evaluation.internal_iopv,
         "hkd_cny_bid": fx_quote.bid if fx_quote else None,

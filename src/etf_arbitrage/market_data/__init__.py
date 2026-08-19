@@ -23,7 +23,7 @@ from .models import (
     TradingStatus,
 )
 from .recorded_history import RecordedHistoryMarketDataSource
-from .redis_source import RedisMarketDataSource
+from .redis_source import NoNewSnapshotError, RedisMarketDataSource
 from .quality import DataQualityChecker, DataQualityReport
 from .simulated import SimulatedMarketDataSource
 from .source import MarketDataSource
@@ -47,6 +47,7 @@ __all__ = [
     "LoadSummary",
     "MarketDataSource",
     "MarketSnapshot",
+    "NoNewSnapshotError",
     "OrderBook",
     "OrderBookLevel",
     "is_virtual_subscription_cash",

@@ -7,9 +7,11 @@ PCF 查询 JSON 已统一映射到同一模型；Panel 控制台可以按代码�
 跨境ETF使用独立 Panel 入口；当前主线是 159920 这类境内上市、港股作为底层篮子的ETF，
 直接复用深交所官方PCF自动下载器。境内ETF和港股成分的最新行情统一从内网Redis读取，
 历史研究只回放由Redis采集生成的本地观察文件；公共第三方行情下载不属于项目数据链路。
-当前研究口径已限定为港股通可覆盖/可对冲篮子。港股通盘中监控暂时只保存ETF和PCF成分
-最新价，不要求Redis提供Bid/Ask或HKD/CNY，也不在盘中计算IOPV、Premium或套利信号。
-HKD/CNY通过收盘后文件按时间戳回填，生成独立模型估值文件。2800/82800不再作为主策略
+当前研究口径已限定为港股通可覆盖/可对冲篮子。2026-08-19 已在 `159920.SZ` 单条记录中
+观察到五档 `bidPrice/bidVolume/offerPrice/offerVolume` 字段；项目可直接读取这种交易日 Hash
+原始盘口。ETF单条成功不等于PCF全部成分同步可用，盘前仍必须检查成分覆盖、时间戳和
+HKD/CNY。缺少任一执行要素时只记录快照并阻断可执行结论。HKD/CNY仍可通过收盘后文件
+按时间戳回填，生成独立模型估值文件。2800/82800不再作为主策略
 标的，仅保留历史对照；QDII申赎结算仍是后续边界。
 
 ## 核心口径
@@ -88,7 +90,8 @@ python -m panel serve panel_hk_app.py --address 127.0.0.1 --port 8506
 Panel 控制台打开地址为 `http://127.0.0.1:8505/panel_app`，直接进入套利模拟可使用
 `http://127.0.0.1:8505/panel_app?page=executable`。控制台分为“实盘均值回复监控”和
 “实盘套利模拟”两个独立页面。前者接入 PCF、内网 Redis 最新价采集、观察文件回放和收盘
-折溢价收敛研究；后者接入 PCF、模拟行情、上传/本地历史行情或标准化 Redis 快照，使用 ETF
+折溢价收敛研究；后者接入 PCF、模拟行情、上传/本地历史行情、标准化 Redis 快照或交易日
+Hash 原始五档行情，使用 ETF
 与成分股 Bid/Ask、多档深度完成纸面申赎套利、订单成交、一级市场申赎和 PnL 模拟。两页
 均复用持久化 Bokeh 数据源进行增量刷新，切页时会停止隐藏页面的定时任务。均值回复页默认
 选择当天并允许通过日历选择任意日期；页面和标签内容按需加载，不再一次创建全部隐藏组件。
@@ -130,11 +133,34 @@ python scripts/probe_sz_quotation.py --code 159920.SZ
 python scripts/probe_sz_quotation.py --code 00700.HK
 ```
 
-适配器每轮只批量读取 ETF 和目标成分股，避免重复拉取整个市场。它能从 `cdate` 和 `ctime`
+适配器每轮只批量读取 ETF 和目标成分股，避免重复拉取整个市场。当前五档字段为
+`bidPrice1..5`、`bidVolume1..5`、`offerPrice1..5`、`offerVolume1..5`，同时兼容旧的
+`bidpx1/askpx1` 买一卖一命名。它能从 `cdate` 和 `ctime`
 解析供应商时间，并优先按 PCF 挂牌市场映射 Redis 代码：上交所 `.SH`、深交所 `.SZ`、
 北交所 `.BJ`、港交所 `.HK`。`--redis-code-suffix` 仅在交易所无法识别时作为兼容兜底。
 Redis 只提供最新价时，沪深标的仍按原指示性研究口径运行；港股通入口只记录原始最新价，
 估值状态保持`PENDING_FX`，不在盘中计算Premium或生成套利信号。
+
+在启动实盘套利模拟前，用当日PCF做一次全篮子只读预检：
+
+```powershell
+python scripts/probe_executable_redis.py `
+  --pcf data/pcf/YYYYMMDD/pcf_159920_YYYYMMDD.xml `
+  --trade-date YYYYMMDD
+```
+
+只有 `quality_blockers` 为空、ETF有双边五档且 `two_sided_components` 覆盖全部实物成分时，
+才可把结果称为当时点的纸面可执行模拟。跨境篮子还要求带时间戳的 HKD/CNY 双边报价；未
+配置时脚本会返回 `MISSING_HKD_CNY_QUOTE`。沪深和跨境Panel的“实盘套利模拟”均使用同一
+套 `.SH` / `.SZ` / `.HK` 代码映射；选择“沪深交易日Hash原始
+五档”后，默认每3秒读取一次，并将ETF、成分股、汇率和原始JSON共同追加到：
+
+```text
+tmp/executable_recordings/YYYYMMDD/ETF代码.jsonl
+```
+
+完全相同的快照在同一运行进程中会跳过。该入口只生成研究快照、机会判断和模拟订单，不含
+任何真实券商报单或申赎接口。
 
 ### 港股通盘中采集与收盘后汇率回填
 

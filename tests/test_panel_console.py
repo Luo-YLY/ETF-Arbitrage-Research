@@ -24,6 +24,7 @@ from etf_arbitrage.dashboard_panel import (
 from etf_arbitrage.dashboard_panel.console import EXECUTABLE_PAGE, MEAN_PAGE
 from etf_arbitrage.executable_config import (
     DataSourceMode,
+    RedisSnapshotFormat,
     SimulationPriceSeedMode,
     SimulationScenario,
 )
@@ -39,7 +40,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def test_console_separates_mean_reversion_and_executable_pages():
     dashboard = PanelConsoleDashboard(PROJECT_ROOT)
+    template = dashboard.template()
 
+    assert template.title == "沪深ETF套利研究控制台"
     assert dashboard.page_select.value == MEAN_PAGE
     assert len(dashboard.main.objects) == 1
     assert dashboard.mean_page is not None
@@ -145,6 +148,27 @@ def test_executable_page_generates_full_depth_simulated_snapshot():
     assert len(dashboard.etf_book_table.value) == int(dashboard.book_levels.value)
     assert not dashboard.component_books_table.value.empty
     assert not dashboard.pcf_components_table.value.empty
+
+
+def test_executable_page_defaults_live_redis_to_raw_five_level_recording():
+    dashboard = PanelExecutableDashboard(PROJECT_ROOT)
+    dashboard.source_mode.value = DataSourceMode.REDIS
+    dashboard.redis_enabled.value = True
+
+    config = dashboard._build_config()
+
+    assert config.redis.snapshot_format == RedisSnapshotFormat.DATE_HASH
+    assert config.redis.number_of_book_levels == 5
+    assert config.redis.poll_interval_ms == 3_000
+    assert config.redis.trade_date_key == dashboard.pcf.trading_date.strftime(
+        "%Y%m%d"
+    )
+    assert config.redis.recording_path.endswith(
+        "tmp\\executable_recordings\\{}\\{}.jsonl".format(
+            config.redis.trade_date_key,
+            dashboard.pcf.etf_code,
+        )
+    )
 
 
 def test_executable_page_can_seed_simulation_from_sz_redis_latest_prices(

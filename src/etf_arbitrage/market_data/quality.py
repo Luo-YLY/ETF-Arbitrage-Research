@@ -91,7 +91,7 @@ class DataQualityChecker:
             and not item.substitute_flag.requires_cash_substitution
         ]
         total_quantity = sum(item.component_share for item in active) or 1.0
-        missing = stale = suspended = limit_up = limit_down = 0.0
+        missing = one_sided = stale = suspended = limit_up = limit_down = 0.0
         max_age = 0.0
         max_skew = 0.0
         for component in active:
@@ -100,6 +100,9 @@ class DataQualityChecker:
             if book is None:
                 missing += weight
                 continue
+            if not book.has_two_sided_book:
+                missing += weight
+                one_sided += weight
             age = self._age_ms(snapshot.snapshot_timestamp, book.exchange_timestamp)
             skew = abs((etf.exchange_timestamp - book.exchange_timestamp).total_seconds()) * 1_000.0
             max_age = max(max_age, age)
@@ -143,6 +146,8 @@ class DataQualityChecker:
 
         if missing > self.config.maximum_missing_weight:
             blockers.append("MISSING_COMPONENT_QUOTES")
+        if one_sided > 0:
+            blockers.append("MISSING_COMPONENT_TWO_SIDED_BOOK")
         if stale > self.config.maximum_stale_weight:
             blockers.append("STALE_COMPONENT_QUOTES")
         if max_skew > self.config.max_cross_section_skew_ms:

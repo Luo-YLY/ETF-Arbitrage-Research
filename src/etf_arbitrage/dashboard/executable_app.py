@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -34,6 +35,7 @@ from etf_arbitrage.executable_config import (
     PaperArbitrageConfig,
     PrimaryMarketConfig,
     RedisConfig,
+    RedisSnapshotFormat,
     SimulationConfig,
     SimulationScenario,
 )
@@ -41,6 +43,7 @@ from etf_arbitrage.market_data import (
     DynamicMarketDataLoader,
     FileReplayMarketDataSource,
     MarketDataSource,
+    NoNewSnapshotError,
     RedisMarketDataSource,
     SimulatedMarketDataSource,
 )
@@ -101,7 +104,11 @@ def _latest_local_day(etf_code: str) -> date:
 
 
 def _runtime_signature(path: Path, config: PaperArbitrageConfig) -> str:
-    return "{}:{}:{}".format(path, path.stat().st_mtime_ns, json.dumps(config.to_dict(), sort_keys=True))
+    return "{}:{}:{}".format(
+        path,
+        path.stat().st_mtime_ns,
+        json.dumps(config.to_dict(include_secrets=True), sort_keys=True),
+    )
 
 
 def _new_history() -> Dict[str, list[dict]]:
@@ -401,7 +408,7 @@ def _source_for(config: PaperArbitrageConfig, pcf) -> Optional[MarketDataSource]
         return SimulatedMarketDataSource(pcf, config.simulation)
     if config.data_source == DataSourceMode.FILE_REPLAY:
         return st.session_state.get("exec_file_source")
-    return RedisMarketDataSource(config.redis, config.etf_code)
+    return RedisMarketDataSource(config.redis, config.etf_code, pcf)
 
 
 def _table_download(table: str, rows: list[dict]) -> None:
@@ -463,6 +470,8 @@ def _render_runtime_content(
             manual_advance = True
         except StopIteration:
             st.info("回放已结束。")
+        except NoNewSnapshotError:
+            st.info("Redis快照尚未更新。")
         except Exception as exc:
             st.error("单步失败：{}".format(exc))
     if controls[3].button("恢复", use_container_width=True, disabled=source is None):
@@ -483,6 +492,8 @@ def _render_runtime_content(
             source.stop()
             st.session_state.exec_runtime_notice = "回放已结束。"
             st.rerun()
+        except NoNewSnapshotError:
+            pass
         except Exception as exc:
             source.stop()
             st.session_state.exec_runtime_error = "连续回放已停止：{}".format(exc)
@@ -855,6 +866,8 @@ def _render_runtime_panel(
     tick_interval_ms = (
         config.simulation.tick_interval_ms
         if source_mode == DataSourceMode.SIMULATED
+        else config.redis.poll_interval_ms
+        if source_mode == DataSourceMode.REDIS
         else config.file_replay.fixed_step_ms
     )
     playback_speed = (
@@ -1037,21 +1050,61 @@ def render() -> None:
                     st.error("历史行情加载失败：{}".format(exc))
 
         redis_enabled = False
-        redis_host = "localhost"
-        redis_port = 6379
-        redis_db = 0
+        redis_host = os.getenv("SZ_REDIS_HOST", "localhost")
+        redis_port = int(os.getenv("SZ_REDIS_PORT", "6379"))
+        redis_db = int(os.getenv("SZ_REDIS_DB", "0"))
         redis_password = None
+        redis_snapshot_format = RedisSnapshotFormat.DATE_HASH
+        redis_live_hkd_cny_code = os.getenv("SZ_REDIS_HKD_CNY_CODE", "")
+        redis_poll_interval = 3_000
+        redis_record_snapshots = True
+        redis_recording_path = ""
         redis_key_prefix = "etf_arbitrage"
         redis_channel_pattern = "market:*"
         redis_timeout = 2.0
         with st.expander("Redis高级设置"):
             redis_enabled = st.checkbox("启用Redis", value=False)
-            redis_host = st.text_input("Host", value="localhost")
+            redis_snapshot_format = RedisSnapshotFormat(
+                st.selectbox(
+                    "Redis快照格式",
+                    [item.value for item in RedisSnapshotFormat],
+                    index=1,
+                )
+            )
+            redis_host = st.text_input("Host", value=redis_host)
             redis_port = int(st.number_input("Port", 1, 65535, 6379))
             redis_db = int(st.number_input("DB", 0, 100, 0))
             redis_password = st.text_input("Password", type="password") or None
-            redis_key_prefix = st.text_input("Key prefix", value="etf_arbitrage")
-            redis_channel_pattern = st.text_input("Channel pattern", value="market:*")
+            if redis_snapshot_format == RedisSnapshotFormat.DATE_HASH:
+                redis_live_hkd_cny_code = st.text_input(
+                    "Redis HKD/CNY代码（跨境可选）",
+                    value=redis_live_hkd_cny_code,
+                    help="留空时仍采集盘口，但跨境可执行性会被质量门禁阻断。",
+                )
+                redis_poll_interval = int(
+                    st.number_input(
+                        "采集间隔（毫秒）",
+                        250,
+                        60_000,
+                        3_000,
+                        250,
+                    )
+                )
+                redis_record_snapshots = st.checkbox(
+                    "自动记录完整五档快照",
+                    value=True,
+                )
+                if redis_record_snapshots:
+                    redis_recording_path = st.text_input(
+                        "五档快照文件（可选）",
+                        value="",
+                        placeholder=(
+                            "留空自动写入 tmp/executable_recordings/交易日/ETF.jsonl"
+                        ),
+                    )
+            else:
+                redis_key_prefix = st.text_input("Key prefix", value="etf_arbitrage")
+                redis_channel_pattern = st.text_input("Channel pattern", value="market:*")
             redis_timeout = float(st.number_input("连接超时（秒）", 0.1, 60.0, 2.0, 0.1))
 
         st.subheader("执行参数")
@@ -1118,6 +1171,17 @@ def render() -> None:
         st.error("PCF校验未通过：{}".format(", ".join(pcf_report.errors)))
         return
 
+    if redis_record_snapshots and not redis_recording_path:
+        redis_recording_path = str(
+            ROOT
+            / "tmp"
+            / "executable_recordings"
+            / day_text
+            / "{}.jsonl".format(etf_code)
+        )
+    if not redis_record_snapshots:
+        redis_recording_path = ""
+
     config = PaperArbitrageConfig(
         etf_code=etf_code,
         data_source=source_mode,
@@ -1126,7 +1190,13 @@ def render() -> None:
             host=redis_host,
             port=redis_port,
             db=redis_db,
-            password=redis_password,
+            password=redis_password or os.getenv("SZ_REDIS_PASSWORD") or None,
+            snapshot_format=redis_snapshot_format,
+            trade_date_key=day_text,
+            hkd_cny_code=redis_live_hkd_cny_code.strip(),
+            number_of_book_levels=5,
+            poll_interval_ms=redis_poll_interval,
+            recording_path=redis_recording_path,
             key_prefix=redis_key_prefix,
             channel_pattern=redis_channel_pattern,
             socket_timeout_seconds=redis_timeout,

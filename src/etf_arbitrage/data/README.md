@@ -22,7 +22,9 @@ python scripts/probe_sz_quotation.py --code 159915.SZ
 ```
 
 恢复内网后应先运行探测脚本，确认 Redis 中真实的买一、卖一、成交量、成交额和时间字段。
-默认字段映射支持 `closepx`、`bidpx1`、`askpx1`、`volume`、`amount`，时间优先读取
+默认字段映射支持 `closepx`、`bidPrice1`、`offerPrice1`、`volume`、`amount`，并兼容
+旧的 `bidpx1`、`askpx1`。完整执行盘口由市场数据层读取
+`bidPrice1..5/bidVolume1..5/offerPrice1..5/offerVolume1..5`。时间优先读取
 `timestamp`，缺失时组合 `cdate` 与 `ctime`。若没有买一卖一，可将
 `require_bid_ask=False` 用于指示性记录；最新价不会被伪装成买一卖一。
 `SZRedisDataFeed` 默认将项目内部的六位代码加上 `.SZ` 后缀再查询 Redis，输出的

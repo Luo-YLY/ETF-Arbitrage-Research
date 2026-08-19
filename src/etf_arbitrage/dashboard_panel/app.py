@@ -1264,7 +1264,7 @@ class PanelReplayDashboard:
 
     def template(self):
         return pn.template.FastListTemplate(
-            title="深市ETF均值回复监控实验台",
+            title="沪深ETF均值回复监控实验台",
             site="ETF Arbitrage",
             accent_base_color=ACCENT,
             header_background="#202A2E",

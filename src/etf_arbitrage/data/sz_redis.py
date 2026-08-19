@@ -191,8 +191,10 @@ class SZRedisFieldMap:
     trade_time: Optional[str] = "ctime"
     last_price: str = "closepx"
     previous_close: Optional[str] = "preClosepx"
-    bid_price: Optional[str] = "bidpx1"
-    ask_price: Optional[str] = "askpx1"
+    bid_price: Optional[str] = "bidPrice1"
+    ask_price: Optional[str] = "offerPrice1"
+    bid_price_aliases: tuple[str, ...] = ("bidpx1",)
+    ask_price_aliases: tuple[str, ...] = ("askpx1",)
     volume: Optional[str] = "volume"
     amount: str = "amount"
     is_suspended: Optional[str] = None
@@ -299,11 +301,15 @@ def load_pcf_price_seed(
         if not field_map.bid_price or not field_map.ask_price:
             raise QuotationSchemaError("HKD/CNY需要买一和卖一字段映射")
         fx_row = frame.loc[resolved_hkd_cny_code]
-        hkd_cny_bid = _positive_price(
-            fx_row, field_map.bid_price, resolved_hkd_cny_code
+        hkd_cny_bid = _positive_price_from_candidates(
+            fx_row,
+            (field_map.bid_price, *field_map.bid_price_aliases),
+            resolved_hkd_cny_code,
         )
-        hkd_cny_ask = _positive_price(
-            fx_row, field_map.ask_price, resolved_hkd_cny_code
+        hkd_cny_ask = _positive_price_from_candidates(
+            fx_row,
+            (field_map.ask_price, *field_map.ask_price_aliases),
+            resolved_hkd_cny_code,
         )
         if hkd_cny_bid > hkd_cny_ask:
             raise QuotationSchemaError("HKD/CNY买价不能高于卖价")
@@ -334,6 +340,19 @@ def _positive_price(row: pd.Series, field: str, code: str) -> float:
             "Redis行情{}的{}必须为正数，当前值为{}".format(code, field, row[field])
         )
     return price
+
+
+def _positive_price_from_candidates(
+    row: pd.Series,
+    fields: Sequence[str],
+    code: str,
+) -> float:
+    for field in fields:
+        if field and field in row and pd.notna(row[field]):
+            return _positive_price(row, field, code)
+    raise QuotationSchemaError(
+        "Redis行情{}缺少价格字段{}".format(code, "/".join(fields))
+    )
 
 
 class SZRedisDataFeed(DataFeed):
@@ -427,8 +446,14 @@ class SZRedisDataFeed(DataFeed):
                 ),
             )
 
-        bid_price = self._optional_float(etf_row, self.field_map.bid_price)
-        ask_price = self._optional_float(etf_row, self.field_map.ask_price)
+        bid_price = self._optional_float_candidates(
+            etf_row,
+            (self.field_map.bid_price, *self.field_map.bid_price_aliases),
+        )
+        ask_price = self._optional_float_candidates(
+            etf_row,
+            (self.field_map.ask_price, *self.field_map.ask_price_aliases),
+        )
         if self.require_bid_ask:
             if bid_price is None:
                 raise QuotationSchemaError(
@@ -514,6 +539,18 @@ class SZRedisDataFeed(DataFeed):
         ):
             return self._parse_vendor_timestamp(row[date_field], row[time_field])
         return fallback or datetime.now()
+
+    @classmethod
+    def _optional_float_candidates(
+        cls,
+        row: pd.Series,
+        fields: Sequence[Optional[str]],
+        default: Optional[float] = None,
+    ) -> Optional[float]:
+        for field in fields:
+            if field and field in row and pd.notna(row[field]):
+                return cls._optional_float(row, field, default)
+        return default
 
     @staticmethod
     def _parse_vendor_timestamp(trade_date: Any, trade_time: Any) -> datetime:
