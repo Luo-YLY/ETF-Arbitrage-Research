@@ -385,6 +385,7 @@ def _small_pcf(exchange: str = "SZSE") -> PCFDocument:
 def test_raw_date_hash_maps_five_levels_records_and_deduplicates():
     pcf = _small_pcf()
     path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    fingerprint_path = path.with_name(path.name + ".fingerprint")
     records = {
         "159915.SZ": _raw_book("159915.SZ", "SZ", 1.205),
         "000001.SZ": _raw_book("000001.SZ", "SZ", 10.0),
@@ -421,6 +422,87 @@ def test_raw_date_hash_maps_five_levels_records_and_deduplicates():
     finally:
         source.disconnect()
         path.unlink(missing_ok=True)
+        fingerprint_path.unlink(missing_ok=True)
+
+
+def test_raw_date_hash_keeps_deduplication_across_source_restart():
+    pcf = _small_pcf()
+    path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    fingerprint_path = path.with_name(path.name + ".fingerprint")
+    records = {
+        "159915.SZ": _raw_book("159915.SZ", "SZ", 1.205),
+        "000001.SZ": _raw_book("000001.SZ", "SZ", 10.0),
+    }
+    config = RedisConfig(
+        enabled=True,
+        snapshot_format=RedisSnapshotFormat.DATE_HASH,
+        trade_date_key="20260720",
+        recording_path=str(path),
+    )
+    try:
+        first = RedisMarketDataSource(
+            config,
+            "159915",
+            pcf,
+            redis_client=RawHashRedis(records),
+        )
+        first.step()
+        first.disconnect()
+
+        restarted = RedisMarketDataSource(
+            config,
+            "159915",
+            pcf,
+            redis_client=RawHashRedis(records),
+        )
+        with pytest.raises(NoNewSnapshotError):
+            restarted.step()
+
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+        assert len(fingerprint_path.read_text(encoding="ascii")) == 64
+    finally:
+        path.unlink(missing_ok=True)
+        fingerprint_path.unlink(missing_ok=True)
+
+
+def test_raw_date_hash_ignores_stale_fingerprint_without_recording():
+    pcf = _small_pcf()
+    path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    fingerprint_path = path.with_name(path.name + ".fingerprint")
+    records = {
+        "159915.SZ": _raw_book("159915.SZ", "SZ", 1.205),
+        "000001.SZ": _raw_book("000001.SZ", "SZ", 10.0),
+    }
+    config = RedisConfig(
+        enabled=True,
+        snapshot_format=RedisSnapshotFormat.DATE_HASH,
+        trade_date_key="20260720",
+        recording_path=str(path),
+    )
+    try:
+        first = RedisMarketDataSource(
+            config,
+            "159915",
+            pcf,
+            redis_client=RawHashRedis(records),
+        )
+        first.step()
+        first.disconnect()
+        path.unlink()
+
+        restarted = RedisMarketDataSource(
+            config,
+            "159915",
+            pcf,
+            redis_client=RawHashRedis(records),
+        )
+        snapshot = restarted.step()
+
+        assert snapshot.etf_order_book.symbol == "159915"
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+    finally:
+        path.unlink(missing_ok=True)
+        fingerprint_path.unlink(missing_ok=True)
 
 
 def test_raw_cross_border_hash_can_carry_hkd_cny_quote():

@@ -1,13 +1,13 @@
-沪深与跨境ETF套利研究系统：内网设备每日启动流程
-========================================
+沪深境内ETF套利研究系统：内网设备每日启动流程
+======================================
 
 适用环境
 --------
 1. Windows 内网设备。
 2. 使用 Miniforge Prompt，不使用 PowerShell 环境变量语法。
 3. 项目已经完成环境安装，日常启动不需要重复安装依赖。
-4. 沪深控制台可选择沪市或深市ETF；跨境控制台当前重点为159920等境内上市跨境ETF。
-5. Redis 行情代码由程序按PCF交易所自动转换为大写 .SH、.SZ 或 .HK 后缀。
+4. 当前盘中主线只启动沪深控制台，并行采集沪市或深市境内成分ETF。
+5. Redis 行情代码由程序按PCF交易所自动转换为大写 .SH 或 .SZ 后缀；含非沪深成分的PCF会被拒绝。
 
 重要说明
 --------
@@ -35,7 +35,7 @@ conda activate ".\.conda\py314"
 
 在能够访问GitHub的外网账户更新代码：
 
-git -c http.version=HTTP/1.1 pull origin main
+git -c http.version=HTTP/1.1 pull --ff-only origin agent/redis-cross-border-etf-research
 git log -1 --oneline
 
 如果出现 Connection was reset，说明当前网络无法连接GitHub。确认正在使用外网账户后重试，
@@ -152,44 +152,45 @@ http://127.0.0.1:8501
 可以在9:30之前启动。后台任务会等待开盘，不需要等到9:30再点击。
 
 
-第五步B：实盘套利模拟五档预检与启动
+第五步B：境内多ETF实盘套利模拟五档采集
 -------------------------------------
 
-先用当天已校验PCF检查ETF和完整成分篮子，不要只检查ETF一条记录：
+本轮只做沪深境内成分ETF，暂不启动港股/跨境入口。先启动沪深Panel控制台：
 
-python scripts\probe_executable_redis.py --pcf data\pcf\YYYYMMDD\pcf_159920_YYYYMMDD.xml --trade-date YYYYMMDD
+python -m panel serve panel_app.py --address 127.0.0.1 --port 8505 --allow-websocket-origin 127.0.0.1:8505 --allow-websocket-origin localhost:8505
 
-预检通过条件：
+浏览器直接打开实盘套利模拟：
 
-1. ETF买卖各5档。
-2. two_sided_components等于active_components。
-3. quality_blockers为空。
-4. 159920等跨境ETF还需要hkd_cny_present=true；没有实时HKD/CNY时可以继续采集，
-   但系统会阻断“可执行”结论。
+http://127.0.0.1:8505/panel_app?page=executable
 
-启动沪深Panel控制台（沪市、深市ETF使用同一五档适配器）：
+在“数据与配置”中：
 
-python -m panel serve panel_app.py --address 127.0.0.1 --port 8505 --allow-websocket-origin 127.0.0.1:8505 --allow-websocket-origin localhost:8505 --show
+1. 交易日选择当天日期。
+2. 逐只选择境内ETF，PCF来源选择“官方下载”，点击“下载并校验”。
+3. 在“境内多ETF日内五档采集”卡片中多选需要采集的ETF。
+4. 确认表格中所有已选ETF的PCF状态都是“已校验”。
+5. 采集间隔保持3秒，并行线程默认4。
+6. 异常自动重启保持打开。
+7. 点击“启动境内多ETF五档采集”。
 
-启动跨境Panel控制台：
+每只ETF的完整五档、成分篮子和原始Redis JSON分别写入：
 
-python -m panel serve panel_hk_app.py --address 127.0.0.1 --port 8506 --allow-websocket-origin 127.0.0.1:8506 --allow-websocket-origin localhost:8506 --show
+tmp\executable_recordings\YYYYMMDD\ETF代码.jsonl
 
-打开“实盘套利模拟”，设置：
+IOPV、质量门禁和申购/赎回机会摘要分别写入：
 
-1. 数据源：Redis实时行情（原始/标准化）。
-2. Redis快照格式：沪深交易日Hash原始五档。
-3. 启用Redis：打开。
-4. 采集间隔：3000毫秒。
-5. 自动记录完整五档快照：打开。
-6. 自动影子交易：盘中首轮保持关闭，只记录机会。
+tmp\executable_results\YYYYMMDD\ETF代码.jsonl
 
-点击“应用配置并重置”，确认数据质量页没有字段解码、交叉盘口、成分缺失或时间陈旧问题，
-再点击“开始”。完整五档和原始Redis JSON写入：
+任务会自动等待开盘、午间保持等待、异常重启并在15:00后结束。关闭浏览器不会停止后台
+采集；需要提前结束时点击“停止采集”。
 
-tmp\executable_recordings\YYYYMMDD\159920.jsonl
+如需对单只ETF先做全篮子只读预检：
 
-该页面没有真实报单接口；“可执行”只代表所用PCF、行情、汇率、费用和质量阈值下的纸面模拟。
+python scripts\probe_executable_redis.py --pcf data\pcf\YYYYMMDD\pcf_159915_YYYYMMDD.xml --trade-date YYYYMMDD
+
+预检通过条件是ETF买卖各5档、two_sided_components等于active_components、且
+quality_blockers为空。该页面没有真实报单接口；“可执行”只代表所用PCF、行情、费用和
+质量阈值下的纸面判断。
 
 
 第六步：交易时段安排

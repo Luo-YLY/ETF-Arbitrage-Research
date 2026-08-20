@@ -12,6 +12,7 @@ from .cross_border_console import (
 )
 from .data import ObservationDataset, discover_observation_datasets, load_observations
 from .executable import PanelExecutableDashboard
+from .executable_operations import ExecutableMultiETFOperations
 from .mean_operations import MeanReversionOperations
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "CrossBorderPanelDashboard",
     "CrossBorderPanelConsoleDashboard",
     "PanelExecutableDashboard",
+    "ExecutableMultiETFOperations",
     "PanelReplayDashboard",
     "MeanReversionOperations",
     "build_cross_border_panel_dashboard",

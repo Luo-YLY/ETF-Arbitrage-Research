@@ -61,6 +61,7 @@ from etf_arbitrage.market_data import (
 )
 from etf_arbitrage.reporting import RunRecorder
 
+from .executable_operations import ExecutableMultiETFOperations
 from .pcf_controls import PanelPCFControls
 
 
@@ -162,6 +163,15 @@ class PanelExecutableDashboard:
         self.pcf = PanelPCFControls(
             self.project_root,
             default_etf=self.default_etf,
+        )
+        self.multi_etf_operations = (
+            None
+            if self.cross_border
+            else ExecutableMultiETFOperations(
+                self.project_root,
+                self.pcf,
+                default_etfs=(self.default_etf,),
+            )
         )
         self.source: Optional[MarketDataSource] = None
         self.file_source: Optional[FileReplayMarketDataSource] = None
@@ -741,6 +751,8 @@ class PanelExecutableDashboard:
             self.callback.stop()
         if self.source is not None:
             self.source.stop()
+        if self.multi_etf_operations is not None:
+            self.multi_etf_operations.stop_runtime()
 
     def _configuration_view(self):
         fx_controls = (
@@ -857,6 +869,11 @@ class PanelExecutableDashboard:
         return pn.Column(
             pn.pane.Markdown("## 行情数据与执行配置"),
             self.pcf.view(),
+            *(
+                [self.multi_etf_operations.view()]
+                if self.multi_etf_operations is not None
+                else []
+            ),
             simulation_controls,
             file_controls,
             redis_controls,

@@ -54,7 +54,7 @@ class RedisMarketDataSource(MarketDataSource):
         self._connected = False
         self._running = False
         self._latest: Optional[MarketSnapshot] = None
-        self._latest_fingerprint: Optional[str] = None
+        self._latest_fingerprint = self._load_recording_fingerprint()
         self._message = "Redis disabled" if not config.enabled else "not connected"
         self._symbols: set[str] = set()
 
@@ -245,7 +245,13 @@ class RedisMarketDataSource(MarketDataSource):
                 else ()
             ),
         )
-        self._append_recording(snapshot, records, key, receive_time)
+        self._append_recording(
+            snapshot,
+            records,
+            key,
+            receive_time,
+            fingerprint,
+        )
         self._latest_fingerprint = fingerprint
         return snapshot
 
@@ -405,6 +411,7 @@ class RedisMarketDataSource(MarketDataSource):
         raw_records: Mapping[str, Mapping[str, Any]],
         redis_key: str,
         captured_at: datetime,
+        fingerprint: str,
     ) -> None:
         if not self.config.recording_path:
             return
@@ -412,6 +419,7 @@ class RedisMarketDataSource(MarketDataSource):
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": 1,
+            "fingerprint": fingerprint,
             "captured_at": captured_at.isoformat(),
             "redis_key": redis_key,
             "snapshot_timestamp": snapshot.snapshot_timestamp.isoformat(),
@@ -446,6 +454,32 @@ class RedisMarketDataSource(MarketDataSource):
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
             handle.write("\n")
+        fingerprint_path = self._fingerprint_path(path)
+        temporary = fingerprint_path.with_suffix(fingerprint_path.suffix + ".tmp")
+        temporary.write_text(fingerprint, encoding="ascii")
+        temporary.replace(fingerprint_path)
+
+    def _load_recording_fingerprint(self) -> Optional[str]:
+        if not self.config.recording_path:
+            return None
+        recording_path = Path(self.config.recording_path)
+        try:
+            if not recording_path.exists() or recording_path.stat().st_size <= 0:
+                return None
+        except OSError:
+            return None
+        fingerprint_path = self._fingerprint_path(recording_path)
+        try:
+            value = fingerprint_path.read_text(encoding="ascii").strip().lower()
+        except OSError:
+            return None
+        if len(value) == 64 and all(character in "0123456789abcdef" for character in value):
+            return value
+        return None
+
+    @staticmethod
+    def _fingerprint_path(recording_path: Path) -> Path:
+        return recording_path.with_name(recording_path.name + ".fingerprint")
 
     @staticmethod
     def _book_payload(book: OrderBook) -> dict[str, Any]:

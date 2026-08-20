@@ -171,6 +171,22 @@ def test_executable_page_defaults_live_redis_to_raw_five_level_recording():
     )
 
 
+def test_executable_page_exposes_mainland_multi_etf_collector_only():
+    mainland = PanelExecutableDashboard(PROJECT_ROOT)
+    cross_border = PanelExecutableDashboard(
+        PROJECT_ROOT,
+        default_etf="159920",
+        cross_border=True,
+    )
+
+    assert mainland.multi_etf_operations is not None
+    assert mainland.multi_etf_operations.monitor_etfs.value == ["159915"]
+    assert "510300" in mainland.multi_etf_operations.monitor_etfs.options
+    assert "159920" not in mainland.multi_etf_operations.monitor_etfs.options
+    assert "513660" not in mainland.multi_etf_operations.monitor_etfs.options
+    assert cross_border.multi_etf_operations is None
+
+
 def test_executable_page_can_seed_simulation_from_sz_redis_latest_prices(
     monkeypatch,
 ):
@@ -463,6 +479,7 @@ def test_executable_parameter_sections_are_visible_collapsible_cards():
     cards = configuration.select(pn.Card)
 
     assert [card.title for card in cards] == [
+        "境内多ETF日内五档采集",
         "模拟行情高级参数",
         "执行参数",
         "账户与一级市场情景",
