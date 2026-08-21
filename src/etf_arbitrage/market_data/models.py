@@ -18,6 +18,43 @@ class TradingStatus(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class MarketPhase(str, Enum):
+    PRE_OPEN = "PRE_OPEN"
+    OPEN_AUCTION = "OPEN_AUCTION"
+    CONTINUOUS = "CONTINUOUS"
+    BREAK = "BREAK"
+    CLOSE_AUCTION = "CLOSE_AUCTION"
+    CLOSED = "CLOSED"
+    UNKNOWN = "UNKNOWN"
+
+
+class InstrumentState(str, Enum):
+    NORMAL = "NORMAL"
+    SUSPENDED_CONFIRMED = "SUSPENDED_CONFIRMED"
+    SUSPENDED_SUSPECTED = "SUSPENDED_SUSPECTED"
+    LIMIT_UP_LOCKED = "LIMIT_UP_LOCKED"
+    LIMIT_DOWN_LOCKED = "LIMIT_DOWN_LOCKED"
+    ONE_SIDED_UNKNOWN = "ONE_SIDED_UNKNOWN"
+    INACTIVE_PHASE = "INACTIVE_PHASE"
+    UNKNOWN = "UNKNOWN"
+
+
+class StateConfidence(str, Enum):
+    CONFIRMED = "CONFIRMED"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    UNKNOWN = "UNKNOWN"
+
+
+class FeedHealthStatus(str, Enum):
+    HEALTHY = "HEALTHY"
+    SOURCE_STALE = "SOURCE_STALE"
+    PARTIAL_MISSING = "PARTIAL_MISSING"
+    DISCONNECTED = "DISCONNECTED"
+    UNKNOWN = "UNKNOWN"
+
+
 class DataQualityStatus(str, Enum):
     GOOD = "GOOD"
     DEGRADED = "DEGRADED"
@@ -45,6 +82,16 @@ class OrderBook:
     lower_limit_price: Optional[float] = None
     sequence_number: Optional[int] = None
     source: str = "unknown"
+    raw_status: str = ""
+    previous_close: Optional[float] = None
+    cumulative_amount: Optional[float] = None
+    cumulative_volume: Optional[float] = None
+    market_phase: MarketPhase = MarketPhase.UNKNOWN
+    instrument_state: InstrumentState = InstrumentState.UNKNOWN
+    state_confidence: StateConfidence = StateConfidence.UNKNOWN
+    state_reasons: Tuple[str, ...] = ()
+    quote_inactivity_age_ms: float = 0.0
+    price_limit_source: str = ""
 
     @property
     def best_bid(self) -> Optional[float]:
@@ -123,6 +170,10 @@ class MarketSnapshot:
     event_watermark: Optional[datetime] = None
     trace_event_ids: Tuple[str, ...] = ()
     assembly_blockers: Tuple[str, ...] = ()
+    market_phase: MarketPhase = MarketPhase.UNKNOWN
+    feed_health: FeedHealthStatus = FeedHealthStatus.UNKNOWN
+    feed_health_reasons: Tuple[str, ...] = ()
+    source_watermark_age_ms: float = 0.0
 
     @property
     def hkd_cny_quote(self) -> Optional[FXQuote]:

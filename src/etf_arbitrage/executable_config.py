@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 
 class DataSourceMode(str, Enum):
+    EXECUTABLE_REPLAY = "EXECUTABLE_REPLAY"
     SIMULATED = "SIMULATED"
     FILE_REPLAY = "FILE_REPLAY"
     REDIS = "REDIS"
@@ -156,7 +157,8 @@ class ExecutionConfig:
 
 @dataclass(frozen=True)
 class DataQualityConfig:
-    max_quote_age_ms: int = 5_000
+    max_quote_age_ms: int = 120_000
+    max_source_watermark_age_ms: int = 15_000
     max_cross_section_skew_ms: int = 5_000
     maximum_missing_weight: float = 0.01
     maximum_stale_weight: float = 0.05
@@ -185,7 +187,7 @@ class PrimaryMarketConfig:
 @dataclass(frozen=True)
 class PaperArbitrageConfig:
     etf_code: str = "159915"
-    data_source: DataSourceMode = DataSourceMode.SIMULATED
+    data_source: DataSourceMode = DataSourceMode.EXECUTABLE_REPLAY
     redis: RedisConfig = field(default_factory=RedisConfig)
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
     file_replay: FileReplayConfig = field(default_factory=FileReplayConfig)
@@ -207,6 +209,14 @@ class PaperArbitrageConfig:
             return value
 
         payload = convert(asdict(self))
+        if self.data_source in {
+            DataSourceMode.EXECUTABLE_REPLAY,
+            DataSourceMode.REDIS,
+        }:
+            payload.pop("simulation", None)
+            replay = payload.pop("file_replay", None)
+            if self.data_source == DataSourceMode.EXECUTABLE_REPLAY:
+                payload["recording_replay"] = replay
         if not include_secrets and payload["redis"].get("password"):
             payload["redis"]["password"] = "***"
         return payload

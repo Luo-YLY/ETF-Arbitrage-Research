@@ -48,8 +48,12 @@ class ExecutableArbitrageDetector:
             snapshot.component_order_books, fx_quote
         )
         quality = self.quality_checker.evaluate(snapshot, self.pcf, internal_iopv)
-        creation = self._creation(snapshot, count, quality.blockers, fx_quote)
-        redemption = self._redemption(snapshot, count, quality.blockers, fx_quote)
+        creation = self._creation(
+            snapshot, count, quality.creation_blockers, fx_quote
+        )
+        redemption = self._redemption(
+            snapshot, count, quality.redemption_blockers, fx_quote
+        )
         unit_shares = self.pcf.creation_redemption_unit * count
         etf = snapshot.etf_order_book
         last = etf.last_price or etf.mid_price or float("nan")
@@ -65,6 +69,7 @@ class ExecutableArbitrageDetector:
         if include_capacity:
             creation_capacity = self.capacity(snapshot, ArbitrageDirection.CREATION)
             redemption_capacity = self.capacity(snapshot, ArbitrageDirection.REDEMPTION)
+        not_priced = float("nan")
         return ArbitrageEvaluation(
             timestamp=snapshot.snapshot_timestamp,
             etf_code=self.pcf.etf_code,
@@ -74,17 +79,25 @@ class ExecutableArbitrageDetector:
             bid_premium=premiums[1],
             ask_premium=premiums[2],
             lower_bound=(
-                redemption.basket.total_value
-                - redemption.estimated_costs
-                - redemption.safety_buffer
-            )
-            / unit_shares,
+                (
+                    redemption.basket.total_value
+                    - redemption.estimated_costs
+                    - redemption.safety_buffer
+                )
+                / unit_shares
+                if redemption.pricing_complete
+                else not_priced
+            ),
             upper_bound=(
-                creation.basket.total_value
-                + creation.estimated_costs
-                + creation.safety_buffer
-            )
-            / unit_shares,
+                (
+                    creation.basket.total_value
+                    + creation.estimated_costs
+                    + creation.safety_buffer
+                )
+                / unit_shares
+                if creation.pricing_complete
+                else not_priced
+            ),
             creation=creation,
             redemption=redemption,
             quality=quality,
@@ -108,8 +121,9 @@ class ExecutableArbitrageDetector:
         for count in range(1, maximum + 1):
             evaluation = self.evaluate(snapshot, count, include_capacity=False)
             result = evaluation.creation if direction == ArbitrageDirection.CREATION else evaluation.redemption
-            marginal.append(result.net_profit - last_profit)
-            last_profit = result.net_profit
+            if result.pricing_complete:
+                marginal.append(result.net_profit - last_profit)
+                last_profit = result.net_profit
             if result.executable:
                 max_executable = count
                 continue
@@ -150,15 +164,6 @@ class ExecutableArbitrageDetector:
             self.execution.depth_haircut,
             self._slippage_bps(),
         )
-        gross = etf_sweep.total_value - basket.total_value
-        reference = max(1.0, abs(basket.total_value))
-        costs = self._costs(
-            basket.physical_value + etf_sweep.total_value,
-            reference,
-            self.costs.creation_fee_bps,
-        )
-        safety = reference * self.execution.safety_buffer_bps / 10_000.0
-        net = gross - costs - safety
         reasons = list(quality_blockers)
         if self.execution.direction == DirectionSelection.REDEMPTION_ONLY:
             reasons.append("DIRECTION_DISABLED")
@@ -167,10 +172,29 @@ class ExecutableArbitrageDetector:
         if not self._within_pcf_limit(ArbitrageDirection.CREATION, count):
             reasons.append("CREATION_LIMIT")
         if not basket.fully_filled:
-            reasons.append("COMPONENT_ASK_DEPTH")
+            reasons.extend(basket.failure_reasons)
+            if any(
+                reason != "MAX_CASH_SUBSTITUTION_RATIO_EXCEEDED"
+                for reason in basket.failure_reasons
+            ):
+                reasons.append("COMPONENT_ASK_DEPTH")
         if not etf_sweep.fully_filled:
             reasons.append("ETF_BID_DEPTH")
-        self._profit_reasons(net, reference, reasons)
+        pricing_complete = basket.fully_filled and etf_sweep.fully_filled
+        if pricing_complete:
+            gross = etf_sweep.total_value - basket.total_value
+            reference = max(1.0, abs(basket.total_value))
+            costs = self._costs(
+                basket.physical_value + etf_sweep.total_value,
+                reference,
+                self.costs.creation_fee_bps,
+            )
+            safety = reference * self.execution.safety_buffer_bps / 10_000.0
+            net = gross - costs - safety
+            net_bps = net / reference * 10_000.0
+            self._profit_reasons(net, reference, reasons)
+        else:
+            gross = costs = safety = net = net_bps = float("nan")
         return DirectionEvaluation(
             direction=ArbitrageDirection.CREATION,
             cu_count=count,
@@ -178,7 +202,7 @@ class ExecutableArbitrageDetector:
             estimated_costs=costs,
             safety_buffer=safety,
             net_profit=net,
-            net_profit_bps=net / reference * 10_000.0,
+            net_profit_bps=net_bps,
             executable=not reasons,
             rejection_reasons=tuple(dict.fromkeys(reasons)),
             basket=basket,
@@ -203,15 +227,6 @@ class ExecutableArbitrageDetector:
             self.execution.depth_haircut,
             self._slippage_bps(),
         )
-        gross = basket.total_value - etf_sweep.total_value
-        reference = max(1.0, abs(basket.total_value))
-        costs = self._costs(
-            basket.physical_value + etf_sweep.total_value,
-            reference,
-            self.costs.redemption_fee_bps,
-        )
-        safety = reference * self.execution.safety_buffer_bps / 10_000.0
-        net = gross - costs - safety
         reasons = list(quality_blockers)
         if self.execution.direction == DirectionSelection.CREATION_ONLY:
             reasons.append("DIRECTION_DISABLED")
@@ -220,10 +235,29 @@ class ExecutableArbitrageDetector:
         if not self._within_pcf_limit(ArbitrageDirection.REDEMPTION, count):
             reasons.append("REDEMPTION_LIMIT")
         if not basket.fully_filled:
-            reasons.append("COMPONENT_BID_DEPTH")
+            reasons.extend(basket.failure_reasons)
+            if any(
+                reason != "MAX_CASH_SUBSTITUTION_RATIO_EXCEEDED"
+                for reason in basket.failure_reasons
+            ):
+                reasons.append("COMPONENT_BID_DEPTH")
         if not etf_sweep.fully_filled:
             reasons.append("ETF_ASK_DEPTH")
-        self._profit_reasons(net, reference, reasons)
+        pricing_complete = basket.fully_filled and etf_sweep.fully_filled
+        if pricing_complete:
+            gross = basket.total_value - etf_sweep.total_value
+            reference = max(1.0, abs(basket.total_value))
+            costs = self._costs(
+                basket.physical_value + etf_sweep.total_value,
+                reference,
+                self.costs.redemption_fee_bps,
+            )
+            safety = reference * self.execution.safety_buffer_bps / 10_000.0
+            net = gross - costs - safety
+            net_bps = net / reference * 10_000.0
+            self._profit_reasons(net, reference, reasons)
+        else:
+            gross = costs = safety = net = net_bps = float("nan")
         return DirectionEvaluation(
             direction=ArbitrageDirection.REDEMPTION,
             cu_count=count,
@@ -231,7 +265,7 @@ class ExecutableArbitrageDetector:
             estimated_costs=costs,
             safety_buffer=safety,
             net_profit=net,
-            net_profit_bps=net / reference * 10_000.0,
+            net_profit_bps=net_bps,
             executable=not reasons,
             rejection_reasons=tuple(dict.fromkeys(reasons)),
             basket=basket,

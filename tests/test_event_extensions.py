@@ -140,6 +140,7 @@ def test_registry_and_market_clock_expose_capabilities_and_transitions() -> None
 
     assert matrix["SZSE"]["pcf_parser"]
     assert matrix["SSE"]["instrument_codec"]
+    assert matrix["SSE"]["exchange_calendar"]
     assert not matrix["SSE"]["production_ready"]
 
     clock = MarketSessionEventGenerator(registry)
@@ -166,8 +167,11 @@ def test_registry_and_market_clock_expose_capabilities_and_transitions() -> None
         EventType.SESSION_PHASE_CHANGED,
         EventType.TRADING_DAY_ENDED,
     ]
-    with pytest.raises(NotImplementedError, match="SSE exchange calendar"):
-        clock.observe(Exchange.SSE, before_open)
+    sse_first = clock.observe(Exchange.SSE, before_open)
+    assert [event.event_type for event in sse_first] == [
+        EventType.TRADING_DAY_STARTED,
+        EventType.SESSION_PHASE_CHANGED,
+    ]
 
 
 def test_snapshot_adapter_and_assembler_keep_cross_market_component_id() -> None:

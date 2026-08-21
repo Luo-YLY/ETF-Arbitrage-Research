@@ -7,7 +7,9 @@ import pandas as pd
 import pytest
 
 from etf_arbitrage.data import (
+    PCFParseError,
     PCFRepository,
+    SSEPCFFetcher,
     SSEPCFParser,
     SZRedisQuotationClient,
     SZRedisSettings,
@@ -127,6 +129,74 @@ def test_repository_stores_sse_pcf_as_json() -> None:
         assert document.parser_version == "sse-public-json-v1"
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def sse_manager_xml() -> bytes:
+    return b"""<?xml version="1.0" encoding="UTF-8"?>
+<SSEPortfolioCompositionFile>
+  <FundInstrumentID>510500</FundInstrumentID>
+  <CreationRedemptionUnit>400000</CreationRedemptionUnit>
+  <TradingDay>20260820</TradingDay>
+  <PreTradingDay>20260819</PreTradingDay>
+  <NAVperCU>3120009.78</NAVperCU><NAV>7.8</NAV>
+  <PreCashComponent>5934.78</PreCashComponent>
+  <EstimatedCashComponent>85.78</EstimatedCashComponent>
+  <MaxCashRatio>0.5</MaxCashRatio>
+  <RedemptionLimit>1400000000</RedemptionLimit>
+  <PublishIOPVFlag>1</PublishIOPVFlag>
+  <CreationRedemptionSwitch>1</CreationRedemptionSwitch>
+  <CreationRedemptionMechanism>1</CreationRedemptionMechanism>
+  <RecordNumber>2</RecordNumber>
+  <ComponentList>
+    <Component>
+      <InstrumentID>000009</InstrumentID><InstrumentName>China Baoan</InstrumentName>
+      <Quantity>600</Quantity><SubstitutionFlag>1</SubstitutionFlag>
+      <CreationPremiumRate>0.1</CreationPremiumRate>
+      <RedemptionDiscountRate>0.1</RedemptionDiscountRate>
+      <SubstitutionCashAmount>4446</SubstitutionCashAmount>
+      <UnderlyingSecurityID>102</UnderlyingSecurityID>
+    </Component>
+    <Component>
+      <InstrumentID>600000</InstrumentID><InstrumentName>SPDB</InstrumentName>
+      <Quantity>500</Quantity><SubstitutionFlag>0</SubstitutionFlag>
+      <CreationPremiumRate>0.1</CreationPremiumRate>
+      <RedemptionDiscountRate>0.1</RedemptionDiscountRate>
+      <UnderlyingSecurityID>101</UnderlyingSecurityID>
+    </Component>
+  </ComponentList>
+</SSEPortfolioCompositionFile>"""
+
+
+def test_repository_stores_and_validates_manager_sse_xml() -> None:
+    root = Path("tmp") / "tests" / ("sse-manager-pcf-" + uuid4().hex)
+    repository = PCFRepository(root)
+    try:
+        path = repository.save(sse_manager_xml(), "510500", "20260820")
+        document = repository.validate(path, "510500.SH", "20260820")
+
+        assert path.suffix == ".xml"
+        assert document.parser_version == "sse-manager-xml-v1"
+        assert document.etf_id == InstrumentId(Exchange.SSE, "510500")
+        assert [item.instrument_id for item in document.components] == [
+            InstrumentId(Exchange.SZSE, "000009"),
+            InstrumentId(Exchange.SSE, "600000"),
+        ]
+        assert document.creation_allowed and document.redemption_allowed
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+class LatestOnlySSEPCFFetcher(SSEPCFFetcher):
+    def fetch_payload(self, etf_code, *, timeout=20.0):
+        return sse_payload()
+
+
+def test_latest_sse_query_cannot_be_saved_as_a_different_day() -> None:
+    with pytest.raises(PCFParseError, match="当前仅返回最新清单"):
+        LatestOnlySSEPCFFetcher().fetch_bytes(
+            "513660",
+            trading_day="20260820",
+        )
 
 
 class CaptureQuotationClient(SZRedisQuotationClient):

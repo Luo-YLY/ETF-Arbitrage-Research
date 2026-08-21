@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
@@ -26,6 +27,7 @@ from etf_arbitrage.executable_config import (
 from etf_arbitrage.market_data import (
     DataQualityChecker,
     DynamicMarketDataLoader,
+    ExecutableRecordingReplayMarketDataSource,
     FileReplayMarketDataSource,
     NoNewSnapshotError,
     RecordedHistoryMarketDataSource,
@@ -425,6 +427,113 @@ def test_raw_date_hash_maps_five_levels_records_and_deduplicates():
         fingerprint_path.unlink(missing_ok=True)
 
 
+def test_executable_recording_replay_preserves_full_depth_and_fill_lookahead():
+    pcf = _small_pcf()
+    path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    fingerprint_path = path.with_name(path.name + ".fingerprint")
+    records = {
+        "159915.SZ": _raw_book("159915.SZ", "SZ", 1.205),
+        "000001.SZ": _raw_book("000001.SZ", "SZ", 10.0),
+    }
+    redis = RawHashRedis(records)
+    clocks = iter(
+        (
+            datetime(2026, 7, 20, 10, 30, 0, 200_000),
+            datetime(2026, 7, 20, 10, 30, 1, 200_000),
+        )
+    )
+    recorder = RedisMarketDataSource(
+        RedisConfig(
+            enabled=True,
+            snapshot_format=RedisSnapshotFormat.DATE_HASH,
+            trade_date_key="20260720",
+            recording_path=str(path),
+        ),
+        "159915",
+        pcf,
+        redis_client=redis,
+        clock=lambda: next(clocks),
+    )
+    try:
+        recorder.step()
+        second_etf = _raw_book("159915.SZ", "SZ", 1.215)
+        second_etf["ctime"] = "103001"
+        redis.records["159915.SZ"] = json.dumps(second_etf)
+        recorder.step()
+        recorder.disconnect()
+
+        replay = ExecutableRecordingReplayMarketDataSource(path, pcf)
+        assert replay.first_snapshot.etf_order_book.best_bid == pytest.approx(1.204)
+        assert len(replay.first_snapshot.etf_order_book.bids) == 5
+        assert len(replay.first_snapshot.etf_order_book.asks) == 5
+        assert replay.first_snapshot.pcf_hash == pcf.file_hash
+
+        replay.start()
+        first = replay.step()
+        fill = replay.snapshot_at_or_after(
+            first.snapshot_timestamp + timedelta(milliseconds=500)
+        )
+        second = replay.step()
+
+        assert fill is second
+        assert second.etf_order_book.last_price == pytest.approx(1.215)
+        assert second.component_order_books["000001"].asks[4].quantity == pytest.approx(
+            600_000
+        )
+        assert replay.records_read == 2
+        assert replay.progress_percent == 100
+        with pytest.raises(StopIteration):
+            replay.step()
+        assert replay.health().status == "COMPLETED"
+
+        replay.reset()
+        assert replay.step() == first
+        replay.disconnect()
+    finally:
+        recorder.disconnect()
+        path.unlink(missing_ok=True)
+        fingerprint_path.unlink(missing_ok=True)
+
+
+def test_executable_recording_replay_rejects_wrong_pcf_identity():
+    pcf = _small_pcf()
+    path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
+    fingerprint_path = path.with_name(path.name + ".fingerprint")
+    recorder = RedisMarketDataSource(
+        RedisConfig(
+            enabled=True,
+            snapshot_format=RedisSnapshotFormat.DATE_HASH,
+            trade_date_key="20260720",
+            recording_path=str(path),
+        ),
+        "159915",
+        pcf,
+        redis_client=RawHashRedis(
+            {
+                "159915.SZ": _raw_book("159915.SZ", "SZ", 1.205),
+                "000001.SZ": _raw_book("000001.SZ", "SZ", 10.0),
+            }
+        ),
+        clock=lambda: datetime(2026, 7, 20, 10, 30, 0, 200_000),
+    )
+    try:
+        recorder.step()
+        with pytest.raises(ValueError, match="PCF哈希") as exc_info:
+            ExecutableRecordingReplayMarketDataSource(
+                path,
+                replace(pcf, file_hash="different-pcf"),
+            )
+        message = str(exc_info.value)
+        assert pcf.file_hash in message
+        assert "different-pcf" in message
+        assert "从采集设备复制该交易日实际使用的原始PCF" in message
+        assert "不要修改采集记录中的哈希" in message
+    finally:
+        recorder.disconnect()
+        path.unlink(missing_ok=True)
+        fingerprint_path.unlink(missing_ok=True)
+
+
 def test_raw_date_hash_keeps_deduplication_across_source_restart():
     pcf = _small_pcf()
     path = Path("tmp") / "tests" / "{}.jsonl".format(uuid4().hex)
@@ -533,7 +642,7 @@ def test_raw_cross_border_hash_can_carry_hkd_cny_quote():
     assert snapshot.component_order_books["00001"].exchange == "HKEX"
 
 
-def test_raw_component_without_two_sided_depth_is_counted_as_missing():
+def test_raw_component_without_ask_blocks_creation_only():
     pcf = _small_pcf()
     component = _raw_book("000001.SZ", "SZ", 10.0)
     for level in range(1, 6):
@@ -559,8 +668,9 @@ def test_raw_component_without_two_sided_depth_is_counted_as_missing():
     report = DataQualityChecker().evaluate(source.step(), pcf)
 
     assert report.missing_weight == pytest.approx(1.0)
-    assert "MISSING_COMPONENT_QUOTES" in report.blockers
-    assert "MISSING_COMPONENT_TWO_SIDED_BOOK" in report.blockers
+    assert "CREATION_MISSING_COMPONENT_ASK" in report.creation_blockers
+    assert report.redemption_enabled
+    assert "ONE_SIDED_COMPONENT_BOOK" in report.warnings
 
 
 def test_raw_date_hash_maps_sse_etf_and_component_vendor_symbols():

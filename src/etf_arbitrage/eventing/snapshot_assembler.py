@@ -11,11 +11,15 @@ from etf_arbitrage.data.pcf import PCFDocument, SubstituteFlag
 from etf_arbitrage.domain import EventEnvelope, EventType, InstrumentId
 from etf_arbitrage.market_data.models import (
     DataQualityStatus,
+    InstrumentState,
+    MarketPhase,
     MarketSnapshot,
     OrderBook,
     OrderBookLevel,
+    StateConfidence,
     TradingStatus,
 )
+from etf_arbitrage.market_data.state import MarketStateClassifier
 
 from .dependency_graph import ETFDependencyGraph
 
@@ -107,6 +111,16 @@ def order_book_to_payload(book: OrderBook) -> dict[str, Any]:
             {"price": level.price, "quantity": level.quantity} for level in book.asks
         ],
         "trading_status": book.trading_status.value,
+        "raw_status": book.raw_status,
+        "previous_close": book.previous_close,
+        "cumulative_amount": book.cumulative_amount,
+        "cumulative_volume": book.cumulative_volume,
+        "market_phase": book.market_phase.value,
+        "instrument_state": book.instrument_state.value,
+        "state_confidence": book.state_confidence.value,
+        "state_reasons": list(book.state_reasons),
+        "quote_inactivity_age_ms": book.quote_inactivity_age_ms,
+        "price_limit_source": book.price_limit_source,
         "upper_limit_price": book.upper_limit_price,
         "lower_limit_price": book.lower_limit_price,
         "sequence_number": book.sequence_number,
@@ -175,6 +189,34 @@ def order_book_from_payload(
             else fallback_event.sequence_number
         ),
         source=str(payload.get("source", fallback_event.source)),
+        raw_status=str(payload.get("raw_status") or ""),
+        previous_close=(
+            float(payload["previous_close"])
+            if payload.get("previous_close") is not None
+            else None
+        ),
+        cumulative_amount=(
+            float(payload["cumulative_amount"])
+            if payload.get("cumulative_amount") is not None
+            else None
+        ),
+        cumulative_volume=(
+            float(payload["cumulative_volume"])
+            if payload.get("cumulative_volume") is not None
+            else None
+        ),
+        market_phase=MarketPhase(
+            str(payload.get("market_phase") or MarketPhase.UNKNOWN.value)
+        ),
+        instrument_state=InstrumentState(
+            str(payload.get("instrument_state") or InstrumentState.UNKNOWN.value)
+        ),
+        state_confidence=StateConfidence(
+            str(payload.get("state_confidence") or StateConfidence.UNKNOWN.value)
+        ),
+        state_reasons=tuple(str(item) for item in payload.get("state_reasons", ())),
+        quote_inactivity_age_ms=float(payload.get("quote_inactivity_age_ms", 0.0)),
+        price_limit_source=str(payload.get("price_limit_source") or ""),
     )
 
 
@@ -201,6 +243,7 @@ class SnapshotAssembler:
         self._max_event_time: Optional[datetime] = None
         self.last_ignored_reason: Optional[str] = None
         self.late_event_count = 0
+        self._state_classifier = MarketStateClassifier()
 
     @property
     def watermark(self) -> Optional[datetime]:
@@ -244,6 +287,7 @@ class SnapshotAssembler:
         self._max_event_time = None
         self.last_ignored_reason = None
         self.late_event_count = 0
+        self._state_classifier.reset()
 
     def register_pcf(
         self,
@@ -516,6 +560,8 @@ class SnapshotAssembler:
             if indicative
             else None
         )
+        if snapshot is not None:
+            snapshot = self._state_classifier.classify_snapshot(snapshot)
         return SnapshotAssemblyResult(
             etf_id=etf_id,
             status=status,

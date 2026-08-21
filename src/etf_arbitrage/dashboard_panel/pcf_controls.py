@@ -14,6 +14,7 @@ import panel as pn
 from etf_arbitrage.data import (
     ETF_PROFILES,
     PCFRepository,
+    SZSE_DEFAULT_PCF_URL_TEMPLATE,
     etf_search_options,
     extract_etf_code,
     format_etf_search_option,
@@ -203,11 +204,14 @@ class PanelPCFControls:
             return
         self.etf_select.options = etf_search_options(self._local_etf_codes())
         templates = self._source_templates()
+        exchange = infer_etf_exchange(etf_code)
         self.url_input.value = templates.get(etf_code, "")
-        is_sse = infer_etf_exchange(etf_code) == Exchange.SSE
+        if exchange == Exchange.SZSE and not self.url_input.value:
+            self.url_input.value = SZSE_DEFAULT_PCF_URL_TEMPLATE
+        is_sse = exchange == Exchange.SSE
         if is_sse and not self.url_input.value:
             self.url_input.placeholder = (
-                "沪市无需填写：直接使用上交所官方PCF查询接口"
+                "沪市无需填写：按交易日自动查询基金管理人官方历史PCF"
             )
             self.save_url_button.disabled = True
         else:

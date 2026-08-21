@@ -23,6 +23,7 @@ from .models import (
     TradingStatus,
 )
 from .source import MarketDataSource
+from .state import MarketStateClassifier, optional_number
 
 
 class NoNewSnapshotError(RuntimeError):
@@ -57,6 +58,7 @@ class RedisMarketDataSource(MarketDataSource):
         self._latest_fingerprint = self._load_recording_fingerprint()
         self._message = "Redis disabled" if not config.enabled else "not connected"
         self._symbols: set[str] = set()
+        self._state_classifier = MarketStateClassifier()
 
     def connect(self) -> None:
         if not self.config.enabled:
@@ -93,6 +95,7 @@ class RedisMarketDataSource(MarketDataSource):
         self._client = None
         self._connected = False
         self._running = False
+        self._state_classifier.reset()
 
     def start(self) -> None:
         if not self._connected:
@@ -146,7 +149,7 @@ class RedisMarketDataSource(MarketDataSource):
         snapshots, _ = DynamicMarketDataLoader().from_frame(pd.DataFrame(frame_rows))
         if not snapshots:
             raise ValueError("Normalized Redis payload contains no complete snapshot")
-        return snapshots[-1]
+        return self._state_classifier.classify_snapshot(snapshots[-1])
 
     def _read_date_hash(self) -> MarketSnapshot:
         if self.pcf is None:
@@ -245,6 +248,7 @@ class RedisMarketDataSource(MarketDataSource):
                 else ()
             ),
         )
+        snapshot = self._state_classifier.classify_snapshot(snapshot)
         self._append_recording(
             snapshot,
             records,
@@ -274,6 +278,27 @@ class RedisMarketDataSource(MarketDataSource):
             bids=bids,
             asks=asks,
             trading_status=self._trading_status(record.get("status")),
+            raw_status=str(record.get("status") or ""),
+            previous_close=optional_number(
+                record,
+                "preClosepx",
+                "preClosePrice",
+                "previousClose",
+            ),
+            cumulative_amount=optional_number(record, "amount", "turnover"),
+            cumulative_volume=optional_number(record, "volume", "balance"),
+            upper_limit_price=optional_number(
+                record,
+                "upperLimitPrice",
+                "upperLimitPx",
+                "highLimitPrice",
+            ),
+            lower_limit_price=optional_number(
+                record,
+                "lowerLimitPrice",
+                "lowerLimitPx",
+                "lowLimitPrice",
+            ),
             source="REDIS_DATE_HASH",
         )
 
@@ -331,7 +356,7 @@ class RedisMarketDataSource(MarketDataSource):
     @staticmethod
     def _trading_status(value: Any) -> TradingStatus:
         text = str(value or "").strip().upper()
-        if text in {"", "0", "E0", "NORMAL", "TRADING"}:
+        if text in {"", "0", "E0", "T0", "T111", "NORMAL", "TRADING"}:
             return TradingStatus.NORMAL
         if text in {"S", "SUSPENDED", "SUSPEND"}:
             return TradingStatus.SUSPENDED
@@ -490,6 +515,18 @@ class RedisMarketDataSource(MarketDataSource):
             "receive_timestamp": book.receive_timestamp.isoformat(),
             "last_price": book.last_price,
             "status": book.trading_status.value,
+            "raw_status": book.raw_status,
+            "previous_close": book.previous_close,
+            "cumulative_amount": book.cumulative_amount,
+            "cumulative_volume": book.cumulative_volume,
+            "upper_limit_price": book.upper_limit_price,
+            "lower_limit_price": book.lower_limit_price,
+            "market_phase": book.market_phase.value,
+            "instrument_state": book.instrument_state.value,
+            "state_confidence": book.state_confidence.value,
+            "state_reasons": list(book.state_reasons),
+            "quote_inactivity_age_ms": book.quote_inactivity_age_ms,
+            "price_limit_source": book.price_limit_source,
             "bids": [[level.price, level.quantity] for level in book.bids],
             "asks": [[level.price, level.quantity] for level in book.asks],
             "source": book.source,

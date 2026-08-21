@@ -1,4 +1,6 @@
+from dataclasses import replace
 from datetime import date
+from math import isnan
 from pathlib import Path
 
 from etf_arbitrage.arbitrage import ExecutableArbitrageDetector
@@ -10,7 +12,15 @@ from etf_arbitrage.executable_config import (
     SimulationConfig,
     SimulationScenario,
 )
-from etf_arbitrage.market_data import SimulatedMarketDataSource
+from etf_arbitrage.market_data import (
+    InstrumentState,
+    SimulatedMarketDataSource,
+    TradingStatus,
+)
+from etf_arbitrage.pricing import (
+    ComponentExecutionAction,
+    ExecutableBasketPricer,
+)
 
 
 PCF = Path("data/pcf/20260722/pcf_159915_20260722.xml")
@@ -22,6 +32,7 @@ def evaluation(
     costs=0,
     haircut=1.0,
     direction=DirectionSelection.BOTH,
+    optional_cash=False,
 ):
     pcf = SZSEPCFParser().parse(PCF)
     snapshot = SimulatedMarketDataSource(
@@ -36,6 +47,7 @@ def evaluation(
             safety_buffer_bps=0,
             minimum_profit_bps=0,
             minimum_profit_amount=0,
+            optional_cash_substitution=optional_cash,
         ),
         CostConfig(secondary_market_bps=costs),
     )
@@ -59,6 +71,135 @@ def test_costs_and_depth_can_remove_opportunity():
     assert not expensive.creation.executable
     shallow = evaluation(SimulationScenario.COMPONENT_DEPTH_SHORTAGE)
     assert "COMPONENT_ASK_DEPTH" in shallow.creation.rejection_reasons
+
+
+def test_incomplete_depth_never_emits_partial_basket_profit_or_bounds():
+    shallow = evaluation(SimulationScenario.COMPONENT_DEPTH_SHORTAGE)
+
+    assert not shallow.creation.pricing_complete
+    assert not shallow.redemption.pricing_complete
+    assert isnan(shallow.creation.gross_profit)
+    assert isnan(shallow.creation.estimated_costs)
+    assert isnan(shallow.creation.net_profit)
+    assert isnan(shallow.creation.net_profit_bps)
+    assert isnan(shallow.redemption.net_profit)
+    assert isnan(shallow.redemption.net_profit_bps)
+    assert isnan(shallow.lower_bound)
+    assert isnan(shallow.upper_bound)
+    assert shallow.creation_capacity.marginal_profits == ()
+    assert shallow.redemption_capacity.marginal_profits == ()
+
+
+def test_adaptive_cash_substitution_only_replaces_failed_allowed_component():
+    result = evaluation(
+        SimulationScenario.COMPONENT_DEPTH_SHORTAGE,
+        optional_cash=True,
+    )
+
+    creation = result.creation.basket
+    redemption = result.redemption.basket
+    assert creation.fully_filled
+    assert redemption.fully_filled
+    assert len(creation.adaptive_cash_substituted_symbols) == 1
+    assert len(redemption.adaptive_cash_substituted_symbols) == 1
+    symbol = creation.adaptive_cash_substituted_symbols[0]
+    assert creation.component_plans[symbol].action == (
+        ComponentExecutionAction.CASH_ADAPTIVE
+    )
+    assert creation.optional_cash_ratio <= creation.max_cash_ratio
+    assert len(creation.cash_substituted_symbols) < len(creation.component_plans)
+
+
+def test_limit_lock_is_directional_and_replans_to_physical_after_unlock():
+    pcf = SZSEPCFParser().parse(PCF)
+    snapshot = SimulatedMarketDataSource(
+        pcf,
+        SimulationConfig(scenario=SimulationScenario.NORMAL),
+    ).step()
+    symbol = next(
+        component.stock_code
+        for component in pcf.components
+        if component.component_share > 0
+        and component.substitute_flag.name == "ALLOWED"
+    )
+    normal_book = snapshot.component_order_books[symbol]
+    locked_book = replace(
+        normal_book,
+        asks=(),
+        trading_status=TradingStatus.LIMIT_UP,
+        instrument_state=InstrumentState.LIMIT_UP_LOCKED,
+    )
+    locked_books = dict(snapshot.component_order_books)
+    locked_books[symbol] = locked_book
+    pricer = ExecutableBasketPricer(pcf, optional_cash_substitution=True)
+
+    creation_locked = pricer.creation_cost(locked_books)
+    redemption_locked = pricer.redemption_proceeds(locked_books)
+    creation_unlocked = pricer.creation_cost(snapshot.component_order_books)
+
+    assert creation_locked.component_plans[symbol].action == (
+        ComponentExecutionAction.CASH_ADAPTIVE
+    )
+    assert creation_locked.component_plans[symbol].reason == "LIMIT_UP_LOCKED"
+    assert redemption_locked.component_plans[symbol].action == (
+        ComponentExecutionAction.PHYSICAL
+    )
+    assert creation_unlocked.component_plans[symbol].action == (
+        ComponentExecutionAction.PHYSICAL
+    )
+    assert symbol not in creation_unlocked.adaptive_cash_substituted_symbols
+
+
+def test_all_component_bottlenecks_are_reported_in_one_snapshot():
+    pcf = SZSEPCFParser().parse(PCF)
+    snapshot = SimulatedMarketDataSource(
+        pcf,
+        SimulationConfig(scenario=SimulationScenario.NORMAL),
+    ).step()
+    symbols = [
+        component.stock_code
+        for component in pcf.components
+        if component.component_share > 0
+        and component.substitute_flag.name == "ALLOWED"
+    ][:2]
+    books = dict(snapshot.component_order_books)
+    for symbol in symbols:
+        books[symbol] = replace(
+            books[symbol],
+            asks=(),
+            trading_status=TradingStatus.LIMIT_UP,
+            instrument_state=InstrumentState.LIMIT_UP_LOCKED,
+        )
+
+    basket = ExecutableBasketPricer(pcf).creation_cost(books)
+
+    assert not basket.fully_filled
+    assert basket.bottleneck_symbols == tuple(symbols)
+    assert all(
+        basket.component_plans[symbol].action == ComponentExecutionAction.BLOCKED
+        for symbol in symbols
+    )
+
+
+def test_pcf_maximum_cash_ratio_is_a_fail_closed_gate():
+    original = SZSEPCFParser().parse(PCF)
+    pcf = replace(original, max_cash_ratio=0.01)
+    snapshot = SimulatedMarketDataSource(
+        pcf,
+        SimulationConfig(scenario=SimulationScenario.NORMAL),
+    ).step()
+    books = {
+        symbol: replace(book, asks=())
+        for symbol, book in snapshot.component_order_books.items()
+    }
+
+    basket = ExecutableBasketPricer(
+        pcf, optional_cash_substitution=True
+    ).creation_cost(books)
+
+    assert not basket.fully_filled
+    assert basket.optional_cash_ratio > basket.max_cash_ratio
+    assert "MAX_CASH_SUBSTITUTION_RATIO_EXCEEDED" in basket.failure_reasons
 
 
 def test_bounds_capacity_and_pcf_validation():

@@ -161,6 +161,37 @@ def test_repository_downloads_from_szse_landing_page(monkeypatch) -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_repository_auto_builds_szse_url_when_template_is_empty(monkeypatch) -> None:
+    root = Path("tmp") / "tests" / uuid4().hex
+    requested_urls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return PCF_SAMPLE.read_bytes()
+
+    def fake_urlopen(request, timeout):
+        requested_urls.append(request.full_url)
+        return FakeResponse()
+
+    monkeypatch.setattr("etf_arbitrage.data.pcf_repository.urlopen", fake_urlopen)
+    try:
+        path = PCFRepository(root).download("", "159915", "20260722")
+
+        assert path.exists()
+        assert requested_urls == [
+            "https://reportdocs.static.szse.cn/files/text/ETFDown/"
+            "pcf_159915_20260722.xml"
+        ]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_repository_falls_back_to_official_report_host(monkeypatch) -> None:
     root = Path("tmp") / "tests" / uuid4().hex
     requested_urls = []
