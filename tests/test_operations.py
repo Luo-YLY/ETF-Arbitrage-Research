@@ -85,6 +85,26 @@ def test_pcf_repository_saves_and_validates_xml_and_zip() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_pcf_repository_lists_only_valid_pcfs_for_requested_day() -> None:
+    root = Path("tmp") / "tests" / uuid4().hex
+    try:
+        repository = PCFRepository(root)
+        valid_path = repository.save(
+            PCF_SAMPLE.read_bytes(),
+            "159915",
+            "20260722",
+        )
+        invalid_path = root / "20260722" / "pcf_159901_20260722.xml"
+        invalid_path.write_text("not a PCF", encoding="utf-8")
+
+        assert repository.available_for_day("20260722") == {
+            "159915": valid_path
+        }
+        assert repository.available_for_day("20260723") == {}
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_pcf_repository_rejects_wrong_etf_or_date() -> None:
     repository = PCFRepository(Path("tmp") / "tests" / uuid4().hex)
 

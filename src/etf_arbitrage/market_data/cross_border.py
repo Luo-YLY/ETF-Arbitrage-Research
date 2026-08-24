@@ -154,8 +154,7 @@ def virtual_subscription_cash_component(
 
 
 def is_virtual_subscription_cash(component: PCFComponent) -> bool:
-    symbol = str(component.symbol).replace(" ", "")
-    return component.stock_code == "159900" or symbol == "申赎现金"
+    return component.is_virtual_subscription_cash
 
 
 def calculate_cross_border_indicative_metrics(

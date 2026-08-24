@@ -1,6 +1,7 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
+import shutil
 from uuid import uuid4
 
 import pandas as pd
@@ -12,6 +13,7 @@ from etf_arbitrage.data import (
     validate_executable_pcf,
 )
 from etf_arbitrage.dashboard_panel import (
+    ExecutableMultiETFOperations,
     PanelConsoleDashboard,
     PanelExecutableDashboard,
     PanelReplayDashboard,
@@ -405,8 +407,15 @@ def test_executable_page_separates_collection_and_simulation_pcf():
     assert dashboard.multi_etf_operations is not None
     assert dashboard.multi_etf_operations.pcf is dashboard.collection_pcf
     assert dashboard.collection_pcf is not dashboard.pcf
-    assert dashboard.multi_etf_operations.monitor_etfs.value == ["159915"]
-    assert "510300" in dashboard.multi_etf_operations.monitor_etfs.options
+    assert dashboard.multi_etf_operations.trading_date.value == (
+        dashboard.collection_pcf.trading_date
+    )
+    assert dashboard.multi_etf_operations.pcf_download_etfs.value == ["159915"]
+    assert "510300" in dashboard.multi_etf_operations.pcf_download_etfs.options
+    ready = dashboard.collection_pcf.repository.available_for_day(
+        dashboard.collection_pcf.trading_day
+    )
+    assert set(dashboard.multi_etf_operations.monitor_etfs.options) <= set(ready)
     assert "159920" not in dashboard.multi_etf_operations.monitor_etfs.options
 
     tabs = dashboard.view().select(pn.Tabs)[0]
@@ -569,3 +578,41 @@ def test_dynamic_szse_etf_gets_automatic_official_pcf_url():
         "https://reportdocs.static.szse.cn/files/text/ETFDown/"
         "pcf_{etf_code}_{trade_date}.xml"
     )
+
+
+def test_batch_pcf_download_populates_only_validated_collection_choices(
+    monkeypatch,
+):
+    temporary_root = PROJECT_ROOT / "tmp" / "tests" / uuid4().hex
+    try:
+        controls = PanelPCFControls(
+            temporary_root,
+            default_etf="159915",
+            default_date=date(2026, 7, 22),
+        )
+        operations = ExecutableMultiETFOperations(temporary_root, controls)
+        sample = (
+            PROJECT_ROOT
+            / "data"
+            / "pcf"
+            / "20260722"
+            / "pcf_159915_20260722.xml"
+        ).read_bytes()
+
+        def fake_download(_url, code, trading_day):
+            return controls.repository.save(sample, code, trading_day)
+
+        monkeypatch.setattr(controls.repository, "download", fake_download)
+        assert operations.monitor_etfs.options == []
+        operations.trading_date.value = date(2026, 7, 23)
+        assert controls.trading_date == date(2026, 7, 23)
+        operations.trading_date.value = date(2026, 7, 22)
+
+        operations._download_selected_pcfs(None)
+
+        assert operations.monitor_etfs.options == ["159915"]
+        assert operations.monitor_etfs.value == ["159915"]
+        assert "#2F6B4F" in operations.message.object
+        operations.stop_runtime()
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)

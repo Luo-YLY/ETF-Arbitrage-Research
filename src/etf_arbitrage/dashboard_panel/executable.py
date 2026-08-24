@@ -590,8 +590,14 @@ class PanelExecutableDashboard:
                 stylesheets=[EXECUTABLE_CSS],
                 sizing_mode="stretch_width",
             ),
-            self.collection_pcf.view(),
             self.multi_etf_operations.view(),
+            pn.Card(
+                self.collection_pcf.view(),
+                title="单只PCF下载、上传或本地导入（可选）",
+                collapsed=True,
+                collapsible=True,
+                sizing_mode="stretch_width",
+            ),
             sizing_mode="stretch_width",
         )
 

@@ -4,7 +4,11 @@ from math import isnan
 from pathlib import Path
 
 from etf_arbitrage.arbitrage import ExecutableArbitrageDetector
-from etf_arbitrage.data import SZSEPCFParser, validate_executable_pcf
+from etf_arbitrage.data import (
+    SZSEPCFParser,
+    SubstituteFlag,
+    validate_executable_pcf,
+)
 from etf_arbitrage.executable_config import (
     CostConfig,
     DirectionSelection,
@@ -179,6 +183,46 @@ def test_all_component_bottlenecks_are_reported_in_one_snapshot():
         basket.component_plans[symbol].action == ComponentExecutionAction.BLOCKED
         for symbol in symbols
     )
+
+
+def test_virtual_subscription_cash_is_not_double_counted_in_iopv_or_basket():
+    original = SZSEPCFParser().parse(PCF)
+    snapshot = SimulatedMarketDataSource(
+        original,
+        SimulationConfig(scenario=SimulationScenario.NORMAL),
+    ).step()
+    virtual_cash = replace(
+        original.components[0],
+        stock_code="159900",
+        symbol="申赎现金",
+        component_share=0.0,
+        substitute_flag=SubstituteFlag.MANDATORY,
+        creation_cash_substitute=935_000.0,
+        redemption_cash_substitute=934_000.0,
+    )
+    with_virtual_cash = replace(
+        original,
+        components=(*original.components, virtual_cash),
+        record_num=original.record_num + 1,
+        total_record_num=original.total_record_num + 1,
+    )
+    baseline = ExecutableBasketPricer(original)
+    corrected = ExecutableBasketPricer(with_virtual_cash)
+
+    assert corrected.internal_iopv(snapshot.component_order_books) == (
+        baseline.internal_iopv(snapshot.component_order_books)
+    )
+    assert corrected.creation_cost(snapshot.component_order_books).total_value == (
+        baseline.creation_cost(snapshot.component_order_books).total_value
+    )
+    assert corrected.redemption_proceeds(
+        snapshot.component_order_books
+    ).total_value == baseline.redemption_proceeds(
+        snapshot.component_order_books
+    ).total_value
+    assert "159900" not in corrected.creation_cost(
+        snapshot.component_order_books
+    ).component_plans
 
 
 def test_pcf_maximum_cash_ratio_is_a_fail_closed_gate():

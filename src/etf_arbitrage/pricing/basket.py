@@ -107,6 +107,8 @@ class ExecutableBasketPricer:
         physical = 0.0
         cash = self.pcf.estimate_cash_component
         for component in self.pcf.components:
+            if component.is_virtual_subscription_cash:
+                continue
             if component.substitute_flag.requires_cash_substitution:
                 cash += component.creation_cash_substitute
                 continue
@@ -143,6 +145,8 @@ class ExecutableBasketPricer:
         optional_cash_reference_value = 0.0
         side = SweepSide.BUY if direction == "CREATION" else SweepSide.SELL
         for component in self.pcf.components:
+            if component.is_virtual_subscription_cash:
+                continue
             book = books.get(component.stock_code)
             quantity = component.component_share * cu_count
             reference_price = self._reference_price(book, direction)

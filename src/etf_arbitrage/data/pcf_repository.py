@@ -210,6 +210,29 @@ class PCFRepository:
             return candidate
         return None
 
+    def available_for_day(
+        self,
+        trading_day: Union[date, str],
+    ) -> Dict[str, Path]:
+        """Return locally stored PCFs that pass code and trading-day validation."""
+
+        day = self._day_text(trading_day)
+        folder = self.root / day
+        if not folder.exists():
+            return {}
+        available: Dict[str, Path] = {}
+        for candidate in sorted([*folder.glob("*.xml"), *folder.glob("*.json")]):
+            match = re.search(r"pcf_(\d{6})_", candidate.stem, re.IGNORECASE)
+            if match is None:
+                continue
+            code = match.group(1)
+            try:
+                self.validate(candidate, code, day)
+            except (OSError, PCFParseError, PCFValidationError, ValueError):
+                continue
+            available[code] = candidate
+        return available
+
     def save(self, content: bytes, etf_code: str, trading_day: Union[date, str]) -> Path:
         code = extract_etf_code(etf_code)
         exchange = infer_etf_exchange(code)

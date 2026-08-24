@@ -72,6 +72,20 @@ class PCFComponent:
         )
         return InstrumentId(exchange, self.stock_code)
 
+    @property
+    def is_virtual_subscription_cash(self) -> bool:
+        """Whether this is the zero-share ``159900 申赎现金`` helper row.
+
+        Some PCFs publish the settlement helper as a mandatory cash component.
+        Its amount is already represented by the PCF cash component and must not
+        be priced as an additional constituent.
+        """
+
+        normalized_symbol = "".join(str(self.symbol).split())
+        return self.component_share == 0 and (
+            self.stock_code == "159900" or normalized_symbol == "申赎现金"
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "stock_code": self.stock_code,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from etf_arbitrage.data import (
     extract_etf_code,
     format_etf_search_option,
 )
+from etf_arbitrage.domain import Exchange
 from etf_arbitrage.operations import (
     ExecutableMonitorController,
     ExecutableMonitorJob,
@@ -66,20 +68,34 @@ class ExecutableMultiETFOperations:
         self.controller = ExecutableMonitorController(self.project_root)
         self.schedule = SZSEMarketSchedule()
         self.callback = None
+        self._refreshing = False
+        self._ready_selection_initialized = False
         defaults = [
             code
             for code in (default_etfs or ("159915",))
             if code in MAINLAND_EXECUTABLE_ETFS
         ] or [MAINLAND_EXECUTABLE_ETFS[0]]
+        self._default_etfs = tuple(defaults)
 
-        self.monitor_etfs = pn.widgets.MultiChoice(
-            label="并行采集ETF",
+        self.trading_date = pn.widgets.DatePicker(
+            label="PCF与采集交易日",
+            value=self.pcf.trading_date,
+        )
+        self.pcf_download_etfs = pn.widgets.MultiChoice(
+            label="需要下载或校验PCF的ETF",
             options=list(MAINLAND_EXECUTABLE_ETFS),
             value=defaults,
-            placeholder="选择需要并行保存五档快照的境内ETF",
+            placeholder="选择需要准备当日PCF的境内ETF",
+        )
+
+        self.monitor_etfs = pn.widgets.MultiChoice(
+            label="并行采集ETF（仅显示已下载且校验通过的当日PCF）",
+            options=[],
+            value=[],
+            placeholder="请先下载并校验当日PCF",
         )
         self.monitor_search = pn.widgets.AutocompleteInput(
-            label="添加境内ETF代码或名称",
+            label="添加ETF代码或名称到PCF清单",
             options=[
                 format_etf_search_option(code) for code in MAINLAND_EXECUTABLE_ETFS
             ],
@@ -90,9 +106,26 @@ class ExecutableMultiETFOperations:
             min_characters=1,
         )
         self.add_button = pn.widgets.Button(
-            label="加入并行采集",
+            label="加入PCF清单",
             icon="plus",
             color="primary",
+        )
+        self.download_pcfs_button = pn.widgets.Button(
+            label="一键下载并校验所选PCF",
+            icon="download",
+            color="primary",
+        )
+        self.ready_refresh_button = pn.widgets.Button(
+            label="刷新已下载PCF",
+            icon="refresh",
+        )
+        self.select_all_ready_button = pn.widgets.Button(
+            label="选择全部已就绪ETF",
+            icon="checks",
+        )
+        self.clear_monitor_button = pn.widgets.Button(
+            label="清空采集选择",
+            icon="x",
         )
         self.interval = pn.widgets.FloatInput(
             label="采集间隔（秒）",
@@ -169,19 +202,24 @@ class ExecutableMultiETFOperations:
             sizing_mode="stretch_width",
         )
 
+        self.trading_date.param.watch(self._trading_date_changed, "value")
         self.monitor_etfs.param.watch(self._selection_changed, "value")
         self.add_button.on_click(self._add_etf)
+        self.download_pcfs_button.on_click(self._download_selected_pcfs)
+        self.ready_refresh_button.on_click(self._refresh_clicked)
+        self.select_all_ready_button.on_click(self._select_all_ready)
+        self.clear_monitor_button.on_click(self._clear_monitor)
         self.start_button.on_click(self._start)
         self.stop_button.on_click(self._stop)
         self.refresh_button.on_click(self._refresh_clicked)
         self.auto_refresh.param.watch(self._auto_refresh_changed, "value")
-        self.pcf.on_change(self.refresh)
+        self.pcf.on_change(self._pcf_controls_changed)
         self.refresh()
         pn.state.onload(self.start_runtime)
 
     @property
     def trading_day(self) -> str:
-        return self.pcf.trading_day
+        return self.trading_date.value.strftime("%Y%m%d")
 
     def view(self):
         return pn.Card(
@@ -189,10 +227,16 @@ class ExecutableMultiETFOperations:
                 "该任务只接受沪深境内成分ETF。每只ETF独立读取当日PCF完整篮子、"
                 "并行采集Redis五档并保存JSONL；含非沪深成分的PCF会被后台拒绝。"
             ),
+            pn.pane.Markdown("#### 1. 批量准备当日PCF"),
+            self.trading_date,
             pn.Row(self.monitor_search, self.add_button),
-            self.monitor_etfs,
-            pn.pane.Markdown("#### 已选ETF的当日PCF"),
+            self.pcf_download_etfs,
+            pn.Row(self.download_pcfs_button, self.ready_refresh_button),
             self.pcf_table,
+            pn.pane.Markdown("#### 2. 从已校验PCF中选择日内采集ETF"),
+            self.monitor_etfs,
+            pn.Row(self.select_all_ready_button, self.clear_monitor_button),
+            pn.pane.Markdown("#### 3. 设置采集任务"),
             pn.Row(
                 self.interval,
                 self.max_workers,
@@ -217,59 +261,66 @@ class ExecutableMultiETFOperations:
         )
 
     def refresh(self) -> None:
-        selected = list(self.monitor_etfs.value)
-        rows = []
-        for code in selected:
-            try:
-                path = self.pcf.repository.find(code, self.trading_day)
-                rows.append(
-                    {
-                        "ETF": code,
-                        "名称": etf_profile(code).name,
-                        "PCF状态": "已校验" if path is not None else "缺失",
-                        "本地文件": (
-                            str(path.relative_to(self.project_root))
-                            if path is not None
-                            and path.is_relative_to(self.project_root)
-                            else str(path or "")
-                        ),
-                    }
-                )
-            except Exception as exc:
-                rows.append(
-                    {
-                        "ETF": code,
-                        "名称": etf_profile(code).name,
-                        "PCF状态": "校验失败",
-                        "错误": str(exc),
-                    }
-                )
-        self.pcf_table.value = pd.DataFrame(rows)
-
-        state = read_job_state(self.controller.state_path(self.trading_day))
-        phase = self.schedule.phase(datetime.now())
-        status = state.get("status", "not_started")
-        self.status_table.value = pd.DataFrame(
-            [
-                {
-                    "交易日": self.trading_day,
-                    "当前时段": PHASE_LABELS.get(phase, phase),
-                    "Redis配置": "已配置"
-                    if os.getenv("SZ_REDIS_HOST")
-                    else "未配置",
-                    "任务状态": STATUS_LABELS.get(status, status),
-                    "进程号": state.get("pid", ""),
-                    "累计轮询": state.get("polls", 0),
-                    "重启次数": state.get("restart_count", 0),
-                    "监控ETF": ",".join(state.get("etf_codes", selected)),
-                }
+        if self._refreshing:
+            return
+        self._refreshing = True
+        try:
+            ready = self._available_mainland_pcfs()
+            ready_codes = sorted(ready)
+            selected = [
+                code for code in self.monitor_etfs.value if code in ready
             ]
-        )
-        latest = state.get("latest", {})
-        self.latest_table.value = pd.DataFrame(
-            [dict(ETF=code, **value) for code, value in latest.items()]
-        )
-        self.log_pane.value = self._tail(self.controller.log_path(self.trading_day))
+            if not self._ready_selection_initialized:
+                selected = [code for code in self._default_etfs if code in ready]
+                self._ready_selection_initialized = True
+            self.monitor_etfs.param.update(
+                options=ready_codes,
+                value=selected,
+            )
+
+            preparation_codes = list(self.pcf_download_etfs.value)
+            rows = []
+            for code in dict.fromkeys([*preparation_codes, *ready_codes]):
+                path = ready.get(code)
+                rows.append(
+                    {
+                        "ETF": code,
+                        "名称": etf_profile(code).name,
+                        "PCF状态": "已下载并校验" if path is not None else "缺失",
+                        "可选采集": "是" if path is not None else "否",
+                        "本地文件": self._display_path(path),
+                    }
+                )
+            self.pcf_table.value = pd.DataFrame(rows)
+
+            state = read_job_state(self.controller.state_path(self.trading_day))
+            phase = self.schedule.phase(datetime.now())
+            status = state.get("status", "not_started")
+            self.status_table.value = pd.DataFrame(
+                [
+                    {
+                        "交易日": self.trading_day,
+                        "当前时段": PHASE_LABELS.get(phase, phase),
+                        "Redis配置": "已配置"
+                        if os.getenv("SZ_REDIS_HOST")
+                        else "未配置",
+                        "任务状态": STATUS_LABELS.get(status, status),
+                        "进程号": state.get("pid", ""),
+                        "累计轮询": state.get("polls", 0),
+                        "重启次数": state.get("restart_count", 0),
+                        "监控ETF": ",".join(state.get("etf_codes", selected)),
+                    }
+                ]
+            )
+            latest = state.get("latest", {})
+            self.latest_table.value = pd.DataFrame(
+                [dict(ETF=code, **value) for code, value in latest.items()]
+            )
+            self.log_pane.value = self._tail(
+                self.controller.log_path(self.trading_day)
+            )
+        finally:
+            self._refreshing = False
 
     def start_runtime(self) -> None:
         if not self.auto_refresh.value:
@@ -311,7 +362,9 @@ class ExecutableMultiETFOperations:
                 paths[code] = str(path)
         if missing:
             self._set_message(
-                "请先逐只下载并校验当日PCF：{}".format(", ".join(missing)),
+                "以下ETF的当日PCF尚未就绪，请先批量下载并校验：{}".format(
+                    ", ".join(missing)
+                ),
                 "warning",
             )
             return
@@ -347,6 +400,90 @@ class ExecutableMultiETFOperations:
     def _selection_changed(self, _event) -> None:
         self.refresh()
 
+    def _trading_date_changed(self, event) -> None:
+        self._ready_selection_initialized = False
+        if self.pcf.date_picker.value != event.new:
+            self.pcf.date_picker.value = event.new
+        else:
+            self.refresh()
+
+    def _pcf_controls_changed(self) -> None:
+        if self.trading_date.value != self.pcf.trading_date:
+            self.trading_date.value = self.pcf.trading_date
+            return
+        self.refresh()
+
+    def _download_selected_pcfs(self, _event) -> None:
+        selected = tuple(dict.fromkeys(self.pcf_download_etfs.value))
+        if not selected:
+            self._set_message("请至少选择一只需要准备PCF的ETF。", "warning")
+            return
+        self.download_pcfs_button.disabled = True
+        self.download_pcfs_button.loading = True
+        successes: dict[str, Path] = {}
+        failures: dict[str, str] = {}
+
+        def download_one(code: str) -> Path:
+            existing = self.pcf.repository.find(code, self.trading_day)
+            if existing is not None:
+                return existing
+            return self.pcf.repository.download(
+                self.pcf.download_url_for(code),
+                code,
+                self.trading_day,
+            )
+
+        try:
+            workers = min(4, len(selected))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(download_one, code): code for code in selected
+                }
+                for future in as_completed(futures):
+                    code = futures[future]
+                    try:
+                        successes[code] = future.result()
+                    except Exception as exc:
+                        failures[code] = str(exc)
+            self.refresh()
+            selectable = set(self.monitor_etfs.options)
+            newly_selected = list(self.monitor_etfs.value)
+            for code in selected:
+                if (
+                    code in successes
+                    and code in selectable
+                    and code not in newly_selected
+                ):
+                    newly_selected.append(code)
+            self.monitor_etfs.value = newly_selected
+            if failures:
+                details = "；".join(
+                    "{}: {}".format(code, message)
+                    for code, message in failures.items()
+                )
+                self._set_message(
+                    "PCF批量处理完成：成功{}只，失败{}只。{}".format(
+                        len(successes), len(failures), details
+                    ),
+                    "warning",
+                )
+            else:
+                self._set_message(
+                    "PCF批量下载、校验完成，共{}只；已加入日内采集选择。".format(
+                        len(successes)
+                    ),
+                    "success",
+                )
+        finally:
+            self.download_pcfs_button.loading = False
+            self.download_pcfs_button.disabled = False
+
+    def _select_all_ready(self, _event) -> None:
+        self.monitor_etfs.value = list(self.monitor_etfs.options)
+
+    def _clear_monitor(self, _event) -> None:
+        self.monitor_etfs.value = []
+
     def _add_etf(self, _event) -> None:
         try:
             code = extract_etf_code(
@@ -361,16 +498,16 @@ class ExecutableMultiETFOperations:
                 "warning",
             )
             return
-        options = list(self.monitor_etfs.options)
+        options = list(self.pcf_download_etfs.options)
         if code not in options:
             options.append(code)
-            self.monitor_etfs.options = options
-        selected = list(self.monitor_etfs.value)
+            self.pcf_download_etfs.options = options
+        selected = list(self.pcf_download_etfs.value)
         if code not in selected:
             selected.append(code)
-            self.monitor_etfs.value = selected
+            self.pcf_download_etfs.value = selected
         self.monitor_search.value = ""
-        self._set_message("已将{}加入并行采集列表。".format(code), "success")
+        self._set_message("已将{}加入PCF准备清单。".format(code), "success")
 
     def _auto_refresh_changed(self, event) -> None:
         if event.new:
@@ -389,6 +526,37 @@ class ExecutableMultiETFOperations:
             '<div style="border-left:3px solid {fg};background:{bg};'
             'padding:8px 10px;color:{fg}">{text}</div>'
         ).format(fg=foreground, bg=background, text=text)
+
+    def _available_mainland_pcfs(self) -> dict[str, Path]:
+        available = self.pcf.repository.available_for_day(self.trading_day)
+        eligible: dict[str, Path] = {}
+        mainland = {Exchange.SSE, Exchange.SZSE}
+        for code, path in available.items():
+            try:
+                document = self.pcf.repository.validate(
+                    path,
+                    code,
+                    self.trading_day,
+                )
+                if document.etf_id.exchange not in mainland:
+                    continue
+                if any(
+                    component.component_share > 0
+                    and component.instrument_id.exchange not in mainland
+                    for component in document.components
+                ):
+                    continue
+            except Exception:
+                continue
+            eligible[code] = path
+        return eligible
+
+    def _display_path(self, path: Optional[Path]) -> str:
+        if path is None:
+            return ""
+        if path.is_relative_to(self.project_root):
+            return str(path.relative_to(self.project_root))
+        return str(path)
 
     @staticmethod
     def _tail(path: Path, maximum_lines: int = 30) -> str:

@@ -180,6 +180,21 @@ class PanelPCFControls:
     def on_change(self, callback: Callable[[], None]) -> None:
         self._callbacks.append(callback)
 
+    def download_url_for(self, etf_code: str) -> str:
+        """Resolve the configured official source for one ETF.
+
+        An empty value is intentional for SSE ETFs: the repository will query
+        the exchange's official historical PCF service automatically.
+        """
+
+        code = extract_etf_code(etf_code)
+        configured = self._source_templates().get(code, "")
+        if configured:
+            return configured
+        if infer_etf_exchange(code) == Exchange.SZSE:
+            return SZSE_DEFAULT_PCF_URL_TEMPLATE
+        return ""
+
     def view(self):
         return pn.Column(
             pn.Row(self.etf_select, self.date_picker),
@@ -203,11 +218,8 @@ class PanelPCFControls:
             self.local_path_input.value = ""
             return
         self.etf_select.options = etf_search_options(self._local_etf_codes())
-        templates = self._source_templates()
         exchange = infer_etf_exchange(etf_code)
-        self.url_input.value = templates.get(etf_code, "")
-        if exchange == Exchange.SZSE and not self.url_input.value:
-            self.url_input.value = SZSE_DEFAULT_PCF_URL_TEMPLATE
+        self.url_input.value = self.download_url_for(etf_code)
         is_sse = exchange == Exchange.SSE
         if is_sse and not self.url_input.value:
             self.url_input.placeholder = (
