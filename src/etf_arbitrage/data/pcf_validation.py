@@ -8,6 +8,8 @@ import hashlib
 from pathlib import Path
 from typing import Optional, Union
 
+from etf_arbitrage.domain import Exchange, infer_etf_exchange
+
 from .pcf import PCFDocument, SubstituteFlag, SZSEPCFParser
 from .sse_pcf import SSEPCFParser
 
@@ -34,7 +36,13 @@ def validate_executable_pcf(
     source = Path(path)
     content = source.read_bytes()
     prefix = content.lstrip()[:1]
-    parser = SSEPCFParser() if source.suffix.lower() == ".json" or prefix == b"{" else SZSEPCFParser()
+    parser = (
+        SSEPCFParser()
+        if (expected_code and infer_etf_exchange(expected_code) == Exchange.SSE)
+        or source.suffix.lower() == ".json"
+        or prefix == b"{"
+        else SZSEPCFParser()
+    )
     document = parser.parse(source)
     errors = []
     warnings = []

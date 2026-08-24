@@ -8,9 +8,15 @@ from typing import Any, Dict
 
 
 class DataSourceMode(str, Enum):
+    EXECUTABLE_REPLAY = "EXECUTABLE_REPLAY"
     SIMULATED = "SIMULATED"
     FILE_REPLAY = "FILE_REPLAY"
     REDIS = "REDIS"
+
+
+class RedisSnapshotFormat(str, Enum):
+    NORMALIZED_JSON = "NORMALIZED_JSON"
+    DATE_HASH = "DATE_HASH"
 
 
 class SimulationScenario(str, Enum):
@@ -67,6 +73,12 @@ class RedisConfig:
     port: int = 6379
     db: int = 0
     password: str | None = None
+    snapshot_format: RedisSnapshotFormat = RedisSnapshotFormat.NORMALIZED_JSON
+    trade_date_key: str = ""
+    hkd_cny_code: str = ""
+    number_of_book_levels: int = 5
+    poll_interval_ms: int = 3_000
+    recording_path: str = ""
     key_prefix: str = "etf_arbitrage"
     channel_pattern: str = "market:*"
     socket_timeout_seconds: float = 2.0
@@ -79,6 +91,10 @@ class SimulationConfig:
     price_seed_mode: SimulationPriceSeedMode = SimulationPriceSeedMode.AUTO_LOCAL
     local_recording_path: str = ""
     redis_code_suffix: str = ".SZ"
+    redis_hkd_cny_code: str = ""
+    hkd_cny_mid: float = 0.92
+    hkd_cny_spread_bps: float = 2.0
+    hkd_cny_volatility: float = 0.0
     tick_interval_ms: int = 1_000
     total_ticks: int = 300
     simulation_speed: float = 1.0
@@ -141,7 +157,8 @@ class ExecutionConfig:
 
 @dataclass(frozen=True)
 class DataQualityConfig:
-    max_quote_age_ms: int = 5_000
+    max_quote_age_ms: int = 120_000
+    max_source_watermark_age_ms: int = 15_000
     max_cross_section_skew_ms: int = 5_000
     maximum_missing_weight: float = 0.01
     maximum_stale_weight: float = 0.05
@@ -170,7 +187,7 @@ class PrimaryMarketConfig:
 @dataclass(frozen=True)
 class PaperArbitrageConfig:
     etf_code: str = "159915"
-    data_source: DataSourceMode = DataSourceMode.SIMULATED
+    data_source: DataSourceMode = DataSourceMode.EXECUTABLE_REPLAY
     redis: RedisConfig = field(default_factory=RedisConfig)
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
     file_replay: FileReplayConfig = field(default_factory=FileReplayConfig)
@@ -181,7 +198,7 @@ class PaperArbitrageConfig:
     primary_market: PrimaryMarketConfig = field(default_factory=PrimaryMarketConfig)
     save_run_data: bool = True
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, include_secrets: bool = False) -> Dict[str, Any]:
         def convert(value: Any) -> Any:
             if isinstance(value, Enum):
                 return value.value
@@ -191,4 +208,15 @@ class PaperArbitrageConfig:
                 return [convert(item) for item in value]
             return value
 
-        return convert(asdict(self))
+        payload = convert(asdict(self))
+        if self.data_source in {
+            DataSourceMode.EXECUTABLE_REPLAY,
+            DataSourceMode.REDIS,
+        }:
+            payload.pop("simulation", None)
+            replay = payload.pop("file_replay", None)
+            if self.data_source == DataSourceMode.EXECUTABLE_REPLAY:
+                payload["recording_replay"] = replay
+        if not include_secrets and payload["redis"].get("password"):
+            payload["redis"]["password"] = "***"
+        return payload

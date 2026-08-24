@@ -1,9 +1,18 @@
-# 沪深 ETF 套利研究系统
+# 沪深 ETF 套利研究系统（跨境模块暂停）
 
 ETF Arbitrage v1.0 是一个面向研究的 Python 原型，用统一数据接口完成 ETF 理论价值计算、
 折溢价监控、机会识别、风险阻断、历史回放和价差头寸回测。深交所 XML PCF 与上交所公开
 PCF 查询 JSON 已统一映射到同一模型；Panel 控制台可以按代码或名称搜索，也允许直接输入
 新的六位 ETF 代码。沪市账户、申赎、结算和生产行情规则仍属于待接入边界。
+
+当前盘中主线只接受沪深上市、且有效成分全部属于沪深的境内ETF。“实盘套利模拟”可按
+当日PCF并行采集多只ETF及其完整篮子的Redis五档快照，并为每只ETF保留独立JSONL文件。
+2026-08-19 已在交易日Hash单条记录中观察到五档
+`bidPrice/bidVolume/offerPrice/offerVolume` 字段；ETF单条成功不等于PCF全部成分同步可用，
+盘前仍必须检查全篮子覆盖、方向所需盘口、市场阶段、数据源水位和时间戳。缺少某一方向的
+执行要素时只阻断该方向，不再因为单边盘口一律阻断申购与赎回。港股/跨境入口和历史研究
+代码暂时保留，但因当前没有同口径实时IOPV，本轮不
+启动、不进入多ETF任务。公共第三方行情下载不属于项目盘中数据链路。
 
 ## 核心口径
 
@@ -44,7 +53,8 @@ ETF_Arbitrage_Project/
 ├── scripts/           # 命令行演示
 ├── tests/             # 基础与集成测试
 ├── streamlit_app.py   # Streamlit 看板入口
-└── panel_app.py       # Panel 双页面控制台入口
+├── panel_app.py       # 沪深 Panel 双页面控制台入口
+└── panel_hk_app.py    # 独立港股 PCF 与行情接口控制台入口
 ```
 
 采用 `src/etf_arbitrage/signal` 命名空间而非项目根目录的 `signal` 包，是为了避免覆盖 Python
@@ -70,19 +80,34 @@ conda env create -f environment.yml
 conda activate etf-arbitrage-py314
 python scripts/run_demo.py
 python -m streamlit run streamlit_app.py
-python -m panel serve panel_app.py --address 127.0.0.1 --port 8505
+python -m panel serve panel_app.py --address 127.0.0.1 --port 8505 --allow-websocket-origin 127.0.0.1:8505 --allow-websocket-origin localhost:8505
 ```
 
 当前工作区也可将环境直接创建在 `.conda/py314`，通过
 `.\.conda\py314\python.exe` 使用，无需修改全局环境。各运行入口会自动加载本地 `src` 目录。
 
-Panel 控制台打开地址为 `http://127.0.0.1:8505/panel_app`，直接进入套利模拟可使用
+当前只需启动沪深Panel。控制台打开地址为 `http://127.0.0.1:8505/panel_app`，直接进入套利模拟可使用
 `http://127.0.0.1:8505/panel_app?page=executable`。控制台分为“实盘均值回复监控”和
 “实盘套利模拟”两个独立页面。前者接入 PCF、内网 Redis 最新价采集、观察文件回放和收盘
-折溢价收敛研究；后者接入 PCF、模拟行情、上传/本地历史行情或标准化 Redis 快照，使用 ETF
+折溢价收敛研究；后者只接入完整五档采集文件或交易日 Hash 原始五档 Redis，使用 ETF
 与成分股 Bid/Ask、多档深度完成纸面申赎套利、订单成交、一级市场申赎和 PnL 模拟。两页
 均复用持久化 Bokeh 数据源进行增量刷新，切页时会停止隐藏页面的定时任务。均值回复页默认
 选择当天并允许通过日历选择任意日期；页面和标签内容按需加载，不再一次创建全部隐藏组件。
+
+### 跨境入口（代码保留，当前暂停）
+
+跨境ETF控制台代码原运行于 `http://127.0.0.1:8506/panel_hk_app`，默认选择 159920。它从
+深交所公开文件域名自动下载当日XML PCF并保存到
+`data/pcf/YYYYMMDD/pcf_159920_YYYYMMDD.xml`。控制台将 159900“申赎现金”识别为清算用
+虚拟证券，只展示申购预收现金，不把它与93只港股成分重复计入IOPV。
+
+该入口本轮不启动。其历史实现仍拆为“均值回复监控”和“实盘套利模拟”两个页面：均值回复页先作为最新价
+采集台：展示159920.SZ与PCF中大写`.HK`成分的最新价和时间戳，盘中不展示IOPV或Premium；
+页面本身不再联网下载历史行情。模拟页可读取Redis最新价、本地采集记录或完全
+模拟数据，再生成ETF/成分多档盘口、纸面订单、申赎与损益。申购方向按“港股卖一×FX卖价”
+复算，赎回方向按“港股买一×FX买价”复算；港股通资格、代理买卖、现金替代多退少补和T+
+交收完成建模前，结果固定为 `INDICATIVE_PAPER`。直接打开模拟页可使用
+`http://127.0.0.1:8506/panel_hk_app?page=executable`。
 
 ## 数据接入
 
@@ -92,25 +117,86 @@ Panel 控制台打开地址为 `http://127.0.0.1:8505/panel_app`，直接进入�
 推荐的正式接入顺序：交易所 PCF 和基金主数据，ETF/成分股实时行情，停复牌与涨跌停状态，
 盘口深度和费率，最后再接申赎执行与券源约束。
 
-### 深市 Redis 行情入口
+### 内网 Redis 行情入口
 
 项目已提供只读的 `SZRedisQuotationClient` 和 `SZRedisDataFeed`。Redis 连接信息通过
 `SZ_REDIS_HOST`、`SZ_REDIS_PORT`、`SZ_REDIS_DB`、`SZ_REDIS_PASSWORD` 和
 `SZ_REDIS_TIMEOUT` 环境变量配置，仓库不保存内网地址或凭据。
 
-首次连接内网后，先安装可选依赖并探测 159915 的真实字段：
+首次连接内网后，先安装可选依赖并探测标的的真实字段。跨境ETF还应逐一抽查PCF中的
+`.HK` 成分代码：
 
 ```powershell
 python -m pip install -e ".[redis]"
 $env:SZ_REDIS_HOST="内网地址"
-python scripts/probe_sz_quotation.py --code 159915.SZ
+python scripts/probe_sz_quotation.py --code 159920.SZ
+python scripts/probe_sz_quotation.py --code 00700.HK
 ```
 
-适配器每轮只批量读取 ETF 和目标成分股，避免重复拉取整个市场。它能从 `cdate` 和 `ctime`
+适配器每轮只批量读取 ETF 和目标成分股，避免重复拉取整个市场。当前五档字段为
+`bidPrice1..5`、`bidVolume1..5`、`offerPrice1..5`、`offerVolume1..5`，同时兼容旧的
+`bidpx1/askpx1` 买一卖一命名。它能从 `cdate` 和 `ctime`
 解析供应商时间，并优先按 PCF 挂牌市场映射 Redis 代码：上交所 `.SH`、深交所 `.SZ`、
 北交所 `.BJ`、港交所 `.HK`。`--redis-code-suffix` 仅在交易所无法识别时作为兼容兜底。
-Redis 只提供最新价时，应使用指示性模式：系统可以记录行情和计算最新价 Premium，但不会
-生成可执行套利信号。
+Redis 只提供最新价时，沪深标的仍按原指示性研究口径运行；港股通入口只记录原始最新价，
+估值状态保持`PENDING_FX`，不在盘中计算Premium或生成套利信号。
+
+在启动实盘套利模拟前，可用任一境内ETF的当日PCF做一次全篮子只读预检：
+
+```powershell
+python scripts/probe_executable_redis.py `
+  --pcf data/pcf/YYYYMMDD/pcf_159915_YYYYMMDD.xml `
+  --trade-date YYYYMMDD
+```
+
+只有 `quality_blockers` 为空、ETF有双边五档且 `two_sided_components` 覆盖全部实物成分时，
+才可把结果称为当时点的纸面可执行模拟。当前日内主线只启用沪深境内成分ETF；跨境/港股
+篮子因缺少同口径实时IOPV暂不进入多ETF任务。Panel“实盘套利模拟”的“数据采集”页可
+多选境内ETF，每只ETF按自己的当日PCF并行读取交易日Hash原始五档，默认每3秒追加到：
+
+```text
+tmp/executable_recordings/YYYYMMDD/ETF代码.jsonl
+```
+
+对应的IOPV、数据质量和申购/赎回机会摘要写入：
+
+```text
+tmp/executable_results/YYYYMMDD/ETF代码.jsonl
+```
+
+完全相同的快照在同一进程及异常重启后都会跳过。后台任务自动等待开盘、午休保持、异常
+重启并在收盘后结束；关闭浏览器不会停止任务。该入口只生成研究快照和纸面机会判断，不含
+任何真实券商报单或申赎接口。
+
+### 港股通盘中采集与收盘后汇率回填（当前暂停）
+
+跨境控制台在开始采集前联网下载并校验当日官方PCF，PCF文件属于设备当日运行数据，不要求
+通过Git同步。进入内网后点击“启动当日采集”，后台只读取`159920.SZ`及PCF中全部大写
+`.HK`成分的`closepx/cdate/ctime`，原始记录写入：
+
+```text
+tmp/recordings/YYYYMMDD/159920.jsonl
+```
+
+盘中不创建159920的IOPV/Premium观察文件。收盘后准备带时间戳的HKD/CNY文件，至少包含：
+
+```csv
+timestamp,hkd_cny_mid
+2026-08-05 09:30:00,0.9201
+```
+
+再执行：
+
+```powershell
+python scripts/backfill_cross_border_fx.py `
+  --pcf data/pcf/YYYYMMDD/pcf_159920_YYYYMMDD.xml `
+  --fx-file data/reference/fx/hkd_cny_YYYYMMDD.csv
+```
+
+程序只使用`fx_timestamp <= 行情timestamp`的最近汇率，默认最大时滞60秒；原始快照不会被
+覆盖，派生结果默认写入
+`outputs/cross_border_backfill/YYYYMMDD/159920/observations.csv`。该结果标记为
+`MODEL_IOPV_POST_CLOSE`，不是交易所官方IOPV。
 
 ### 沪市 PCF 入口
 
@@ -209,52 +295,71 @@ ETF与成分股多档Bid/Ask + 官方PCF
 -> 虚拟账户、最终现金差额和PnL
 ```
 
-启动项目后，在Streamlit左侧页面导航中进入“实盘套利模拟”：
+当前实盘套利研究入口使用 Panel：
 
 ```powershell
 conda activate etf-arbitrage-py314
-python -m streamlit run streamlit_app.py
+python -m panel serve panel_app.py --address 127.0.0.1 --port 8505 --allow-websocket-origin 127.0.0.1:8505 --allow-websocket-origin localhost:8505
 ```
 
-当前工作区使用项目内环境时也可以运行：
+进入“实盘套利模拟”后，配置区拆为两个互不干扰的页面：
 
-```powershell
-.\.conda\py314\python.exe -m streamlit run streamlit_app.py
-```
+- “数据采集”：使用独立的PCF和ETF选择器，并行采集多只境内ETF。该页只保存原始五档快照与
+  机会摘要，不会改动模拟账户或创建纸面成交。
+- “套利模拟配置”：选择单只ETF和同交易日PCF，读取
+  `tmp/executable_recordings/YYYYMMDD/ETF代码.jsonl` 做流式回放；也可切换为Redis实时
+  五档纸面模拟。采集选择与模拟选择彼此独立。
 
-左侧导航固定显示为“实盘均值回复监控”和“实盘套利模拟”。模拟页面可设置有限Tick时间轴，
-并以0.25x至100x倍速连续回放；总览同步绘制ETF Bid/Ask和内部IOPV时间序列，
-鼠标悬停时使用统一时间指示线。价格图采用与均值回复监控一致的实际价格窄幅自动缩放，
-官方IOPV暂不绘制；右轴以首个有效ETF Last为0 bp显示相对开盘变化。
+当前 Panel 运行入口不再提供随机合成行情、Last价格种子、异常注入、旧版CSV/JSON字段映射，
+也不会根据Last补造Bid/Ask。完整五档文件中的ETF盘口、成分股盘口、时间戳、缺失成分和PCF
+哈希会原样进入套利引擎及数据质量门禁。大文件按行流式读取；为延迟成交预读的快照会留在
+缓冲区，之后仍会作为决策快照处理，不会跳过时间点。
 
-默认参数为159915、模拟行情、自动优先本地采集价格基准、1 CU、库存锁定模式、禁止主动使用
-允许现金替代、Redis实时接口关闭、自动影子交易关闭和只记录机会。只有在页面中主动启用
-“自动影子交易”并关闭“只记录机会”后，系统才创建带有 `simulated_only=true` 标记的虚拟订单。
-项目没有券商柜台、真实报单或撤单接口。
+默认关闭自动纸面成交，仅记录机会。只有主动启用“自动影子交易”并关闭“只记录机会”后，
+系统才创建纸面订单、成交、一级市场申赎和PnL记录。项目没有券商柜台、真实报单或撤单接口。
 
-### 三种行情模式
+### 两种行情模式
 
-- `SIMULATED`：默认模式。根据PCF生成内部一致的成分股、IOPV和ETF多档盘口，可注入溢价、
-  折价、深度不足、陈旧、缺失、停牌、涨跌停、解码错误和序号断档等场景；相同随机种子可复现。
-  侧边栏“模拟价格来源”默认选择“本地历史数据（逐条回放）”，流式读取
-  `tmp/recordings/YYYYMMDD/ETF代码.jsonl`。每条记录保留原始时间戳、ETF Last和成分股Last，
-  并在该时点合成Bid/Ask与多档深度，无需连接Redis，也不会把数百MB文件一次性载入内存。
-  也可手工指定采集文件、切换为完全模拟，或在内网环境显式读取Redis最新价。需要注意：
-  本地回放中的价格轨迹是真实采集值，盘口深度、冲击和成交仍是模拟值。
-- `FILE_REPLAY`：支持CSV、Parquet、JSON和JSONL，可输入文件、目录或通配符。载入层负责字段
-  映射，回放只读取 `timestamp <= decision_time` 的记录，不使用未来行情。
-- `REDIS`：可选实时接口，默认 `enabled=false`，并使用延迟导入。未安装Redis包或连接失败时，
-  模拟与文件回放仍可使用；密码不会在页面明文显示。
+- `EXECUTABLE_REPLAY`：默认模式。回放多ETF采集器保存的嵌套JSONL完整五档快照，并校验
+  ETF代码、交易日、PCF版本和PCF哈希。文件不匹配时拒绝启动，不降级为合成行情。
+- `REDIS`：直接读取交易日Hash原始五档做实时纸面模拟。连接参数来自启动进程的
+  `SZ_REDIS_*` 环境变量；该页不重复写采集文件，文件保存统一由“数据采集”页负责。
 
-文件回放至少需要时间、证券代码、ETF标记、买卖方向、档位、价格和数量等字段。常见的
-`bid1_price`、`bid1_volume`、`ask1_price`、`ask1_volume` 可在载入层映射，不会进入套利引擎。
-页面会显示文件数量、记录数、时间范围、证券数量、缺失字段和数据预览，并支持重新加载。
+跨设备复制严格回放数据时，必须把
+`tmp/executable_recordings/YYYYMMDD/ETF代码.jsonl`、对应的`.fingerprint`和采集设备上
+当时实际使用的`data/pcf/YYYYMMDD/pcf_ETF代码_YYYYMMDD.*`作为一个数据包复制。同一交易日
+后来从另一官方入口重新下载的PCF可能具有不同原始哈希或版本，不能替代采集时的原文件；
+不得为了通过检查而改写JSONL中的PCF哈希。
+
+### 市场状态与方向质量门禁
+
+行情质量被拆为三个彼此独立的维度：市场阶段、数据源健康和单证券状态。系统按内地市场时间
+识别开盘集合竞价、连续竞价、午休、收盘集合竞价和闭市；只有连续竞价阶段允许生成新的纸面
+套利机会，其他阶段保留快照与状态证据，但不把无盘口直接判成停牌或涨跌停。
+
+单证券状态保留供应商原始 `status`、昨收、成交额/量、盘口和推断证据。明确停牌状态才标记为
+`SUSPENDED_CONFIRMED`；目前观察到的 `T1/C1` 无盘口只标记为
+`SUSPENDED_SUSPECTED`，直到取得供应商字段字典。涨跌停优先使用供应商直接上下限字段；缺少
+直接字段时，才按证券代码板块和昨收推断涨跌幅限制，并把置信度标为中等，避免把推断当成
+交易所确认事实。
+
+申购方向只要求ETF买一和成分股卖一；赎回方向只要求ETF卖一和成分股买一。停牌、涨停无卖盘、
+跌停无买盘及报价不活跃均按PCF数量乘参考价换算成篮子名义金额占比，再分别进入申购或赎回
+门禁。一个方向不可执行时，另一个方向仍可独立通过。
+
+交易日Hash模式每轮通过一次 `HMGET` 接收ETF与全篮子，因此各证券自身 `ctime` 的横截面差异
+只作为事件时间诊断，不再误当成网络接收时间不同步。实时新鲜度由最新接收水位计算；单证券
+长时间不更新则另行进入报价不活跃门禁。非原子数据源仍保留横截面事件时间偏差告警。
 
 ### PCF与计算口径
 
 可执行页面支持官方链接下载、本地路径和XML上传，并显示交易日、申赎单位、预估现金差额、
 申赎开关、限额、现金替代统计、文件时间和SHA256哈希。下载失败只会保留错误信息并提示使用
 本地文件，不会自动换用未经确认的第三方PCF。
+
+“官方下载”会按ETF代码自动识别交易所，无需手工填写地址：沪市调用上交所官方查询接口；
+深市按ETF代码和所选交易日自动生成深交所PCF文件地址，并依次尝试官方主、备文件域名。
+该规则也适用于目录中尚未预置的新深市ETF代码。自定义地址仍可通过本机配置覆盖。
 
 默认现金替代口径为：禁止和允许现金替代的证券均按实物盘口处理；必须现金替代的证券使用
 PCF中方向对应的现金金额。启用“允许现金替代”属于高级情景研究，使用前应再次确认所用PCF
@@ -290,7 +395,8 @@ python -m pip install -e ".[redis]"
 原均值回复回测指数是折溢价头寸的收敛研究指数，并不是账户净值或申赎套利收益。新增模块已覆盖多档深度、
 最小申赎单位、现金替代、费用、延迟、账户资源和一级市场现金差额的可配置模拟，但仍不代表
 真实可成交结果。真实研究还需接入并核验交易所级盘口、券源、申赎权限、结算时点、税费、
-资金占用和券商规则。Dashboard默认数据为确定性模拟行情，只用于验证系统行为和研究流程。
+资金占用和券商规则。Panel实盘套利页面默认回放本机采集的完整五档文件，结果仍只用于验证
+系统行为和研究流程。
 
 ## 事件驱动扩展报告（2026-07-29）
 

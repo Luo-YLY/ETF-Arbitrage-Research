@@ -111,8 +111,13 @@ RAW_CSS = """
 class PanelReplayDashboard:
     """Session-local replay controller backed by a persistent Bokeh source."""
 
-    def __init__(self, project_root: Union[Path, str]) -> None:
+    def __init__(
+        self,
+        project_root: Union[Path, str],
+        default_etf: str = "159915",
+    ) -> None:
         self.project_root = Path(project_root).resolve()
+        self.default_etf = str(default_etf).zfill(6)
         self.datasets = discover_observation_datasets(self.project_root)
         self.by_day = datasets_by_day(self.datasets)
         self.observations = pd.DataFrame()
@@ -135,7 +140,7 @@ class PanelReplayDashboard:
         self.etf_select = pn.widgets.AutocompleteInput(
             label="ETF代码或名称",
             options=etf_search_options(observed_codes),
-            value=format_etf_search_option("159915"),
+            value=format_etf_search_option(self.default_etf),
             placeholder="输入6位代码、名称，或从建议中选择",
             restrict=False,
             case_sensitive=False,
@@ -1259,7 +1264,7 @@ class PanelReplayDashboard:
 
     def template(self):
         return pn.template.FastListTemplate(
-            title="深市ETF均值回复监控实验台",
+            title="沪深ETF均值回复监控实验台",
             site="ETF Arbitrage",
             accent_base_color=ACCENT,
             header_background="#202A2E",

@@ -3,7 +3,7 @@
 `models.py` 定义统一的 ETF 行情、股票行情、基金主数据和成分权重结构。
 
 `DataFeed` 是供应商无关接口。`DataFrameReplayFeed` 用于 CSV/DataFrame 历史回放，
-`SyntheticDataFeed` 提供可重复的研究样例。接入 Wind、Tushare、AKShare 或券商接口时，
+`SyntheticDataFeed` 提供可重复的研究样例。接入 Wind、Tushare、内网Redis或券商接口时，
 新增 `DataFeed` 实现即可，不需要修改估值、信号和回测模块。
 
 `sz_redis.py` 将原有深市 Redis 行情脚本拆分为两个部分：
@@ -22,7 +22,9 @@ python scripts/probe_sz_quotation.py --code 159915.SZ
 ```
 
 恢复内网后应先运行探测脚本，确认 Redis 中真实的买一、卖一、成交量、成交额和时间字段。
-默认字段映射支持 `closepx`、`bidpx1`、`askpx1`、`volume`、`amount`，时间优先读取
+默认字段映射支持 `closepx`、`bidPrice1`、`offerPrice1`、`volume`、`amount`，并兼容
+旧的 `bidpx1`、`askpx1`。完整执行盘口由市场数据层读取
+`bidPrice1..5/bidVolume1..5/offerPrice1..5/offerVolume1..5`。时间优先读取
 `timestamp`，缺失时组合 `cdate` 与 `ctime`。若没有买一卖一，可将
 `require_bid_ask=False` 用于指示性记录；最新价不会被伪装成买一卖一。
 `SZRedisDataFeed` 默认将项目内部的六位代码加上 `.SZ` 后缀再查询 Redis，输出的

@@ -12,10 +12,12 @@ import panel as pn
 
 from etf_arbitrage.data import (
     ETF_PROFILES,
+    JsonlSnapshotStore,
     etf_profile,
     etf_search_options,
     extract_etf_code,
 )
+from etf_arbitrage.domain import vendor_symbol
 from etf_arbitrage.operations import (
     MarketMonitorController,
     MarketMonitorJob,
@@ -54,21 +56,27 @@ class MeanReversionOperations:
         self,
         project_root: Union[Path, str],
         on_observations_changed: Optional[Callable[[], None]] = None,
+        pcf_controls: Optional[PanelPCFControls] = None,
+        default_etfs: Optional[tuple[str, ...]] = None,
+        capture_only: bool = False,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.controller = MarketMonitorController(self.project_root)
         self.schedule = SZSEMarketSchedule()
         self.on_observations_changed = on_observations_changed
+        self.capture_only = bool(capture_only)
         self.callback = None
 
-        self.pcf = PanelPCFControls(
+        resolved_defaults = tuple(default_etfs or ("159915",))
+        self.pcf = pcf_controls or PanelPCFControls(
             self.project_root,
+            default_etf=resolved_defaults[0],
             default_date=date.today(),
         )
         self.monitor_etfs = pn.widgets.MultiChoice(
             label="监控ETF",
             options=list(ETF_PROFILES),
-            value=["159915"],
+            value=list(resolved_defaults),
             placeholder="已加入的监控标的",
         )
         self.monitor_search = pn.widgets.AutocompleteInput(
@@ -151,6 +159,15 @@ class MeanReversionOperations:
             height=250,
             sizing_mode="stretch_width",
         )
+        self.latest_quotes_table = pn.widgets.Tabulator(
+            pd.DataFrame(),
+            show_index=False,
+            disabled=True,
+            height=520,
+            pagination="local",
+            page_size=25,
+            sizing_mode="stretch_width",
+        )
         self.log_pane = pn.widgets.TextAreaInput(
             label="",
             value="",
@@ -180,6 +197,44 @@ class MeanReversionOperations:
         return self.pcf.trading_day
 
     def view(self):
+        if self.capture_only:
+            return pn.Column(
+                pn.pane.Markdown("## 港股通ETF与成分股最新价监控"),
+                pn.pane.HTML(
+                    '<div style="border-left:4px solid #8B5E34;background:#fff8ec;'
+                    'padding:10px 12px;color:#5f4328">盘中仅保存ETF和PCF成分股最新价。'
+                    '当前不计算IOPV、不显示Premium、不生成套利信号；估值状态固定为'
+                    '<b>PENDING_FX</b>，收盘后由汇率回填程序生成独立派生结果。</div>',
+                    sizing_mode="stretch_width",
+                ),
+                pn.Row(self.monitor_search, self.add_monitor_button),
+                pn.Row(
+                    self.monitor_etfs,
+                    self.interval,
+                    self.auto_restart,
+                    self.restart_delay,
+                ),
+                pn.pane.Markdown(
+                    "Redis代码规则：ETF使用交易所后缀（如`159920.SZ`）；"
+                    "PCF中的港股成分固定映射为五位代码加大写`.HK`（如`00700.HK`）。"
+                ),
+                pn.Row(
+                    self.start_button,
+                    self.stop_button,
+                    self.refresh_button,
+                    self.auto_refresh,
+                ),
+                self.message,
+                self.status_table,
+                self.restart_status,
+                pn.pane.Markdown("#### ETF采集状态"),
+                self.latest_table,
+                pn.pane.Markdown("#### ETF与PCF成分最新价"),
+                self.latest_quotes_table,
+                pn.pane.Markdown("#### 采集日志"),
+                self.log_pane,
+                sizing_mode="stretch_width",
+            )
         return pn.Column(
             pn.pane.Markdown("## 盘前与真实行情采集"),
             pn.Tabs(
@@ -280,6 +335,10 @@ class MeanReversionOperations:
         self.latest_table.value = pd.DataFrame(
             [dict(ETF=code, **value) for code, value in latest.items()]
         )
+        if self.capture_only:
+            self.latest_quotes_table.value = pd.DataFrame(
+                self._latest_quote_rows(selected)
+            )
         self.log_pane.value = self._tail(
             self.controller.log_path(self.trading_day)
         )
@@ -335,6 +394,7 @@ class MeanReversionOperations:
                     redis_code_suffix=self.redis_suffix.value.strip() or ".SZ",
                     auto_restart=bool(self.auto_restart.value),
                     restart_delay=float(self.restart_delay.value),
+                    capture_only=self.capture_only,
                 )
             )
             self._set_message(
@@ -391,6 +451,63 @@ class MeanReversionOperations:
         self.refresh()
         if self.on_observations_changed is not None:
             self.on_observations_changed()
+
+    def _latest_quote_rows(self, selected: list[str]) -> list[dict]:
+        rows = []
+        for code in selected:
+            recording = (
+                self.project_root
+                / "tmp"
+                / "recordings"
+                / self.trading_day
+                / "{}.jsonl".format(code)
+            )
+            try:
+                path = self.pcf.repository.find(code, self.trading_day)
+                if path is None or not recording.exists():
+                    continue
+                pcf = self.pcf.repository.validate(path, code, self.trading_day)
+                snapshot = JsonlSnapshotStore(recording).latest_snapshot()
+            except Exception:
+                continue
+            rows.append(
+                {
+                    "类别": "ETF",
+                    "Redis代码": vendor_symbol(pcf.etf_id),
+                    "名称": pcf.symbol,
+                    "最新价": snapshot.etf_quote.last_price,
+                    "前收盘": None,
+                    "涨跌幅": None,
+                    "行情时间": snapshot.etf_quote.timestamp,
+                    "状态": "已记录",
+                }
+            )
+            for component in pcf.components:
+                if component.component_share <= 0:
+                    continue
+                quote = snapshot.stock_quotes.get(component.stock_code)
+                previous_close = quote.previous_close if quote is not None else None
+                last_price = quote.last_price if quote is not None else None
+                change = (
+                    last_price / previous_close - 1.0
+                    if last_price is not None
+                    and previous_close is not None
+                    and previous_close > 0
+                    else None
+                )
+                rows.append(
+                    {
+                        "类别": "成分股",
+                        "Redis代码": vendor_symbol(component.instrument_id),
+                        "名称": component.symbol,
+                        "最新价": last_price,
+                        "前收盘": previous_close,
+                        "涨跌幅": change,
+                        "行情时间": quote.timestamp if quote is not None else None,
+                        "状态": "已记录" if last_price is not None else "行情缺失",
+                    }
+                )
+        return rows
 
     @staticmethod
     def _tail(path: Path, lines: int = 80) -> str:

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import timedelta
 from io import BytesIO
 import json
 from math import isfinite
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -24,9 +25,7 @@ from bokeh.models import (
 from bokeh.plotting import figure
 
 from etf_arbitrage.data import (
-    SZRedisQuotationClient,
     SZRedisSettings,
-    load_pcf_price_seed,
     validate_executable_pcf,
 )
 from etf_arbitrage.engine import PaperArbitrageEngine, PaperEngineResult
@@ -43,20 +42,18 @@ from etf_arbitrage.executable_config import (
     PaperArbitrageConfig,
     PrimaryMarketConfig,
     RedisConfig,
-    SimulationConfig,
-    SimulationPriceSeedMode,
-    SimulationScenario,
+    RedisSnapshotFormat,
 )
 from etf_arbitrage.market_data import (
-    DynamicMarketDataLoader,
-    FileReplayMarketDataSource,
+    ExecutableRecordingReplayMarketDataSource,
     MarketDataSource,
-    RecordedHistoryMarketDataSource,
+    NoNewSnapshotError,
     RedisMarketDataSource,
-    SimulatedMarketDataSource,
+    cross_border_hk_components,
 )
 from etf_arbitrage.reporting import RunRecorder
 
+from .executable_operations import ExecutableMultiETFOperations
 from .pcf_controls import PanelPCFControls
 
 
@@ -68,27 +65,10 @@ IOPV_COLOR = "#7A5C9E"
 BID_COLOR = "#2F6B4F"
 ASK_COLOR = "#C44536"
 
-SCENARIO_LABELS = {
-    SimulationScenario.NORMAL: "正常行情",
-    SimulationScenario.PREMIUM_SHOCK: "ETF溢价冲击",
-    SimulationScenario.DISCOUNT_SHOCK: "ETF折价冲击",
-    SimulationScenario.MEAN_REVERSION: "折溢价均值回复",
-    SimulationScenario.ETF_DEPTH_SHORTAGE: "ETF盘口深度不足",
-    SimulationScenario.COMPONENT_DEPTH_SHORTAGE: "成分股盘口深度不足",
-    SimulationScenario.STALE_QUOTE: "成分股报价陈旧",
-    SimulationScenario.MISSING_QUOTE: "成分股行情缺失",
-    SimulationScenario.SUSPENSION: "成分股停牌",
-    SimulationScenario.LIMIT_UP_NO_ASK: "涨停且无卖盘",
-    SimulationScenario.LIMIT_DOWN_NO_BID: "跌停且无买盘",
-    SimulationScenario.DECODE_ERROR: "行情解码错误",
-    SimulationScenario.SEQUENCE_GAP: "行情序号断档",
-    SimulationScenario.CROSSED_BOOK: "异常交叉盘口",
-    SimulationScenario.PCF_INVALID: "PCF交易日无效",
-}
-
 STATUS_LABELS = {
     "RUNNING": "运行中",
     "READY": "就绪",
+    "COMPLETED": "已完成",
     "DISCONNECTED": "未连接",
     "DISABLED": "已禁用",
     "ERROR": "异常",
@@ -145,12 +125,34 @@ EXECUTABLE_CSS = """
 class PanelExecutableDashboard:
     """Session-local executable-arbitrage simulator and replay controller."""
 
-    def __init__(self, project_root: Union[Path, str]) -> None:
+    def __init__(
+        self,
+        project_root: Union[Path, str],
+        default_etf: str = "159915",
+        cross_border: bool = False,
+    ) -> None:
         self.project_root = Path(project_root).resolve()
         self.run_root = self.project_root / "data" / "runs"
-        self.pcf = PanelPCFControls(self.project_root)
+        self.default_etf = str(default_etf).zfill(6)
+        self.cross_border = bool(cross_border)
+        self.pcf = PanelPCFControls(
+            self.project_root,
+            default_etf=self.default_etf,
+        )
+        self.collection_pcf = PanelPCFControls(
+            self.project_root,
+            default_etf=self.default_etf,
+        )
+        self.multi_etf_operations = (
+            None
+            if self.cross_border
+            else ExecutableMultiETFOperations(
+                self.project_root,
+                self.collection_pcf,
+                default_etfs=(self.default_etf,),
+            )
+        )
         self.source: Optional[MarketDataSource] = None
-        self.file_source: Optional[FileReplayMarketDataSource] = None
         self.file_summary = None
         self.engine: Optional[PaperArbitrageEngine] = None
         self.snapshot = None
@@ -158,7 +160,6 @@ class PanelExecutableDashboard:
         self.config: Optional[PaperArbitrageConfig] = None
         self.pcf_document = None
         self.pcf_report = None
-        self.redis_price_seed = None
         self.opening_reference_price: Optional[float] = None
         self.callback = None
         self.history = _new_history()
@@ -169,141 +170,39 @@ class PanelExecutableDashboard:
         self._build_output_models()
         self._wire_events()
         self._source_mode_changed(None)
-        self._price_seed_mode_changed(None)
+        if self.cross_border:
+            self.optional_cash.value = False
+            self.optional_cash.disabled = True
+            self.optional_cash.name = "跨境套利当前暂停"
         self._refresh_pcf_views()
         self._update_views()
 
     def _build_data_widgets(self) -> None:
         self.source_mode = pn.widgets.Select(
-            label="行情数据源",
+            label="套利模拟行情来源",
             options={
-                "模拟行情（本地/合成）": DataSourceMode.SIMULATED,
-                "上传/读取历史行情": DataSourceMode.FILE_REPLAY,
-                "标准化Redis实时行情": DataSourceMode.REDIS,
+                "完整五档采集文件回放": DataSourceMode.EXECUTABLE_REPLAY,
+                "Redis实时五档（纸面模拟）": DataSourceMode.REDIS,
             },
-            value=DataSourceMode.SIMULATED,
+            value=DataSourceMode.EXECUTABLE_REPLAY,
         )
-        self.scenario = pn.widgets.Select(
-            label="模拟场景",
-            options={
-                label: scenario for scenario, label in SCENARIO_LABELS.items()
-            },
-            value=SimulationScenario.NORMAL,
-        )
-        self.random_seed = _int_input("随机种子", 42, 0, 1_000_000, 1)
-        self.price_seed_mode = pn.widgets.Select(
-            label="模拟价格来源",
-            options={
-                "本地历史数据（逐条回放）": (
-                    SimulationPriceSeedMode.AUTO_LOCAL
-                ),
-                "指定本地历史文件": (
-                    SimulationPriceSeedMode.LOCAL_RECORDING
-                ),
-                "完全模拟数据": SimulationPriceSeedMode.SYNTHETIC,
-                "内网Redis实时最新价": SimulationPriceSeedMode.REDIS_LATEST,
-            },
-            value=SimulationPriceSeedMode.AUTO_LOCAL,
-        )
-        self.local_recording_path = pn.widgets.TextInput(
-            label="本地采集文件（可选）",
+        self.recording_path = pn.widgets.TextInput(
+            label="完整五档采集文件",
             value="",
-            placeholder="留空自动读取 tmp/recordings/交易日/ETF代码.jsonl",
-        )
-        self.redis_seed_suffix = pn.widgets.TextInput(
-            label="Redis代码后缀",
-            value=".SZ",
-            placeholder=".SZ",
-        )
-        self.price_seed_message = pn.pane.HTML(
-            '<div class="exec-status">价格基准：自动优先读取PCF交易日对应的本地采集文件；不存在时使用完全模拟。买卖盘深度与后续路径仍由模拟器生成。</div>',
-            sizing_mode="stretch_width",
-        )
-        self.tick_ms = _int_input("Tick间隔（毫秒）", 1000, 10, 60_000, 10)
-        self.total_ticks = _int_input(
-            "模拟时间轴长度（Tick）", 300, 10, 100_000, 10
-        )
-        self.simulation_speed = pn.widgets.Select(
-            label="模拟加速",
-            options={
-                "{}x".format(value): value
-                for value in (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
-            },
-            value=1.0,
-        )
-        self.premium_shock = _float_input(
-            "冲击（bp）", 35.0, 0.0, 500.0, 1.0
-        )
-        self.base_volatility = _float_input(
-            "基础波动率", 0.00015, 0.0, 0.02, 0.00005
-        )
-        self.book_levels = _int_input("盘口档位", 5, 1, 10, 1)
-        self.depth_per_level = _float_input(
-            "每档深度（CU倍数）", 2.0, 0.01, 20.0, 0.1
-        )
-        self.quote_latency = _int_input(
-            "行情延迟（毫秒）", 50, 0, 60_000, 10
-        )
-        self.stale_ratio = _float_input(
-            "陈旧报价比例", 0.10, 0.0, 1.0, 0.01
-        )
-        self.missing_ratio = _float_input(
-            "缺失报价比例", 0.05, 0.0, 1.0, 0.01
-        )
-        self.etf_spread = _float_input(
-            "ETF价差（bp）", 2.0, 0.0, 1000.0, 0.5
-        )
-        self.component_spread = _float_input(
-            "成分股价差（bp）", 4.0, 0.0, 1000.0, 0.5
-        )
-        self.depth_decay = _float_input(
-            "盘口深度衰减", 0.85, 0.01, 1.0, 0.01
-        )
-        self.shock_start_tick = _int_input(
-            "冲击开始Tick", 0, 0, 1_000_000, 1
-        )
-        self.shock_duration = _int_input(
-            "冲击持续Tick", 30, 1, 1_000_000, 1
-        )
-        self.mean_reversion_speed = _float_input(
-            "均值回复速度", 0.12, 0.0, 10.0, 0.01
-        )
-        self.suspended_weight = _float_input(
-            "模拟停牌比例", 0.05, 0.0, 1.0, 0.01
-        )
-        self.limit_up_weight = _float_input(
-            "模拟涨停比例", 0.05, 0.0, 1.0, 0.01
-        )
-        self.limit_down_weight = _float_input(
-            "模拟跌停比例", 0.05, 0.0, 1.0, 0.01
-        )
-        self.sequence_gap_probability = _float_input(
-            "序号断档概率", 0.0, 0.0, 1.0, 0.01
-        )
-
-        self.market_upload = pn.widgets.FileInput(
-            label="上传历史行情",
-            accept=".csv,.json,.jsonl,.parquet",
-            multiple=False,
-        )
-        self.market_path = pn.widgets.TextInput(
-            label="本地文件/文件夹/通配符",
-            placeholder="支持CSV、JSON、JSONL、Parquet",
-        )
-        self.schema_mapping = pn.widgets.TextAreaInput(
-            label="Schema映射JSON",
-            value="{}",
-            height=100,
+            placeholder=(
+                "留空自动使用 "
+                "tmp/executable_recordings/交易日/ETF代码.jsonl"
+            ),
         )
         self.file_speed = _float_input(
-            "文件回放速度（倍）", 1.0, 0.1, 100.0, 0.1
+            "回放速度（倍）", 1.0, 0.1, 100.0, 0.1
         )
         self.file_step_ms = _int_input(
-            "固定回放步长（毫秒）", 1000, 10, 60_000, 10
+            "采集快照基准间隔（毫秒）", 3000, 10, 60_000, 10
         )
-        self.load_market_button = pn.widgets.Button(
-            label="加载或重新加载历史行情",
-            icon="database-import",
+        self.inspect_recording_button = pn.widgets.Button(
+            label="检查采集文件",
+            icon="file-search",
             color="primary",
         )
         self.file_message = pn.pane.HTML("", sizing_mode="stretch_width")
@@ -311,28 +210,27 @@ class PanelExecutableDashboard:
             pd.DataFrame(),
             show_index=False,
             disabled=True,
-            height=180,
+            height=140,
             sizing_mode="stretch_width",
+        )
+        self.data_source_message = pn.pane.HTML(
+            '<div class="exec-status">'
+            "默认回放数据采集页面保存的原始五档快照；不会补造盘口、"
+            "缺失成分或异常行情。"
+            "</div>",
+            sizing_mode="stretch_width",
+            stylesheets=[EXECUTABLE_CSS],
         )
 
         self.redis_enabled = pn.widgets.Toggle(
-            label="启用Redis",
-            value=False,
+            label="启用Redis实时纸面模拟",
+            value=True,
         )
-        self.redis_host = pn.widgets.TextInput(label="Host", value="localhost")
-        self.redis_port = _int_input("Port", 6379, 1, 65535, 1)
-        self.redis_db = _int_input("DB", 0, 0, 100, 1)
-        self.redis_password = pn.widgets.PasswordInput(label="Password")
-        self.redis_key_prefix = pn.widgets.TextInput(
-            label="Key prefix",
-            value="etf_arbitrage",
-        )
-        self.redis_channel_pattern = pn.widgets.TextInput(
-            label="Channel pattern",
-            value="market:*",
+        self.redis_poll_interval = _int_input(
+            "Redis轮询间隔（毫秒）", 3_000, 250, 60_000, 250
         )
         self.redis_timeout = _float_input(
-            "连接超时（秒）", 2.0, 0.1, 60.0, 0.1
+            "Redis连接超时（秒）", 2.0, 0.1, 60.0, 0.1
         )
 
     def _build_execution_widgets(self) -> None:
@@ -393,7 +291,7 @@ class PanelExecutableDashboard:
             "深度折减", 0.90, 0.01, 1.0, 0.01
         )
         self.optional_cash = pn.widgets.Checkbox(
-            label="允许可选现金替代",
+            label="异常成分自适应现金替代（受PCF上限约束）",
             value=False,
         )
         self.auto_paper = pn.widgets.Toggle(
@@ -443,10 +341,13 @@ class PanelExecutableDashboard:
         )
 
         self.max_age = _int_input(
-            "最大报价年龄（毫秒）", 5000, 1, 600_000, 100
+            "单证券最长未更新（毫秒）", 120000, 1, 600_000, 1000
+        )
+        self.max_source_age = _int_input(
+            "行情源水位最大延迟（毫秒）", 15000, 1, 600_000, 1000
         )
         self.max_skew = _int_input(
-            "最大横截面时差（毫秒）", 5000, 1, 600_000, 100
+            "非原子源事件时差（毫秒）", 5000, 1, 600_000, 100
         )
         self.max_missing = _float_input(
             "最大缺失权重", 0.01, 0.0, 1.0, 0.01
@@ -551,6 +452,7 @@ class PanelExecutableDashboard:
         self.pcf_components_table = _table(height=430)
         self.etf_book_table = _table(height=250)
         self.component_books_table = _table(height=390)
+        self.component_plan_table = _table(height=430)
         self.basket_table = _table(height=190)
         self.opportunities_table = _table(height=350)
         self.capacity_table = _table(height=180)
@@ -600,8 +502,7 @@ class PanelExecutableDashboard:
 
     def _wire_events(self) -> None:
         self.source_mode.param.watch(self._source_mode_changed, "value")
-        self.price_seed_mode.param.watch(self._price_seed_mode_changed, "value")
-        self.load_market_button.on_click(self._load_market_data)
+        self.inspect_recording_button.on_click(self._inspect_recording)
         self.apply_button.on_click(self._apply_config)
         self.start_button.on_click(self._start)
         self.pause_button.on_click(self._pause)
@@ -615,7 +516,6 @@ class PanelExecutableDashboard:
         return pn.Column(
             pn.pane.Markdown("### 实盘套利模拟"),
             self.source_mode,
-            self.price_seed_mode,
             self.apply_button,
             pn.Row(self.start_button, self.pause_button),
             pn.Row(self.step_button, self.reset_button),
@@ -632,10 +532,23 @@ class PanelExecutableDashboard:
             pn.pane.Bokeh(self.edge_figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
+        boundary = []
+        if self.cross_border:
+            boundary.append(
+                pn.pane.HTML(
+                    '<div class="exec-status"><b>跨境功能暂停：</b>'
+                    "当前只保留境内ETF的完整五档采集、回放与纸面套利模拟。"
+                    "</div>",
+                    sizing_mode="stretch_width",
+                    stylesheets=[EXECUTABLE_CSS],
+                )
+            )
         return pn.Column(
+            *boundary,
             pn.Tabs(
                 ("实时总览", runtime),
-                ("数据与配置", self._configuration_view()),
+                ("数据采集", self._data_collection_view()),
+                ("套利模拟配置", self._configuration_view()),
                 ("PCF", self._pcf_view()),
                 ("盘口与篮子", self._book_view()),
                 ("套利机会", self._opportunity_view()),
@@ -654,57 +567,58 @@ class PanelExecutableDashboard:
             self.callback.stop()
         if self.source is not None:
             self.source.stop()
+        if self.multi_etf_operations is not None:
+            self.multi_etf_operations.stop_runtime()
 
-    def _configuration_view(self):
-        simulation_controls = pn.Column(
-            pn.Row(self.scenario, self.random_seed),
-            self.local_recording_path,
-            self.redis_seed_suffix,
-            self.price_seed_message,
-            pn.Row(self.tick_ms, self.total_ticks, self.simulation_speed),
-            pn.Row(self.premium_shock, self.base_volatility),
-            pn.Row(self.book_levels, self.depth_per_level, self.quote_latency),
-            pn.Row(self.stale_ratio, self.missing_ratio),
-            pn.Card(
-                pn.Column(
-                    pn.Row(self.etf_spread, self.component_spread),
-                    pn.Row(self.depth_decay, self.mean_reversion_speed),
-                    pn.Row(self.shock_start_tick, self.shock_duration),
-                    pn.Row(
-                        self.suspended_weight,
-                        self.limit_up_weight,
-                        self.limit_down_weight,
-                    ),
-                    self.sequence_gap_probability,
+    def _data_collection_view(self):
+        if self.multi_etf_operations is None:
+            return pn.Column(
+                pn.pane.Markdown("## 数据采集"),
+                pn.pane.HTML(
+                    '<div class="exec-status">当前仅开放境内ETF五档采集。</div>',
+                    stylesheets=[EXECUTABLE_CSS],
                 ),
-                title="模拟行情高级参数",
-                collapsed=False,
+                sizing_mode="stretch_width",
+            )
+        return pn.Column(
+            pn.pane.Markdown("## 数据采集"),
+            pn.pane.HTML(
+                '<div class="exec-status">'
+                "这里仅负责选择PCF、并行采集多只ETF并保存原始五档文件；"
+                "不会在后台自动成交或改动套利模拟账户。"
+                "</div>",
+                stylesheets=[EXECUTABLE_CSS],
+                sizing_mode="stretch_width",
+            ),
+            self.multi_etf_operations.view(),
+            pn.Card(
+                self.collection_pcf.view(),
+                title="单只PCF下载、上传或本地导入（可选）",
+                collapsed=True,
                 collapsible=True,
                 sizing_mode="stretch_width",
             ),
             sizing_mode="stretch_width",
         )
-        self.simulation_controls = simulation_controls
-        file_controls = pn.Column(
-            self.market_upload,
-            self.market_path,
-            self.schema_mapping,
+
+    def _configuration_view(self):
+        self.replay_controls = pn.Column(
+            self.recording_path,
             pn.Row(self.file_speed, self.file_step_ms),
-            self.load_market_button,
+            self.inspect_recording_button,
             self.file_message,
             self.file_summary_table,
             sizing_mode="stretch_width",
         )
-        self.file_controls = file_controls
-        redis_controls = pn.Column(
+        self.redis_controls = pn.Column(
             self.redis_enabled,
-            pn.Row(self.redis_host, self.redis_port, self.redis_db),
-            self.redis_password,
-            pn.Row(self.redis_key_prefix, self.redis_channel_pattern),
-            self.redis_timeout,
+            pn.Row(self.redis_poll_interval, self.redis_timeout),
+            pn.pane.Markdown(
+                "Redis连接读取当前进程的 SZ_REDIS_* 环境配置。"
+                "实时纸面模拟不重复写采集文件；原始文件由“数据采集”页面统一保存。"
+            ),
             sizing_mode="stretch_width",
         )
-        self.redis_controls = redis_controls
         self._source_mode_changed(None)
 
         execution_controls = pn.Column(
@@ -722,6 +636,11 @@ class PanelExecutableDashboard:
                 self.primary_latency,
             ),
             pn.Row(self.depth_haircut, self.optional_cash),
+            pn.pane.Markdown(
+                "勾选后，仅在某一方向无法按五档完成实物成交、且PCF标记为"
+                "“允许替代”时，才对该成分改用现金替代；停板解除或深度恢复后"
+                "会自动回到实物交易。超过PCF最大现金替代比例时仍会阻断。"
+            ),
             pn.Row(self.auto_paper, self.record_only),
             sizing_mode="stretch_width",
         )
@@ -737,39 +656,62 @@ class PanelExecutableDashboard:
             sizing_mode="stretch_width",
         )
         quality_controls = pn.Column(
-            pn.Row(self.max_age, self.max_skew, self.max_iopv_error),
+            pn.Row(
+                self.max_source_age,
+                self.max_age,
+                self.max_skew,
+                self.max_iopv_error,
+            ),
             pn.Row(self.max_missing, self.max_stale, self.max_suspended),
             pn.Row(self.max_limit_up, self.max_limit_down, self.kill_switch),
             sizing_mode="stretch_width",
         )
         return pn.Column(
-            pn.pane.Markdown("## 行情数据与执行配置"),
+            pn.pane.Markdown("## 套利模拟配置"),
+            pn.pane.HTML(
+                '<div class="exec-status">'
+                "选择一个ETF及同交易日PCF，再使用该ETF的完整五档采集文件回放；"
+                "也可切换为Redis实时纸面模拟。所有订单仍为纸面订单。"
+                "</div>",
+                stylesheets=[EXECUTABLE_CSS],
+                sizing_mode="stretch_width",
+            ),
+            self.source_mode,
+            self.data_source_message,
             self.pcf.view(),
-            simulation_controls,
-            file_controls,
-            redis_controls,
-            pn.Column(
-                pn.Card(
-                    execution_controls,
-                    title="执行参数",
-                    collapsed=False,
-                    collapsible=True,
-                    sizing_mode="stretch_width",
-                ),
-                pn.Card(
-                    account_controls,
-                    title="账户与一级市场情景",
-                    collapsed=False,
-                    collapsible=True,
-                    sizing_mode="stretch_width",
-                ),
-                pn.Card(
-                    quality_controls,
-                    title="数据质量阈值",
-                    collapsed=False,
-                    collapsible=True,
-                    sizing_mode="stretch_width",
-                ),
+            pn.Card(
+                self.replay_controls,
+                title="完整五档采集文件回放",
+                collapsed=False,
+                collapsible=True,
+                sizing_mode="stretch_width",
+            ),
+            pn.Card(
+                self.redis_controls,
+                title="Redis实时五档",
+                collapsed=False,
+                collapsible=True,
+                sizing_mode="stretch_width",
+            ),
+            pn.Card(
+                execution_controls,
+                title="执行与交易摩擦",
+                collapsed=False,
+                collapsible=True,
+                sizing_mode="stretch_width",
+            ),
+            pn.Card(
+                account_controls,
+                title="账户与一级市场情景",
+                collapsed=False,
+                collapsible=True,
+                sizing_mode="stretch_width",
+            ),
+            pn.Card(
+                quality_controls,
+                title="数据质量门禁",
+                collapsed=False,
+                collapsible=True,
                 sizing_mode="stretch_width",
             ),
             sizing_mode="stretch_width",
@@ -790,6 +732,8 @@ class PanelExecutableDashboard:
             self.etf_book_table,
             pn.pane.Markdown("## 成分股盘口"),
             self.component_books_table,
+            pn.pane.Markdown("## 逐成分执行方案（异常项优先）"),
+            self.component_plan_table,
             pn.pane.Markdown("## 申购/赎回篮子"),
             self.basket_table,
             sizing_mode="stretch_width",
@@ -847,53 +791,43 @@ class PanelExecutableDashboard:
         )
 
     def _build_config(self) -> PaperArbitrageConfig:
+        try:
+            redis_settings = SZRedisSettings.from_env()
+        except ValueError as exc:
+            if self.source_mode.value == DataSourceMode.REDIS:
+                raise ValueError(
+                    "Redis实时纸面模拟需要先设置SZ_REDIS_HOST"
+                ) from exc
+            redis_settings = SZRedisSettings(host="localhost")
+        recording_path = _resolve_executable_recording_path(
+            self.project_root,
+            self.pcf.trading_date,
+            self.pcf.etf_code,
+            self.recording_path.value.strip(),
+        )
         return PaperArbitrageConfig(
             etf_code=self.pcf.etf_code,
             data_source=self.source_mode.value,
             redis=RedisConfig(
-                enabled=bool(self.redis_enabled.value),
-                host=self.redis_host.value.strip() or "localhost",
-                port=int(self.redis_port.value),
-                db=int(self.redis_db.value),
-                password=self.redis_password.value or None,
-                key_prefix=self.redis_key_prefix.value.strip() or "etf_arbitrage",
-                channel_pattern=self.redis_channel_pattern.value.strip() or "market:*",
+                enabled=(
+                    self.source_mode.value == DataSourceMode.REDIS
+                    and bool(self.redis_enabled.value)
+                ),
+                host=redis_settings.host,
+                port=redis_settings.port,
+                db=redis_settings.db,
+                password=redis_settings.password,
+                snapshot_format=RedisSnapshotFormat.DATE_HASH,
+                trade_date_key=self.pcf.trading_date.strftime("%Y%m%d"),
+                number_of_book_levels=5,
+                poll_interval_ms=int(self.redis_poll_interval.value),
+                recording_path="",
                 socket_timeout_seconds=float(self.redis_timeout.value),
             ),
-            simulation=SimulationConfig(
-                scenario=self.scenario.value,
-                random_seed=int(self.random_seed.value),
-                price_seed_mode=self.price_seed_mode.value,
-                local_recording_path=self.local_recording_path.value.strip(),
-                redis_code_suffix=self.redis_seed_suffix.value.strip() or ".SZ",
-                tick_interval_ms=int(self.tick_ms.value),
-                total_ticks=int(self.total_ticks.value),
-                simulation_speed=float(self.simulation_speed.value),
-                base_volatility=float(self.base_volatility.value),
-                etf_spread_bps=float(self.etf_spread.value),
-                component_spread_bps=float(self.component_spread.value),
-                number_of_book_levels=int(self.book_levels.value),
-                depth_per_level=float(self.depth_per_level.value),
-                depth_decay=float(self.depth_decay.value),
-                premium_shock_bps=float(self.premium_shock.value),
-                shock_start_tick=int(self.shock_start_tick.value),
-                shock_duration_ticks=int(self.shock_duration.value),
-                mean_reversion_speed=float(self.mean_reversion_speed.value),
-                stale_quote_ratio=float(self.stale_ratio.value),
-                missing_quote_ratio=float(self.missing_ratio.value),
-                suspended_weight=float(self.suspended_weight.value),
-                limit_up_weight=float(self.limit_up_weight.value),
-                limit_down_weight=float(self.limit_down_weight.value),
-                quote_latency_ms=int(self.quote_latency.value),
-                sequence_gap_probability=float(
-                    self.sequence_gap_probability.value
-                ),
-            ),
             file_replay=FileReplayConfig(
-                path=self.market_path.value,
+                path=str(recording_path),
                 fixed_step_ms=int(self.file_step_ms.value),
                 playback_speed=float(self.file_speed.value),
-                schema_mapping=self._schema_mapping(),
             ),
             costs=CostConfig(
                 secondary_market_bps=float(self.secondary_bps.value),
@@ -924,6 +858,7 @@ class PanelExecutableDashboard:
             ),
             quality=DataQualityConfig(
                 max_quote_age_ms=int(self.max_age.value),
+                max_source_watermark_age_ms=int(self.max_source_age.value),
                 max_cross_section_skew_ms=int(self.max_skew.value),
                 maximum_missing_weight=float(self.max_missing.value),
                 maximum_stale_weight=float(self.max_stale.value),
@@ -959,10 +894,21 @@ class PanelExecutableDashboard:
         )
         if not report.valid:
             raise ValueError("PCF校验未通过：{}".format(", ".join(report.errors)))
+        runtime_pcf = (
+            _cross_border_proxy_pcf(pcf) if self.cross_border else pcf
+        )
         config = self._build_config()
-        signature = json.dumps(config.to_dict(), sort_keys=True, ensure_ascii=True)
+        signature = json.dumps(
+            config.to_dict(include_secrets=True),
+            sort_keys=True,
+            ensure_ascii=True,
+        )
         current_signature = (
-            json.dumps(self.config.to_dict(), sort_keys=True, ensure_ascii=True)
+            json.dumps(
+                self.config.to_dict(include_secrets=True),
+                sort_keys=True,
+                ensure_ascii=True,
+            )
             if self.config is not None
             else None
         )
@@ -971,113 +917,65 @@ class PanelExecutableDashboard:
 
         previous_source = self.source
         self.stop_runtime()
-        if isinstance(previous_source, RecordedHistoryMarketDataSource):
+        if isinstance(
+            previous_source,
+            (
+                ExecutableRecordingReplayMarketDataSource,
+                RedisMarketDataSource,
+            ),
+        ):
             previous_source.disconnect()
         self.config = config
         self.pcf_document = pcf
         self.pcf_report = report
-        self.engine = PaperArbitrageEngine(pcf, config)
-        self.redis_price_seed = None
-        if config.data_source == DataSourceMode.SIMULATED:
-            seed_mode = config.simulation.price_seed_mode
-            local_path = _resolve_local_recording_path(
-                self.project_root,
-                pcf,
-                config.simulation.local_recording_path,
+        self.engine = PaperArbitrageEngine(runtime_pcf, config)
+
+        if config.data_source == DataSourceMode.EXECUTABLE_REPLAY:
+            self.source = ExecutableRecordingReplayMarketDataSource(
+                config.file_replay.path,
+                runtime_pcf,
             )
-            use_local = seed_mode in {
-                SimulationPriceSeedMode.AUTO_LOCAL,
-                SimulationPriceSeedMode.LOCAL_RECORDING,
-            }
-            if use_local and local_path.exists():
-                self.source = RecordedHistoryMarketDataSource(
-                    local_path,
-                    pcf,
-                    config.simulation,
-                )
-                self.source.prime()
-            elif seed_mode == SimulationPriceSeedMode.LOCAL_RECORDING:
-                raise ValueError(
-                    "未找到本地采集文件：{}".format(local_path)
-                )
-            elif (
-                seed_mode == SimulationPriceSeedMode.AUTO_LOCAL
-                and config.simulation.local_recording_path
-            ):
-                raise ValueError(
-                    "指定的本地采集文件不存在：{}".format(local_path)
-                )
-            elif seed_mode == SimulationPriceSeedMode.REDIS_LATEST:
-                self.redis_price_seed = _load_redis_price_seed(
-                    pcf,
-                    config.simulation.redis_code_suffix,
-                )
-                self.source = SimulatedMarketDataSource(
-                    pcf,
-                    config.simulation,
-                    initial_component_prices=(
-                        self.redis_price_seed.component_prices
-                    ),
-                    initial_etf_price=self.redis_price_seed.etf_price,
-                    price_seed_source="sz_redis_latest_trade",
-                )
-            else:
-                self.source = SimulatedMarketDataSource(pcf, config.simulation)
-        elif config.data_source == DataSourceMode.FILE_REPLAY:
-            if self.file_source is None:
-                raise ValueError("请先上传或读取历史行情")
-            self.file_source.reset()
-            self.source = self.file_source
+            first = self.source.first_snapshot
+            source_label = "完整五档采集文件回放"
+            source_text = (
+                "文件={}；首条快照={}；ETF五档={}/{}；"
+                "成功记录成分股={}。盘口、时间戳与缺失状态均按采集文件原样回放。"
+            ).format(
+                self.source.path,
+                first.snapshot_timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                len(first.etf_order_book.bids),
+                len(first.etf_order_book.asks),
+                len(first.component_order_books),
+            )
+            self._show_recording_summary(self.source)
+        elif config.data_source == DataSourceMode.REDIS:
+            self.source = RedisMarketDataSource(
+                config.redis,
+                config.etf_code,
+                runtime_pcf,
+            )
+            source_label = "Redis实时五档纸面模拟"
+            source_text = (
+                "实时读取交易日Hash中的ETF与PCF成分五档盘口，轮询间隔={}毫秒；"
+                "本页面不重复写采集文件。"
+            ).format(config.redis.poll_interval_ms)
         else:
-            self.source = RedisMarketDataSource(config.redis, config.etf_code)
+            raise ValueError("当前页面不再支持模拟行情或旧版行情文件")
+
         self.snapshot = None
         self.result = None
         self.history = _new_history()
         self._clear_sources()
         self._refresh_pcf_views()
         self._update_views()
-        source_label = {
-            DataSourceMode.SIMULATED: "模拟行情",
-            DataSourceMode.FILE_REPLAY: "历史行情回放",
-            DataSourceMode.REDIS: "标准化Redis",
-        }.get(config.data_source, str(config.data_source))
-        if isinstance(self.source, RecordedHistoryMarketDataSource):
-            first_snapshot = self.source.prime()
-            source_label = "本地历史数据（真实价格轨迹+合成盘口）"
-            seed_text = (
-                "逐条回放本地历史数据（{}），记录数={}，首条有效时间={}；"
-                "ETF与成分股Last沿用历史轨迹，Bid/Ask与多档深度为模拟值。"
-            ).format(
-                self.source.path,
-                self.source.total_records,
-                first_snapshot.snapshot_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            )
-        elif self.redis_price_seed is not None:
-            seed_text = (
-                "价格基准：Redis最新成交价，ETF={:.4f}，"
-                "PCF实物成分股={}/{}；买卖盘深度与后续路径为模拟值。"
-            ).format(
-                self.redis_price_seed.etf_price,
-                self.redis_price_seed.component_count,
-                self.redis_price_seed.component_count,
-            )
-        elif (
-            config.data_source == DataSourceMode.SIMULATED
-            and config.simulation.price_seed_mode
-            == SimulationPriceSeedMode.AUTO_LOCAL
-        ):
-            seed_text = (
-                "价格基准：未找到{}，已使用完全模拟。"
-            ).format(local_path)
-        else:
-            seed_text = "价格基准：完全模拟。"
-        self.price_seed_message.object = (
-            '<div class="exec-status">{}</div>'.format(seed_text)
+        self.data_source_message.object = (
+            '<div class="exec-status">{}</div>'.format(source_text)
         )
         self._set_status(
-            "配置已应用，数据源：{}。{}仅进行纸面模拟，不连接真实交易柜台。".format(
+            "配置已应用，数据源：{}。{}"
+            "仅进行纸面模拟，不连接真实交易柜台。".format(
                 source_label,
-                seed_text,
+                source_text,
             ),
             "ready",
         )
@@ -1117,15 +1015,21 @@ class PanelExecutableDashboard:
         try:
             self._ensure_runtime()
             self.source.start()
+            callback_period = (
+                int(self.config.redis.poll_interval_ms)
+                if self.config.data_source == DataSourceMode.REDIS
+                else 250
+            )
             if self.callback is None:
                 self.callback = pn.state.add_periodic_callback(
                     self._tick,
-                    period=250,
+                    period=callback_period,
                     start=True,
                 )
             elif not self.callback.running:
+                self.callback.period = callback_period
                 self.callback.start()
-            self._set_status("连续模拟/回放中。", "running")
+            self._set_status("连续采集/模拟/回放中。", "running")
         except Exception as exc:
             self._set_status("启动失败：{}".format(exc), "error")
 
@@ -1143,6 +1047,8 @@ class PanelExecutableDashboard:
             self._set_status("已推进一个快照。", "paused")
         except StopIteration:
             self._set_status("模拟/回放已结束。", "completed")
+        except NoNewSnapshotError:
+            self._set_status("Redis快照尚未更新。", "paused")
         except Exception as exc:
             self._set_status("单步失败：{}".format(exc), "error")
 
@@ -1167,6 +1073,8 @@ class PanelExecutableDashboard:
             if self.callback is not None and self.callback.running:
                 self.callback.stop()
             self._set_status("模拟/回放已结束。", "completed")
+        except NoNewSnapshotError:
+            return
         except Exception as exc:
             self.source.stop()
             if self.callback is not None and self.callback.running:
@@ -1174,102 +1082,79 @@ class PanelExecutableDashboard:
             self._set_status("连续运行已停止：{}".format(exc), "error")
 
     def _steps_per_refresh(self) -> int:
-        if self.source_mode.value == DataSourceMode.SIMULATED:
-            tick_ms = int(self.tick_ms.value)
-            speed = float(self.simulation_speed.value)
-        else:
-            tick_ms = int(self.file_step_ms.value)
-            speed = float(self.file_speed.value)
-        simulated_tick_seconds = tick_ms / 1000.0 / max(speed, 1e-9)
-        return max(1, int(0.25 / simulated_tick_seconds + 0.999999))
+        if self.source_mode.value == DataSourceMode.REDIS:
+            return 1
+        tick_ms = int(self.file_step_ms.value)
+        speed = float(self.file_speed.value)
+        replay_tick_seconds = tick_ms / 1000.0 / max(speed, 1e-9)
+        return max(1, int(0.25 / replay_tick_seconds + 0.999999))
 
-    def _load_market_data(self, _event) -> None:
+    def _inspect_recording(self, _event) -> None:
         try:
-            mapping = self._schema_mapping()
-            loader = DynamicMarketDataLoader()
-            if self.market_upload.value:
-                snapshots, summary = loader.load_bytes(
-                    self.market_upload.value,
-                    self.market_upload.filename or "uploaded.jsonl",
-                    mapping,
+            path = self.pcf.selected_path
+            if path is None:
+                raise ValueError("请先选择并校验同交易日PCF")
+            pcf, report = validate_executable_pcf(
+                path,
+                self.pcf.etf_code,
+                self.pcf.trading_date,
+            )
+            if not report.valid:
+                raise ValueError(
+                    "PCF校验未通过：{}".format(", ".join(report.errors))
                 )
-            else:
-                snapshots, summary = loader.load_path(
-                    self.market_path.value,
-                    mapping,
-                )
-            self.file_source = FileReplayMarketDataSource(snapshots, summary)
-            self.file_summary = summary
-            self.file_summary_table.value = pd.DataFrame([asdict(summary)])
-            self._set_file_message(
-                "历史行情已加载：{}个快照，{}个证券。".format(
-                    summary.snapshot_count,
-                    summary.symbol_count,
+            replay = ExecutableRecordingReplayMarketDataSource(
+                _resolve_executable_recording_path(
+                    self.project_root,
+                    self.pcf.trading_date,
+                    self.pcf.etf_code,
+                    self.recording_path.value.strip(),
                 ),
+                pcf,
+            )
+            self._show_recording_summary(replay)
+            self._set_file_message(
+                "采集文件检查通过，可应用配置后开始回放。",
                 "success",
             )
-            if self.source_mode.value == DataSourceMode.FILE_REPLAY:
-                self._ensure_runtime(force=True)
         except Exception as exc:
+            self.file_summary = None
+            self.file_summary_table.value = pd.DataFrame()
             self._set_file_message(
-                "历史行情加载失败：{}".format(exc),
+                "采集文件检查失败：{}".format(exc),
                 "error",
             )
 
-    def _schema_mapping(self) -> Dict[str, str]:
-        payload = json.loads(self.schema_mapping.value or "{}")
-        if not isinstance(payload, dict):
-            raise ValueError("Schema映射必须是JSON对象")
-        return {str(key): str(value) for key, value in payload.items()}
+    def _show_recording_summary(
+        self,
+        replay: ExecutableRecordingReplayMarketDataSource,
+    ) -> None:
+        first = replay.first_snapshot
+        self.file_summary = {
+            "文件": str(replay.path),
+            "大小(MB)": round(replay.total_bytes / 1024 / 1024, 3),
+            "首条快照": first.snapshot_timestamp,
+            "ETF": first.etf_order_book.symbol,
+            "ETF买档": len(first.etf_order_book.bids),
+            "ETF卖档": len(first.etf_order_book.asks),
+            "成分股快照": len(first.component_order_books),
+            "PCF哈希": first.pcf_hash or "",
+        }
+        self.file_summary_table.value = pd.DataFrame([self.file_summary])
 
     def _source_mode_changed(self, _event) -> None:
-        mode = self.source_mode.value
-        is_simulated = mode == DataSourceMode.SIMULATED
-        if hasattr(self, "simulation_controls"):
-            self.simulation_controls.visible = is_simulated
-        if hasattr(self, "file_controls"):
-            self.file_controls.visible = mode == DataSourceMode.FILE_REPLAY
+        replay = self.source_mode.value == DataSourceMode.EXECUTABLE_REPLAY
+        if hasattr(self, "replay_controls"):
+            self.replay_controls.visible = replay
         if hasattr(self, "redis_controls"):
-            self.redis_controls.visible = mode == DataSourceMode.REDIS
-        self.price_seed_mode.visible = is_simulated
-        self.scenario.visible = is_simulated
-        self.simulation_speed.visible = is_simulated
-        self.total_ticks.visible = (
-            is_simulated and not self._uses_local_history()
+            self.redis_controls.visible = not replay
+        message = (
+            "使用数据采集页面保存的完整五档JSONL，按时间顺序原样回放。"
+            if replay
+            else "直接读取Redis完整五档做实时纸面模拟，不重复保存采集文件。"
         )
-
-    def _price_seed_mode_changed(self, _event) -> None:
-        mode = self.price_seed_mode.value
-        self.local_recording_path.visible = mode in {
-            SimulationPriceSeedMode.AUTO_LOCAL,
-            SimulationPriceSeedMode.LOCAL_RECORDING,
-        }
-        self.redis_seed_suffix.visible = (
-            mode == SimulationPriceSeedMode.REDIS_LATEST
-        )
-        message = {
-            SimulationPriceSeedMode.AUTO_LOCAL: (
-                "价格来源：本地历史数据。自动读取PCF交易日与ETF代码对应的"
-                "tmp/recordings文件，逐条保留ETF与成分股Last历史轨迹，并为"
-                "每个时点生成Bid/Ask和多档深度；不连接内网Redis。"
-            ),
-            SimulationPriceSeedMode.LOCAL_RECORDING: (
-                "价格来源：指定的本地历史文件。逐条保留Last历史轨迹并生成"
-                "模拟盘口；不连接内网Redis。"
-            ),
-            SimulationPriceSeedMode.SYNTHETIC: (
-                "价格来源：完全模拟数据，不读取本地文件或内网Redis。"
-            ),
-            SimulationPriceSeedMode.REDIS_LATEST: (
-                "价格来源：内网Redis实时最新价，需要当前进程配置SZ_REDIS_HOST。"
-            ),
-        }[mode]
-        self.price_seed_message.object = (
+        self.data_source_message.object = (
             '<div class="exec-status">{}</div>'.format(message)
-        )
-        self.total_ticks.visible = (
-            self.source_mode.value == DataSourceMode.SIMULATED
-            and not self._uses_local_history()
         )
         if _event is not None:
             self._set_status(
@@ -1277,35 +1162,34 @@ class PanelExecutableDashboard:
                 "ready",
             )
 
-    def _uses_local_history(self) -> bool:
-        return self.price_seed_mode.value in {
-            SimulationPriceSeedMode.AUTO_LOCAL,
-            SimulationPriceSeedMode.LOCAL_RECORDING,
-        }
-
     def _pcf_changed(self) -> None:
         previous_source = self.source
         self.stop_runtime()
-        if isinstance(previous_source, RecordedHistoryMarketDataSource):
+        if isinstance(
+            previous_source,
+            (
+                ExecutableRecordingReplayMarketDataSource,
+                RedisMarketDataSource,
+            ),
+        ):
             previous_source.disconnect()
         self.source = None
         self.engine = None
         self.config = None
-        self.redis_price_seed = None
         self._refresh_pcf_views()
         self._set_status("PCF选择已变化，请应用配置。", "ready")
 
     def _build_price_figure(self):
         chart = figure(
-            title="ETF价格、盘口与IOPV（实际价格窄幅缩放）",
+            title="ETF价格、盘口与内部IOPV（有效价格自动缩放）",
             x_axis_type="datetime",
             y_range=DataRange1d(
-                range_padding=0.08,
+                range_padding=0.12,
                 range_padding_units="percent",
                 only_visible=True,
                 default_span=0.01,
             ),
-            height=340,
+            height=380,
             sizing_mode="stretch_width",
             tools="xpan,xwheel_zoom,box_zoom,reset,save",
             active_scroll="xwheel_zoom",
@@ -1314,9 +1198,7 @@ class PanelExecutableDashboard:
             ("etf_last", "ETF最新价", ETF_COLOR, "solid", 2.2),
             ("etf_bid", "ETF买一价", BID_COLOR, "dotted", 1.4),
             ("etf_ask", "ETF卖一价", ASK_COLOR, "dotted", 1.4),
-            ("internal_iopv", "内部IOPV", IOPV_COLOR, "solid", 1.8),
-            ("lower_bound", "套利下界", "#8B5E34", "dotdash", 1.2),
-            ("upper_bound", "套利上界", "#8B5E34", "dotdash", 1.2),
+            ("internal_iopv", "内部IOPV", IOPV_COLOR, "solid", 2.6),
         )
         for field, label, color, dash, width in specs:
             chart.line(
@@ -1340,10 +1222,6 @@ class PanelExecutableDashboard:
                         "内部IOPV",
                         "@internal_iopv{0.0000} / "
                         "@internal_iopv_rel_bps{0.00} bp",
-                    ),
-                    (
-                        "套利边界",
-                        "@lower_bound{0.0000} - @upper_bound{0.0000}",
                     ),
                 ],
                 formatters={"@timestamp": "datetime"},
@@ -1384,7 +1262,7 @@ return ((tick / reference - 1) * 10000).toFixed(1)
 
     def _build_edge_figure(self):
         chart = figure(
-            title="申购/赎回净利润边际",
+            title="可计算快照的申购/赎回净利润（空白表示深度不足）",
             x_axis_type="datetime",
             height=290,
             sizing_mode="stretch_width",
@@ -1399,6 +1277,15 @@ return ((tick / reference - 1) * 10000).toFixed(1)
             color=POSITIVE,
             line_width=2,
         )
+        chart.scatter(
+            "timestamp",
+            "creation_bps",
+            source=self.market_source,
+            color=POSITIVE,
+            marker="circle",
+            size=4,
+            alpha=0.75,
+        )
         chart.line(
             "timestamp",
             "redemption_bps",
@@ -1406,6 +1293,15 @@ return ((tick / reference - 1) * 10000).toFixed(1)
             legend_label="赎回净利润（bp）",
             color=NEGATIVE,
             line_width=2,
+        )
+        chart.scatter(
+            "timestamp",
+            "redemption_bps",
+            source=self.market_source,
+            color=NEGATIVE,
+            marker="circle",
+            size=4,
+            alpha=0.75,
         )
         chart.add_layout(
             Span(
@@ -1484,7 +1380,7 @@ return ((tick / reference - 1) * 10000).toFixed(1)
             self.opening_span.location = self.opening_reference_price
             self.opening_span.visible = True
             self.price_figure.title.text = (
-                "ETF价格、盘口与IOPV（开盘基准 {:.4f}=0 bp，右轴）"
+                "ETF价格、盘口与内部IOPV（开盘基准 {:.4f}=0 bp，右轴）"
             ).format(self.opening_reference_price)
 
         reference = self.opening_reference_price
@@ -1518,8 +1414,12 @@ return ((tick / reference - 1) * 10000).toFixed(1)
             "upper_bound_rel_bps": [
                 _relative_bps(evaluation.upper_bound, reference)
             ],
-            "creation_bps": [evaluation.creation.net_profit_bps],
-            "redemption_bps": [evaluation.redemption.net_profit_bps],
+            "creation_bps": [
+                _chart_number(evaluation.creation.net_profit_bps)
+            ],
+            "redemption_bps": [
+                _chart_number(evaluation.redemption.net_profit_bps)
+            ],
         }
         self.market_source.stream(payload, rollover=20_000)
         pnl = pd.DataFrame(self.history["pnl"])
@@ -1553,14 +1453,18 @@ return ((tick / reference - 1) * 10000).toFixed(1)
                 ]
             )
             self.secondary_metrics.object = _metric_strip(
-                [
+                ([
                     ("官方IOPV", "--", NEGATIVE),
                     ("内部IOPV", "--", IOPV_COLOR),
                     ("套利下界", "--", "#8B5E34"),
                     ("套利上界", "--", "#8B5E34"),
                     ("申购净利润", "--", POSITIVE),
                     ("赎回净利润", "--", NEGATIVE),
-                ]
+                ] + (
+                    [("HKD/CNY Bid", "--", BID_COLOR), ("HKD/CNY Ask", "--", ASK_COLOR)]
+                    if self.cross_border
+                    else []
+                ))
             )
             return
         evaluation = self.result.decision_evaluation
@@ -1573,10 +1477,22 @@ return ((tick / reference - 1) * 10000).toFixed(1)
             [
                 ("系统状态", status, ACCENT),
                 (
-                    "新交易许可",
-                    "允许" if evaluation.quality.new_trades_enabled else "禁止",
+                    "市场阶段",
+                    evaluation.quality.market_phase.value,
+                    ACCENT,
+                ),
+                (
+                    "申购许可",
+                    "允许" if evaluation.quality.creation_enabled else "禁止",
                     BID_COLOR
-                    if evaluation.quality.new_trades_enabled
+                    if evaluation.quality.creation_enabled
+                    else ASK_COLOR,
+                ),
+                (
+                    "赎回许可",
+                    "允许" if evaluation.quality.redemption_enabled else "禁止",
+                    BID_COLOR
+                    if evaluation.quality.redemption_enabled
                     else ASK_COLOR,
                 ),
                 (
@@ -1589,68 +1505,61 @@ return ((tick / reference - 1) * 10000).toFixed(1)
                 ("ETF Ask", _price(etf.best_ask), ASK_COLOR),
             ]
         )
+        fx_quote = self.snapshot.hkd_cny_quote
         self.secondary_metrics.object = _metric_strip(
-            [
+            ([
                 ("官方IOPV", _price(evaluation.official_iopv), NEGATIVE),
                 ("内部IOPV", _price(evaluation.internal_iopv), IOPV_COLOR),
                 ("套利下界", _price(evaluation.lower_bound), "#8B5E34"),
                 ("套利上界", _price(evaluation.upper_bound), "#8B5E34"),
                 (
                     "申购净利润",
-                    "{:,.2f}".format(evaluation.creation.net_profit),
+                    _profit(evaluation.creation),
                     POSITIVE,
                 ),
                 (
                     "赎回净利润",
-                    "{:,.2f}".format(evaluation.redemption.net_profit),
+                    _profit(evaluation.redemption),
                     NEGATIVE,
                 ),
-            ]
+            ] + (
+                [
+                    ("HKD/CNY Bid", _fx_price(fx_quote.bid if fx_quote else None), BID_COLOR),
+                    ("HKD/CNY Ask", _fx_price(fx_quote.ask if fx_quote else None), ASK_COLOR),
+                ]
+                if self.cross_border
+                else []
+            ))
         )
 
     def _update_runtime_status(self) -> None:
         if self.runtime_status.object:
             return
         source_label = {
-            DataSourceMode.SIMULATED: "模拟行情",
-            DataSourceMode.FILE_REPLAY: "历史行情回放",
-            DataSourceMode.REDIS: "标准化Redis",
+            DataSourceMode.EXECUTABLE_REPLAY: "完整五档采集文件回放",
+            DataSourceMode.REDIS: "Redis实时五档纸面模拟",
         }.get(self.source_mode.value, str(self.source_mode.value))
-        if isinstance(self.source, RecordedHistoryMarketDataSource):
-            source_label = "本地历史数据（真实Last+模拟盘口）"
         self.runtime_status.object = (
             '<div class="exec-status">状态：就绪　数据源：{}　'
             "仅进行纸面模拟，不连接真实交易柜台。</div>"
         ).format(source_label)
 
     def _update_progress(self) -> None:
-        if isinstance(self.source, RecordedHistoryMarketDataSource):
-            total = max(self.source.total_records, 1)
-            current = min(self.source.records_read, total)
-            percentage = min(
-                100,
-                int(round(current / total * 100)),
+        if isinstance(
+            self.source,
+            ExecutableRecordingReplayMarketDataSource,
+        ):
+            self.progress.value = self.source.progress_percent
+            self.progress.name = (
+                "完整五档回放：已处理{}条，预读{}条，文件{}%"
+            ).format(
+                self.source.records_read,
+                self.source.buffered_records,
+                self.source.progress_percent,
             )
-            self.progress.value = max(1, percentage) if current > 0 else 0
-            self.progress.name = "回放进度 {}/{}".format(current, total)
-        elif isinstance(self.source, SimulatedMarketDataSource):
-            total = max(int(self.total_ticks.value), 1)
-            self.progress.value = min(
-                100,
-                int(round(self.source.current_tick / total * 100)),
-            )
-            self.progress.name = "模拟进度 {}/{}".format(
-                self.source.current_tick,
-                total,
-            )
-        elif isinstance(self.source, FileReplayMarketDataSource):
-            total = max(len(self.source.snapshots), 1)
-            current = max(self.source._index + 1, 0)
-            self.progress.value = min(100, int(round(current / total * 100)))
-            self.progress.name = "文件回放进度 {}/{}".format(current, total)
         else:
             self.progress.value = 0
-            self.progress.name = "进度"
+            self.progress.name = "实时数据源不显示固定进度"
 
     def _refresh_pcf_views(self) -> None:
         path = self.pcf.selected_path
@@ -1709,6 +1618,7 @@ return ((tick / reference - 1) * 10000).toFixed(1)
         if self.snapshot is None or self.result is None:
             self.etf_book_table.value = pd.DataFrame()
             self.component_books_table.value = pd.DataFrame()
+            self.component_plan_table.value = pd.DataFrame()
             self.basket_table.value = pd.DataFrame()
             self.capacity_table.value = pd.DataFrame()
         else:
@@ -1718,6 +1628,9 @@ return ((tick / reference - 1) * 10000).toFixed(1)
             )
             self.component_books_table.value = _component_book_rows(
                 self.snapshot
+            )
+            self.component_plan_table.value = _component_plan_rows(
+                evaluation
             )
             self.basket_table.value = pd.DataFrame(
                 [
@@ -1730,7 +1643,17 @@ return ((tick / reference - 1) * 10000).toFixed(1)
                         ),
                         "篮子合计": evaluation.creation.basket.total_value,
                         "完整成交": evaluation.creation.basket.fully_filled,
-                        "瓶颈证券": evaluation.creation.basket.bottleneck_symbol,
+                        "自适应替代证券": ",".join(
+                            evaluation.creation.basket.adaptive_cash_substituted_symbols
+                        ),
+                        "现金替代比例": evaluation.creation.basket.optional_cash_ratio,
+                        "PCF替代上限": evaluation.creation.basket.max_cash_ratio,
+                        "瓶颈证券": ",".join(
+                            evaluation.creation.basket.bottleneck_symbols
+                        ),
+                        "失败原因": ",".join(
+                            evaluation.creation.basket.failure_reasons
+                        ),
                     },
                     {
                         "方向": "赎回",
@@ -1741,7 +1664,17 @@ return ((tick / reference - 1) * 10000).toFixed(1)
                         ),
                         "篮子合计": evaluation.redemption.basket.total_value,
                         "完整成交": evaluation.redemption.basket.fully_filled,
-                        "瓶颈证券": evaluation.redemption.basket.bottleneck_symbol,
+                        "自适应替代证券": ",".join(
+                            evaluation.redemption.basket.adaptive_cash_substituted_symbols
+                        ),
+                        "现金替代比例": evaluation.redemption.basket.optional_cash_ratio,
+                        "PCF替代上限": evaluation.redemption.basket.max_cash_ratio,
+                        "瓶颈证券": ",".join(
+                            evaluation.redemption.basket.bottleneck_symbols
+                        ),
+                        "失败原因": ",".join(
+                            evaluation.redemption.basket.failure_reasons
+                        ),
                     },
                 ]
             )
@@ -1817,7 +1750,7 @@ return ((tick / reference - 1) * 10000).toFixed(1)
         self.opening_span.location = 0
         self.opening_span.visible = False
         self.price_figure.title.text = (
-            "ETF价格、盘口与IOPV（实际价格窄幅缩放）"
+            "ETF价格、盘口与内部IOPV（有效价格自动缩放）"
         )
         self.market_source.data = {
             "timestamp": [],
@@ -1924,25 +1857,79 @@ def _new_history() -> Dict[str, list[dict]]:
     return {name: [] for name in HISTORY_TABLES}
 
 
+def _cross_border_proxy_pcf(pcf):
+    """Remove the virtual subscription-cash record from proxy valuation.
+
+    The 159900 row is a settlement prepayment record, not an investable basket
+    constituent.  Keeping it in the generic simulator would add it to NAV a
+    second time and materially overstate the synthetic IOPV.
+    """
+
+    components = tuple(cross_border_hk_components(pcf))
+    if not components:
+        raise ValueError("跨境纸面模拟未识别到HKEX参考成分")
+    return replace(
+        pcf,
+        components=components,
+        total_record_num=len(components),
+    )
+
+
 def _snapshot_record(snapshot, evaluation) -> dict:
+    etf_payload = {
+        "timestamp": snapshot.etf_order_book.exchange_timestamp.isoformat(),
+        "status": snapshot.etf_order_book.trading_status.value,
+        "instrument_state": snapshot.etf_order_book.instrument_state.value,
+        "raw_status": snapshot.etf_order_book.raw_status,
+        "bids": [
+            [level.price, level.quantity]
+            for level in snapshot.etf_order_book.bids
+        ],
+        "asks": [
+            [level.price, level.quantity]
+            for level in snapshot.etf_order_book.asks
+        ],
+    }
     component_payload = {
         symbol: {
             "timestamp": book.exchange_timestamp.isoformat(),
             "status": book.trading_status.value,
+            "instrument_state": book.instrument_state.value,
+            "state_confidence": book.state_confidence.value,
+            "state_reasons": list(book.state_reasons),
+            "raw_status": book.raw_status,
             "bids": [[level.price, level.quantity] for level in book.bids],
             "asks": [[level.price, level.quantity] for level in book.asks],
         }
         for symbol, book in snapshot.component_order_books.items()
     }
+    fx_quote = snapshot.hkd_cny_quote
     return {
         "timestamp": snapshot.snapshot_timestamp.isoformat(),
         "source_mode": snapshot.source_mode,
+        "market_phase": snapshot.market_phase.value,
+        "feed_health": snapshot.feed_health.value,
+        "source_watermark_age_ms": snapshot.source_watermark_age_ms,
         "etf_code": snapshot.etf_order_book.symbol,
         "etf_last": snapshot.etf_order_book.last_price,
         "etf_bid": snapshot.etf_order_book.best_bid,
         "etf_ask": snapshot.etf_order_book.best_ask,
+        "etf_book_json": json.dumps(etf_payload, ensure_ascii=False),
         "official_iopv": snapshot.official_iopv,
         "internal_iopv": evaluation.internal_iopv,
+        "hkd_cny_bid": fx_quote.bid if fx_quote else None,
+        "hkd_cny_ask": fx_quote.ask if fx_quote else None,
+        "hkd_cny_exchange_timestamp": (
+            fx_quote.exchange_timestamp.isoformat()
+            if fx_quote and fx_quote.exchange_timestamp
+            else None
+        ),
+        "hkd_cny_receive_timestamp": (
+            fx_quote.receive_timestamp.isoformat()
+            if fx_quote and fx_quote.receive_timestamp
+            else None
+        ),
+        "hkd_cny_source": fx_quote.source if fx_quote else None,
         "sequence_gap": snapshot.sequence_gap,
         "decode_error": snapshot.decode_error,
         "component_books_json": json.dumps(
@@ -1957,15 +1944,46 @@ def _opportunity_record(evaluation, result) -> dict:
         "etf_code": evaluation.etf_code,
         "direction": result.direction.value,
         "cu_count": result.cu_count,
-        "gross_profit": result.gross_profit,
-        "estimated_costs": result.estimated_costs,
-        "safety_buffer": result.safety_buffer,
-        "net_profit": result.net_profit,
-        "net_profit_bps": result.net_profit_bps,
+        "gross_profit": _finite_number(result.gross_profit),
+        "estimated_costs": _finite_number(result.estimated_costs),
+        "safety_buffer": _finite_number(result.safety_buffer),
+        "net_profit": _finite_number(result.net_profit),
+        "net_profit_bps": _finite_number(result.net_profit_bps),
+        "pricing_complete": result.pricing_complete,
         "executable": result.executable,
         "rejection_reasons": ",".join(result.rejection_reasons),
         "basket_value": result.basket.total_value,
         "basket_fully_filled": result.basket.fully_filled,
+        "adaptive_cash_symbols": ",".join(
+            result.basket.adaptive_cash_substituted_symbols
+        ),
+        "optional_cash_ratio": result.basket.optional_cash_ratio,
+        "max_cash_ratio": result.basket.max_cash_ratio,
+        "basket_bottlenecks": ",".join(result.basket.bottleneck_symbols),
+        "basket_failure_reasons": ",".join(result.basket.failure_reasons),
+        "component_plan_json": json.dumps(
+            [
+                {
+                    "symbol": plan.symbol,
+                    "name": plan.name,
+                    "action": plan.action.value,
+                    "reason": plan.reason,
+                    "required_quantity": plan.required_quantity,
+                    "visible_quantity": plan.visible_quantity,
+                    "filled_quantity": plan.filled_quantity,
+                    "unfilled_quantity": plan.unfilled_quantity,
+                    "reference_price": plan.reference_price,
+                    "cash_amount": plan.cash_amount,
+                    "cash_reference_value": plan.cash_reference_value,
+                    "substitute_flag": plan.substitute_flag.name,
+                    "instrument_state": plan.instrument_state,
+                    "state_confidence": plan.state_confidence,
+                }
+                for plan in result.basket.component_plans.values()
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
         "etf_fully_filled": result.etf_sweep.fully_filled,
     }
 
@@ -2059,45 +2077,22 @@ def _book_rows(book) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _resolve_local_recording_path(
+def _resolve_executable_recording_path(
     project_root: Path,
-    pcf,
+    trading_date,
+    etf_code: str,
     configured_path: str,
 ) -> Path:
     if configured_path:
         path = Path(configured_path).expanduser()
-        return path if path.is_absolute() else project_root / path
+        return path.resolve() if path.is_absolute() else (project_root / path).resolve()
     return (
         project_root
         / "tmp"
-        / "recordings"
-        / pcf.trading_day.strftime("%Y%m%d")
-        / "{}.jsonl".format(pcf.etf_code)
-    )
-
-
-def _load_redis_price_seed(pcf, redis_code_suffix: str):
-    try:
-        settings = SZRedisSettings.from_env()
-    except ValueError as exc:
-        raise ValueError(
-            "启用Redis价格基准前，请先在启动Panel的同一终端设置SZ_REDIS_HOST"
-        ) from exc
-    client = SZRedisQuotationClient(settings)
-    try:
-        if not client.ping():
-            raise ConnectionError("Redis连接探测未通过")
-        return load_pcf_price_seed(
-            client,
-            pcf,
-            trade_date=pcf.trading_day,
-            redis_code_suffix=redis_code_suffix,
-        )
-    finally:
-        connection = getattr(client, "_redis_client", None)
-        close = getattr(connection, "close", None)
-        if callable(close):
-            close()
+        / "executable_recordings"
+        / trading_date.strftime("%Y%m%d")
+        / "{}.jsonl".format(str(etf_code).zfill(6))
+    ).resolve()
 
 
 def _component_book_rows(snapshot) -> pd.DataFrame:
@@ -2105,17 +2100,94 @@ def _component_book_rows(snapshot) -> pd.DataFrame:
         [
             {
                 "证券代码": symbol,
-                "状态": book.trading_status.value,
+                "币种": "HKD" if str(book.exchange).upper() == "HKEX" else "CNY",
+                "状态": book.instrument_state.value,
+                "置信度": book.state_confidence.value,
+                "原始状态": book.raw_status,
+                "状态证据": ",".join(book.state_reasons),
                 "最新价": book.last_price,
+                "昨收": book.previous_close,
+                "涨停价": book.upper_limit_price,
+                "跌停价": book.lower_limit_price,
                 "买一": book.best_bid,
                 "买一量": book.bids[0].quantity if book.bids else None,
                 "卖一": book.best_ask,
                 "卖一量": book.asks[0].quantity if book.asks else None,
                 "行情时间": book.exchange_timestamp,
+                "未更新毫秒": book.quote_inactivity_age_ms,
                 "序号": book.sequence_number,
             }
             for symbol, book in snapshot.component_order_books.items()
         ]
+    )
+
+
+def _component_plan_rows(evaluation) -> pd.DataFrame:
+    rows = []
+    action_priority = {
+        "BLOCKED": 0,
+        "CASH_ADAPTIVE": 1,
+        "CASH_MANDATORY": 2,
+        "PHYSICAL": 3,
+        "NO_ACTION": 4,
+    }
+    action_labels = {
+        "CASH_MANDATORY": "PCF强制现金替代",
+        "CASH_ADAPTIVE": "异常成分自适应现金替代",
+        "BLOCKED": "阻断",
+        "NO_ACTION": "无需操作",
+    }
+    reason_labels = {
+        "BOOK_DEPTH_FILLED": "五档深度可完整成交",
+        "PCF_MANDATORY_CASH_SUBSTITUTION": "PCF规定必须现金替代",
+        "LIMIT_UP_LOCKED": "涨停封板，当前无卖盘",
+        "LIMIT_DOWN_LOCKED": "跌停封板，当前无买盘",
+        "SUSPENDED_CONFIRMED": "已确认停牌",
+        "SUSPENDED_SUSPECTED": "疑似停牌，等待更强证据",
+        "ONE_SIDED_UNKNOWN": "单边盘口且尚不能确认停板",
+        "INSUFFICIENT_DEPTH": "五档可成交数量不足",
+        "EMPTY_BOOK": "所需方向没有挂单",
+        "MISSING_COMPONENT_BOOK": "缺少该成分行情",
+        "MISSING_HKD_CNY_QUOTE": "缺少港币人民币汇率",
+        "MISSING_CASH_SUBSTITUTION_REFERENCE": "缺少现金替代估值参考",
+        "ZERO_COMPONENT_QUANTITY": "PCF成分数量为零",
+    }
+    for direction_label, result in (
+        ("申购", evaluation.creation),
+        ("赎回", evaluation.redemption),
+    ):
+        for plan in result.basket.component_plans.values():
+            action = plan.action.value
+            physical_label = "买入成分" if direction_label == "申购" else "卖出成分"
+            rows.append(
+                {
+                    "_priority": action_priority.get(action, 99),
+                    "方向": direction_label,
+                    "证券代码": plan.symbol,
+                    "名称": plan.name,
+                    "市场状态": plan.instrument_state,
+                    "状态置信度": plan.state_confidence,
+                    "PCF替代标志": plan.substitute_flag.name,
+                    "执行动作": action_labels.get(action, physical_label),
+                    "动作说明": reason_labels.get(plan.reason, plan.reason),
+                    "原因代码": plan.reason,
+                    "所需数量": plan.required_quantity,
+                    "五档挂单量": plan.visible_quantity,
+                    "压力后成交量": plan.filled_quantity,
+                    "未成交量": plan.unfilled_quantity,
+                    "参考价": plan.reference_price,
+                    "实物成交额": plan.physical_value,
+                    "现金替代额": plan.cash_amount,
+                    "替代比例计量市值": plan.cash_reference_value,
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["_priority", "方向", "证券代码"], kind="stable")
+        .drop(columns=["_priority"])
+        .reset_index(drop=True)
     )
 
 
@@ -2181,6 +2253,21 @@ def _price(value: Optional[float]) -> str:
     return "{:.4f}".format(float(value))
 
 
+def _profit(result) -> str:
+    if not result.pricing_complete:
+        if "MAX_CASH_SUBSTITUTION_RATIO_EXCEEDED" in result.basket.failure_reasons:
+            return "不可计算（现金替代超限）"
+        return "不可计算（深度不足）"
+    value = _finite_number(result.net_profit)
+    return "--" if value is None else "{:,.2f}".format(value)
+
+
+def _fx_price(value: Optional[float]) -> str:
+    if value is None or pd.isna(value):
+        return "--"
+    return "{:.6f}".format(float(value))
+
+
 def _is_valid_price(value: Optional[float]) -> bool:
     if value is None:
         return False
@@ -2201,4 +2288,19 @@ def _relative_bps(
 
 
 def _chart_price(value: Optional[float]) -> Optional[float]:
-    return float(value) if _is_valid_price(value) else None
+    return float(value) if _is_valid_price(value) else float("nan")
+
+
+def _chart_number(value: Optional[float]) -> float:
+    number = _finite_number(value)
+    return number if number is not None else float("nan")
+
+
+def _finite_number(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if isfinite(number) else None

@@ -152,7 +152,7 @@ def test_panel_replay_streams_rows_without_replacing_chart_models():
         assert dashboard.source.data["position"] == [-1, -1]
         dashboard._stream_rows(1)
 
-        assert template.title == "深市ETF均值回复监控实验台"
+        assert template.title == "沪深ETF均值回复监控实验台"
         assert id(dashboard.source) == source_identity
         assert dashboard.cursor == 3
         assert len(dashboard.source.data["timestamp"]) == 3

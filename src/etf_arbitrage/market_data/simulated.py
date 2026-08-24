@@ -11,11 +11,13 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from etf_arbitrage.data.pcf import PCFDocument, SubstituteFlag
+from etf_arbitrage.domain import Exchange
 from etf_arbitrage.executable_config import SimulationConfig, SimulationScenario
 
 from .models import (
     DataQualityStatus,
     DataSourceHealth,
+    FXQuote,
     MarketSnapshot,
     OrderBook,
     OrderBookLevel,
@@ -34,6 +36,8 @@ class SimulatedMarketDataSource(MarketDataSource):
         config: SimulationConfig = SimulationConfig(),
         initial_component_prices: Optional[Mapping[str, float]] = None,
         initial_etf_price: Optional[float] = None,
+        initial_hkd_cny_bid: Optional[float] = None,
+        initial_hkd_cny_ask: Optional[float] = None,
         price_seed_source: str = "synthetic",
     ) -> None:
         self.pcf = pcf
@@ -46,6 +50,16 @@ class SimulatedMarketDataSource(MarketDataSource):
         self._sequence = 0
         self._latest: Optional[MarketSnapshot] = None
         self.price_seed_source = str(price_seed_source)
+        self._has_hk_components = any(
+            item.instrument_id.exchange == Exchange.HKEX
+            and item.component_share > 0
+            and not item.substitute_flag.requires_cash_substitution
+            for item in self.pcf.components
+        )
+        self._set_initial_fx(initial_hkd_cny_bid, initial_hkd_cny_ask)
+        self._base_fx_mid = self._fx_mid
+        self._base_fx_bid = self._fx_bid
+        self._base_fx_ask = self._fx_ask
         self._base_prices = self._initial_component_prices(initial_component_prices)
         self._prices = dict(self._base_prices)
         self.initial_etf_price = _optional_positive_price(
@@ -86,6 +100,9 @@ class SimulatedMarketDataSource(MarketDataSource):
         self._sequence = 0
         self._latest = None
         self._prices = dict(self._base_prices)
+        self._fx_mid = self._base_fx_mid
+        self._fx_bid = self._base_fx_bid
+        self._fx_ask = self._base_fx_ask
 
     def subscribe(self, symbols: Iterable[str]) -> None:
         self._subscribed.update(str(symbol) for symbol in symbols)
@@ -161,7 +178,16 @@ class SimulatedMarketDataSource(MarketDataSource):
                 for item in active
             }
         raw = {item.stock_code: float(self._rng.uniform(8.0, 80.0)) for item in active}
-        raw_value = sum(item.component_share * raw[item.stock_code] for item in active)
+        raw_value = sum(
+            item.component_share
+            * raw[item.stock_code]
+            * (
+                self._fx_mid
+                if item.instrument_id.exchange == Exchange.HKEX
+                else 1.0
+            )
+            for item in active
+        )
         fixed_cash = sum(
             item.creation_cash_substitute
             for item in self.pcf.components
@@ -182,6 +208,12 @@ class SimulatedMarketDataSource(MarketDataSource):
         for code, price in list(self._prices.items()):
             change = float(self._rng.normal(0.0, self.config.base_volatility))
             self._prices[code] = max(0.01, price * (1.0 + change))
+        if self._has_hk_components and self.config.hkd_cny_volatility > 0:
+            fx_change = float(
+                self._rng.normal(0.0, self.config.hkd_cny_volatility)
+            )
+            self._fx_mid = max(0.0001, self._fx_mid * (1.0 + fx_change))
+            self._set_fx_spread()
 
     def _premium_bps(self) -> float:
         scenario = self.config.scenario
@@ -285,6 +317,20 @@ class SimulatedMarketDataSource(MarketDataSource):
             snapshot_timestamp=snapshot_time,
             etf_order_book=etf_book,
             component_order_books=component_books,
+            fx_quotes=(
+                {
+                    "HKD/CNY": FXQuote(
+                        bid=self._fx_bid,
+                        ask=self._fx_ask,
+                        exchange_timestamp=timestamp,
+                        receive_timestamp=timestamp
+                        + timedelta(milliseconds=self.config.quote_latency_ms),
+                        source="simulated:{}".format(self.price_seed_source),
+                    )
+                }
+                if self._has_hk_components
+                else {}
+            ),
             official_iopv=internal_iopv * (1.0 + float(self._rng.normal(0.0, 0.00002))),
             internal_iopv=internal_iopv,
             data_quality_status=(
@@ -337,7 +383,13 @@ class SimulatedMarketDataSource(MarketDataSource):
 
     def _internal_iopv(self) -> float:
         physical = sum(
-            item.component_share * self._prices[item.stock_code]
+            item.component_share
+            * self._prices[item.stock_code]
+            * (
+                self._fx_mid
+                if item.instrument_id.exchange == Exchange.HKEX
+                else 1.0
+            )
             for item in self.pcf.components
             if item.component_share > 0
             and not item.substitute_flag.requires_cash_substitution
@@ -350,6 +402,37 @@ class SimulatedMarketDataSource(MarketDataSource):
         return (physical + mandatory + self.pcf.estimate_cash_component) / float(
             self.pcf.creation_redemption_unit
         )
+
+    def _set_initial_fx(
+        self,
+        initial_bid: Optional[float],
+        initial_ask: Optional[float],
+    ) -> None:
+        if not self._has_hk_components:
+            self._fx_mid = 1.0
+            self._fx_bid = 1.0
+            self._fx_ask = 1.0
+            return
+        if (initial_bid is None) != (initial_ask is None):
+            raise ValueError("HKD/CNY bid and ask must be supplied together")
+        if initial_bid is not None and initial_ask is not None:
+            quote = FXQuote(bid=float(initial_bid), ask=float(initial_ask))
+            self._fx_mid = quote.mid
+            self._fx_bid = quote.bid
+            self._fx_ask = quote.ask
+            return
+        self._fx_mid = _positive_price(
+            self.config.hkd_cny_mid, "simulated HKD/CNY mid"
+        )
+        self._set_fx_spread()
+
+    def _set_fx_spread(self) -> None:
+        spread_bps = float(self.config.hkd_cny_spread_bps)
+        if spread_bps < 0:
+            raise ValueError("hkd_cny_spread_bps cannot be negative")
+        half = self._fx_mid * spread_bps / 20_000.0
+        self._fx_bid = self._fx_mid - half
+        self._fx_ask = self._fx_mid + half
 
     def _sequence_increment(self) -> int:
         if self.config.scenario == SimulationScenario.SEQUENCE_GAP:

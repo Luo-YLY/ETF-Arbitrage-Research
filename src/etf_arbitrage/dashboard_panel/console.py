@@ -40,7 +40,7 @@ class PanelConsoleDashboard:
 
     def template(self):
         return pn.template.BootstrapTemplate(
-            title="深市ETF套利研究控制台",
+            title="沪深ETF套利研究控制台",
             site="ETF Arbitrage",
             header_background="#202A2E",
             sidebar=[self.sidebar],

@@ -7,6 +7,7 @@ from typing import Optional
 
 from etf_arbitrage.data import SSEPCFParser
 from etf_arbitrage.domain import Exchange, InstrumentId
+from etf_arbitrage.operations import SZSEMarketSchedule
 
 from .base import ExchangeAdapter, ExchangeCalendar, ExchangeCapabilities, PCFParser
 
@@ -33,14 +34,15 @@ class SSEAdapter(ExchangeAdapter):
     capabilities = ExchangeCapabilities(
         pcf_parser=True,
         instrument_codec=True,
-        exchange_calendar=False,
+        exchange_calendar=True,
         market_data_events=False,
         rule_book=False,
         settlement_model=False,
         production_ready=False,
         notes=(
-            "SSE public PCF header and component JSON parsing is implemented.",
+            "SSE public JSON and fund-manager historical XML PCF parsing is implemented.",
             "Exchange-qualified symbol encoding supports the .SH suffix.",
+            "Mainland session clock is enabled for fail-closed phase gating.",
             "Account, settlement and production trading rules are not implemented.",
         ),
     )
@@ -48,6 +50,7 @@ class SSEAdapter(ExchangeAdapter):
     def __init__(self, suffix: str = ".SH") -> None:
         self._codec = SSEInstrumentCodec(suffix=suffix)
         self._pcf_parser = SSEPCFParser()
+        self._calendar = SZSEMarketSchedule()
 
     @property
     def codec(self) -> SSEInstrumentCodec:
@@ -59,4 +62,4 @@ class SSEAdapter(ExchangeAdapter):
 
     @property
     def calendar(self) -> Optional[ExchangeCalendar]:
-        return None
+        return self._calendar

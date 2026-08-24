@@ -37,6 +37,7 @@ ETF_PROFILES: Mapping[str, ETFProfile] = {
     "159949": ETFProfile("159949", "创业板50ETF华安", "华安基金", "399673 创业板50"),
     "159903": ETFProfile("159903", "深成ETF南方", "南方基金", "399001 深证成指"),
     "159919": ETFProfile("159919", "沪深300ETF嘉实", "嘉实基金", "000300 沪深300"),
+    "159920": ETFProfile("159920", "恒生ETF华夏", "华夏基金", "HSI 恒生指数"),
     "510300": ETFProfile(
         "510300",
         "沪深300ETF华泰柏瑞",
@@ -49,6 +50,34 @@ ETF_PROFILES: Mapping[str, ETFProfile] = {
         "上证50ETF华夏",
         "华夏基金",
         "000016 上证50",
+        Exchange.SSE,
+    ),
+    "510500": ETFProfile(
+        "510500",
+        "中证500ETF南方",
+        "南方基金",
+        "000905 中证500",
+        Exchange.SSE,
+    ),
+    "588000": ETFProfile(
+        "588000",
+        "科创50ETF华夏",
+        "华夏基金",
+        "000688 科创50",
+        Exchange.SSE,
+    ),
+    "513660": ETFProfile(
+        "513660",
+        "恒生ETF",
+        "华夏基金",
+        "恒生指数（估值汇率调整）",
+        Exchange.SSE,
+    ),
+    "513600": ETFProfile(
+        "513600",
+        "恒生指数ETF",
+        "南方基金",
+        "恒生指数（估值汇率调整）",
         Exchange.SSE,
     ),
 }
@@ -121,6 +150,10 @@ SZSE_REPORT_DOCUMENT_HOSTS = (
     "reportdocs.static.szse.cn",
     "reportdocs.static.sse.org.cn",
 )
+SZSE_DEFAULT_PCF_URL_TEMPLATE = (
+    "https://reportdocs.static.szse.cn/files/text/ETFDown/"
+    "pcf_{etf_code}_{trade_date}.xml"
+)
 
 
 class PCFValidationError(ValueError):
@@ -144,6 +177,20 @@ class PCFRepository:
         )
         return self.root / day / "pcf_{}_{}{}".format(code, day, extension)
 
+    def _path_for_extension(
+        self,
+        etf_code: str,
+        trading_day: Union[date, str],
+        extension: str,
+    ) -> Path:
+        day = self._day_text(trading_day)
+        code = extract_etf_code(etf_code)
+        return self.root / day / "pcf_{}_{}{}".format(
+            code,
+            day,
+            extension,
+        )
+
     def find(self, etf_code: str, trading_day: Union[date, str]) -> Optional[Path]:
         expected = self.path_for(etf_code, trading_day)
         if expected.exists():
@@ -163,15 +210,43 @@ class PCFRepository:
             return candidate
         return None
 
+    def available_for_day(
+        self,
+        trading_day: Union[date, str],
+    ) -> Dict[str, Path]:
+        """Return locally stored PCFs that pass code and trading-day validation."""
+
+        day = self._day_text(trading_day)
+        folder = self.root / day
+        if not folder.exists():
+            return {}
+        available: Dict[str, Path] = {}
+        for candidate in sorted([*folder.glob("*.xml"), *folder.glob("*.json")]):
+            match = re.search(r"pcf_(\d{6})_", candidate.stem, re.IGNORECASE)
+            if match is None:
+                continue
+            code = match.group(1)
+            try:
+                self.validate(candidate, code, day)
+            except (OSError, PCFParseError, PCFValidationError, ValueError):
+                continue
+            available[code] = candidate
+        return available
+
     def save(self, content: bytes, etf_code: str, trading_day: Union[date, str]) -> Path:
         code = extract_etf_code(etf_code)
         exchange = infer_etf_exchange(code)
-        payload = (
-            self._extract_json(content)
-            if exchange == Exchange.SSE
-            else self._extract_xml(content, code)
-        )
-        destination = self.path_for(etf_code, trading_day)
+        if exchange == Exchange.SSE:
+            payload = self._extract_sse_payload(content)
+            extension = ".json" if payload.lstrip().startswith(b"{") else ".xml"
+            destination = self._path_for_extension(
+                etf_code,
+                trading_day,
+                extension,
+            )
+        else:
+            payload = self._extract_xml(content, code)
+            destination = self.path_for(etf_code, trading_day)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         temporary.write_bytes(payload)
@@ -191,9 +266,16 @@ class PCFRepository:
         timeout: float = 20.0,
     ) -> Path:
         code = extract_etf_code(etf_code)
-        if infer_etf_exchange(code) == Exchange.SSE and not url_template.strip():
-            content = self.sse_fetcher.fetch_bytes(code, timeout=timeout)
+        exchange = infer_etf_exchange(code)
+        if exchange == Exchange.SSE and not url_template.strip():
+            content = self.sse_fetcher.fetch_bytes(
+                code,
+                trading_day=trading_day,
+                timeout=timeout,
+            )
             return self.save(content, code, trading_day)
+        if exchange == Exchange.SZSE and not url_template.strip():
+            url_template = SZSE_DEFAULT_PCF_URL_TEMPLATE
         url = self.render_url(url_template, code, trading_day)
         errors = []
         for candidate in self.download_candidates(url, etf_code, trading_day):
@@ -280,7 +362,9 @@ class PCFRepository:
         prefix = source.read_bytes().lstrip()[:1]
         parser = (
             self.sse_parser
-            if source.suffix.lower() == ".json" or prefix == b"{"
+            if infer_etf_exchange(extract_etf_code(etf_code)) == Exchange.SSE
+            or source.suffix.lower() == ".json"
+            or prefix == b"{"
             else self.szse_parser
         )
         document = parser.parse(source)
@@ -337,27 +421,34 @@ class PCFRepository:
             raise PCFValidationError("PCF压缩包损坏") from exc
 
     @staticmethod
-    def _extract_json(content: bytes) -> bytes:
+    def _extract_sse_payload(content: bytes) -> bytes:
         if content[:2] == b"PK":
             try:
                 with ZipFile(BytesIO(content)) as archive:
                     names = [
                         name
                         for name in archive.namelist()
-                        if name.lower().endswith(".json")
+                        if name.lower().endswith((".json", ".xml"))
                     ]
                     if len(names) != 1:
                         raise PCFValidationError(
-                            "压缩包内无法唯一识别沪市PCF JSON"
+                            "压缩包内无法唯一识别沪市PCF JSON/XML"
                         )
                     content = archive.read(names[0])
             except BadZipFile as exc:
                 raise PCFValidationError("PCF压缩包损坏") from exc
+        prefix = content.lstrip()[:100].lower()
+        if prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html"):
+            raise PCFValidationError(
+                "下载地址返回的是网页，不是沪市PCF JSON/XML文件"
+            )
+        if prefix.startswith(b"<"):
+            return content
         try:
             payload = json.loads(content.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PCFValidationError(
-                "沪市PCF需要上交所官方查询JSON或其ZIP文件"
+                "沪市PCF需要上交所官方查询JSON、管理人官方XML或其ZIP文件"
             ) from exc
         if not isinstance(payload, dict):
             raise PCFValidationError("沪市PCF JSON根节点必须是对象")

@@ -20,6 +20,7 @@ from etf_arbitrage.executable_config import SimulationConfig, SimulationScenario
 from .models import (
     DataQualityStatus,
     DataSourceHealth,
+    FXQuote,
     MarketSnapshot,
     OrderBookLevel,
     TradingStatus,
@@ -349,6 +350,20 @@ class RecordedHistoryMarketDataSource(MarketDataSource):
             snapshot_timestamp=recorded.timestamp,
             etf_order_book=etf_book,
             component_order_books=component_books,
+            fx_quotes=(
+                {
+                    "HKD/CNY": FXQuote(
+                        bid=self._simulator._fx_bid,
+                        ask=self._simulator._fx_ask,
+                        exchange_timestamp=recorded.timestamp,
+                        receive_timestamp=recorded.timestamp
+                        + timedelta(milliseconds=self.config.quote_latency_ms),
+                        source="simulated:local_history_replay",
+                    )
+                }
+                if self._simulator._has_hk_components
+                else {}
+            ),
             official_iopv=None,
             internal_iopv=internal_iopv,
             data_quality_status=(

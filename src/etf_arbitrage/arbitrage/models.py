@@ -24,6 +24,11 @@ class DirectionEvaluation:
     basket: BasketExecutionResult
     etf_sweep: DepthSweepResult
 
+    @property
+    def pricing_complete(self) -> bool:
+        """Whether both legs have enough visible depth for a full-CU price."""
+        return self.basket.fully_filled and self.etf_sweep.fully_filled
+
 
 @dataclass(frozen=True)
 class CapacityResult:

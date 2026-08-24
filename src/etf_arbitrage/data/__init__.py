@@ -1,6 +1,17 @@
 """Unified market-data contracts and feed implementations."""
 
 from .feed import DataFeed, LiveDataFeed
+from .hk_pcf import (
+    HKPCFParser,
+    HKPCFRepository,
+    HKPCFValidationError,
+    TRAHK_COUNTERS,
+    TRAHK_HKD_COUNTER,
+    TRAHK_PCF_DOWNLOAD_URL,
+    TRAHK_PCF_SOURCE_PAGE,
+    TRAHK_RMB_COUNTER,
+    normalize_trahk_counter,
+)
 from .models import (
     ComponentWeight,
     ETFInfo,
@@ -21,6 +32,7 @@ from .pcf_repository import (
     ETFProfile,
     PCFRepository,
     PCFValidationError,
+    SZSE_DEFAULT_PCF_URL_TEMPLATE,
     SZSE_ETFS,
     SZSEETFProfile,
     etf_profile,
@@ -35,6 +47,7 @@ from .sse_pcf import (
     SSE_PCF_DETAIL_URL,
     SSE_PCF_HEADER_SQL_ID,
     SSE_PCF_QUERY_URL,
+    SSE_MANAGER_PCF_SOURCE_PAGES,
     SSEPCFFetcher,
     SSEPCFParser,
 )
@@ -64,6 +77,9 @@ __all__ = [
     "ETFProfile",
     "ETF_PROFILES",
     "ETFQuote",
+    "HKPCFParser",
+    "HKPCFRepository",
+    "HKPCFValidationError",
     "LimitStatus",
     "LiveDataFeed",
     "JsonlSnapshotStore",
@@ -85,14 +101,21 @@ __all__ = [
     "SSE_PCF_DETAIL_URL",
     "SSE_PCF_HEADER_SQL_ID",
     "SSE_PCF_QUERY_URL",
+    "SSE_MANAGER_PCF_SOURCE_PAGES",
     "SSEPCFFetcher",
     "SSEPCFParser",
     "SZSEPCFParser",
+    "SZSE_DEFAULT_PCF_URL_TEMPLATE",
     "SZSEETFProfile",
     "SZSE_ETFS",
     "StockQuote",
     "SyntheticDataFeed",
     "SubstituteFlag",
+    "TRAHK_COUNTERS",
+    "TRAHK_HKD_COUNTER",
+    "TRAHK_PCF_DOWNLOAD_URL",
+    "TRAHK_PCF_SOURCE_PAGE",
+    "TRAHK_RMB_COUNTER",
     "etf_profile",
     "etf_search_options",
     "extract_etf_code",
@@ -102,4 +125,5 @@ __all__ = [
     "load_recording_price_seed",
     "PCFValidationReport",
     "validate_executable_pcf",
+    "normalize_trahk_counter",
 ]

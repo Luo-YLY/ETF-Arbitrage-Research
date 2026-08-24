@@ -1,21 +1,21 @@
-深市ETF套利研究系统：内网设备每日启动流程
-========================================
+沪深境内ETF套利研究系统：内网设备每日启动流程
+======================================
 
 适用环境
 --------
 1. Windows 内网设备。
 2. 使用 Miniforge Prompt，不使用 PowerShell 环境变量语法。
 3. 项目已经完成环境安装，日常启动不需要重复安装依赖。
-4. 当前监控标的：159915、159901、159949、159903。
-5. Redis 行情代码由程序自动转换为大写 .SZ 后缀。
+4. 当前盘中主线只启动沪深控制台，并行采集沪市或深市境内成分ETF。
+5. Redis 行情代码由程序按PCF交易所自动转换为大写 .SH 或 .SZ 后缀；含非沪深成分的PCF会被拒绝。
 
 重要说明
 --------
 1. YYYYMMDD 表示当天日期，例如 20260723。
 2. 必须先在可访问外网的账户完成代码更新和PCF下载，再切换内网账户。
 3. 内网采集启动后不要切换账户，否则Redis连接可能中断。
-4. 当前Redis没有买一卖一，回测价格模式使用“指示性（最新价）”。
-5. 指示性回测衡量Premium收敛，不代表可以直接成交的真实套利收益。
+4. 当前Redis快照已提供买卖五档；任何ETF、实物成分或必要汇率缺少双边盘口时，系统必须阻断“可执行”结论。
+5. 所有结果仍是纸面模拟；即使五档完整，也不代表已获得真实申赎权限、成交或套利收益。
 
 
 第一步：外网账户更新项目
@@ -35,7 +35,7 @@ conda activate ".\.conda\py314"
 
 在能够访问GitHub的外网账户更新代码：
 
-git -c http.version=HTTP/1.1 pull origin main
+git -c http.version=HTTP/1.1 pull --ff-only origin agent/redis-cross-border-etf-research
 git log -1 --oneline
 
 如果出现 Connection was reset，说明当前网络无法连接GitHub。确认正在使用外网账户后重试，
@@ -121,7 +121,8 @@ python scripts\probe_sz_quotation.py --code 159915.SZ --date YYYYMMDD
 
 注意：
 1. 盘前今日Redis哈希尚未生成时，可能显示 No quotation record found。
-2. 开盘后应看到 closepx、ctime、amount 等字段。
+2. 开盘后应看到 closepx、ctime、amount，以及 bidPrice1..5、bidVolume1..5、
+   offerPrice1..5、offerVolume1..5 等字段。
 3. Redis代码必须是 159915.SZ 形式，但看板内只选择六位ETF代码。
 
 
@@ -149,6 +150,47 @@ http://127.0.0.1:8501
 点击“启动当日采集”。
 
 可以在9:30之前启动。后台任务会等待开盘，不需要等到9:30再点击。
+
+
+第五步B：境内多ETF实盘套利模拟五档采集
+-------------------------------------
+
+本轮只做沪深境内成分ETF，暂不启动港股/跨境入口。先启动沪深Panel控制台：
+
+python -m panel serve panel_app.py --address 127.0.0.1 --port 8505 --allow-websocket-origin 127.0.0.1:8505 --allow-websocket-origin localhost:8505
+
+浏览器直接打开实盘套利模拟：
+
+http://127.0.0.1:8505/panel_app?page=executable
+
+在“数据与配置”中：
+
+1. 交易日选择当天日期。
+2. 逐只选择境内ETF，PCF来源选择“官方下载”，点击“下载并校验”。
+3. 在“境内多ETF日内五档采集”卡片中多选需要采集的ETF。
+4. 确认表格中所有已选ETF的PCF状态都是“已校验”。
+5. 采集间隔保持3秒，并行线程默认4。
+6. 异常自动重启保持打开。
+7. 点击“启动境内多ETF五档采集”。
+
+每只ETF的完整五档、成分篮子和原始Redis JSON分别写入：
+
+tmp\executable_recordings\YYYYMMDD\ETF代码.jsonl
+
+IOPV、质量门禁和申购/赎回机会摘要分别写入：
+
+tmp\executable_results\YYYYMMDD\ETF代码.jsonl
+
+任务会自动等待开盘、午间保持等待、异常重启并在15:00后结束。关闭浏览器不会停止后台
+采集；需要提前结束时点击“停止采集”。
+
+如需对单只ETF先做全篮子只读预检：
+
+python scripts\probe_executable_redis.py --pcf data\pcf\YYYYMMDD\pcf_159915_YYYYMMDD.xml --trade-date YYYYMMDD
+
+预检通过条件是ETF买卖各5档、two_sided_components等于active_components、且
+quality_blockers为空。该页面没有真实报单接口；“可执行”只代表所用PCF、行情、费用和
+质量阈值下的纸面判断。
 
 
 第六步：交易时段安排
@@ -284,10 +326,12 @@ ren tmp\runtime\market_monitor_YYYYMMDD.log market_monitor_YYYYMMDD_legacy_encod
 [ ] 激活Miniforge环境
 [ ] 设置SZ_REDIS_HOST
 [ ] 测试159915.SZ行情
+[ ] 用当日PCF运行五档全篮子预检
 [ ] 启动内网看板
 [ ] 选择四只ETF和3秒采集间隔
 [ ] 点击启动当日采集
 [ ] 开盘后确认recordings和observations持续增长
+[ ] 确认executable_recordings五档快照持续增长且质量阻断符合预期
 [ ] 午间保持任务等待，不停止
 [ ] 收盘后确认completed
 [ ] 对四只ETF运行指示性回测
